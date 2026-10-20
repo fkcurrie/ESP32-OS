@@ -192,13 +192,30 @@ void renderHeader(const screen::ScreenState& st, uint32_t now_ms, bool full_redr
     g_lcd.drawString(180, 3, right_tag, lcd::COLOR_WHITE, lcd::COLOR_BG, 2, 11);
 }
 
-void renderFooter(const screen::ScreenState& st, bool full_redraw) {
+void renderFooter(const screen::ScreenState& st, uint32_t now_ms, bool full_redraw) {
     if (full_redraw) {
         g_lcd.drawCard(6, 131, 308, 37, lcd::COLOR_CARD, lcd::COLOR_BORDER);
     }
     char banner[28];
     if (st.view_mode == screen::ViewMode::HOST_MONITOR && strcmp(st.host_ip, "0.0.0.0") != 0) {
         snprintf(banner, sizeof(banner), "IP: %-20.20s", st.host_ip);
+    } else if (st.view_mode == screen::ViewMode::DASHBOARD) {
+        uint32_t phase = (now_ms / 2500UL) % 2UL;
+        if (phase == 0) {
+            snprintf(
+                banner,
+                sizeof(banner),
+                "WIFI:%-2d AP   BLE:%-3d DV",
+                static_cast<int>(st.wifi_count),
+                static_cast<int>(st.ble_count));
+        } else {
+            snprintf(
+                banner,
+                sizeof(banner),
+                "HEAP:%3luKB  FLASH:%2uMB",
+                static_cast<unsigned long>(st.free_heap / 1024UL),
+                static_cast<unsigned>(st.flash_mb));
+        }
     } else {
         snprintf(banner, sizeof(banner), "%-24.24s", st.custom_text);
     }
@@ -217,34 +234,37 @@ uint8_t stepSmoothBar(uint8_t current, uint8_t target) {
     return static_cast<uint8_t>(static_cast<int>(current) + step);
 }
 
-void renderDashboardView(const screen::ScreenState& st, bool full_redraw) {
-    static uint8_t s_wifi_bar = 0;
-    static uint8_t s_ble_bar = 0;
-
+void renderDashboardView(const screen::ScreenState& st, uint32_t now_ms, bool full_redraw) {
+    (void)st;
     if (full_redraw) {
         g_lcd.drawCard(6, 26, 151, 102, lcd::COLOR_CARD, lcd::COLOR_BORDER);
-        g_lcd.drawString(14, 31, "WI-FI 6", lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 10);
+        g_lcd.drawString(14, 31, "STOPWATCH", lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 10);
 
         g_lcd.drawCard(163, 26, 151, 102, lcd::COLOR_CARD, lcd::COLOR_BORDER);
-        g_lcd.drawString(171, 31, "BLE 5.0", lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 10);
+        g_lcd.drawString(171, 31, "20FPS WAVE", lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 10);
     }
 
-    char num_buf[8];
-    snprintf(num_buf, sizeof(num_buf), "%-3d", static_cast<int>(st.wifi_count));
-    g_lcd.drawString(14, 53, num_buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 5, 3);
-    g_lcd.drawString(110, 74, "AP", lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 2);
+    // Left card: Giant 40px sub-second stopwatch (00.0 .. 99.9s) + 20 FPS sweep bar
+    uint32_t sec_mod = (now_ms / 1000UL) % 100UL;
+    uint32_t tenths = (now_ms / 100UL) % 10UL;
+    char left_buf[12];
+    snprintf(left_buf, sizeof(left_buf), "%02lu.%lu", static_cast<unsigned long>(sec_mod), static_cast<unsigned long>(tenths));
+    g_lcd.drawString(14, 53, left_buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 5, 4);
 
-    uint8_t target_wifi = static_cast<uint8_t>((st.wifi_count * 5 > 100) ? 100 : (st.wifi_count * 5));
-    s_wifi_bar = stepSmoothBar(s_wifi_bar, target_wifi);
-    g_lcd.drawProgressBar(14, 102, 135, 18, s_wifi_bar, lcd::COLOR_WHITE, lcd::COLOR_BG);
+    // Smooth 20 FPS triangle wave over a 2-second period (0..100..0)
+    uint32_t sweep_ms = now_ms % 2000UL;
+    uint8_t sweep_pct = static_cast<uint8_t>(
+        (sweep_ms < 1000UL) ? (sweep_ms / 10UL) : ((2000UL - sweep_ms) / 10UL));
+    g_lcd.drawProgressBar(14, 102, 135, 18, sweep_pct, lcd::COLOR_WHITE, lcd::COLOR_BG);
 
-    snprintf(num_buf, sizeof(num_buf), "%-3d", static_cast<int>(st.ble_count));
-    g_lcd.drawString(171, 53, num_buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 5, 3);
-    g_lcd.drawString(267, 74, "DV", lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 2);
-
-    uint8_t target_ble = static_cast<uint8_t>((st.ble_count * 2 > 100) ? 100 : (st.ble_count * 2));
-    s_ble_bar = stepSmoothBar(s_ble_bar, target_ble);
-    g_lcd.drawProgressBar(171, 102, 135, 18, s_ble_bar, lcd::COLOR_WHITE, lcd::COLOR_BG);
+    // Right card: Giant 40px live 20 FPS wave percentage (0..100%) + thick bar
+    uint32_t wave_ms = (now_ms + 500UL) % 3000UL;
+    uint8_t wave_pct = static_cast<uint8_t>(
+        (wave_ms < 1500UL) ? (wave_ms / 15UL) : ((3000UL - wave_ms) / 15UL));
+    char right_buf[12];
+    snprintf(right_buf, sizeof(right_buf), "%3u%%", static_cast<unsigned>(wave_pct));
+    g_lcd.drawString(171, 53, right_buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 5, 4);
+    g_lcd.drawProgressBar(171, 102, 135, 18, wave_pct, lcd::COLOR_WHITE, lcd::COLOR_BG);
 }
 
 void renderHostView(const screen::ScreenState& st, bool full_redraw) {
@@ -341,11 +361,11 @@ void renderUiIfNeeded() {
             break;
         case screen::ViewMode::DASHBOARD:
         default:
-            renderDashboardView(snapshot, full_redraw);
+            renderDashboardView(snapshot, now_ms, full_redraw);
             break;
     }
 
-    renderFooter(snapshot, full_redraw);
+    renderFooter(snapshot, now_ms, full_redraw);
     last_frame_ms = now_ms;
 }
 
