@@ -163,8 +163,8 @@ void St7789Lcd::begin() {
     writeCommand(0x11);  // SLPOUT
     delay(120);
 
-    writeCommand(0x36);  // MADCTL (Landscape 320x172: MV=1, MX=1)
-    writeData(0x60);
+    writeCommand(0x36);  // MADCTL (Landscape 320x172: MV=1, MY=1)
+    writeData(0xA0);
 
     writeCommand(0x3A);  // COLMOD (16-bit RGB565)
     writeData(0x05);
@@ -228,7 +228,7 @@ void St7789Lcd::begin() {
 
 void St7789Lcd::setLandscapeFlip(bool flipped) {
     writeCommand(0x36);  // MADCTL
-    writeData(flipped ? 0xA0 : 0x60);
+    writeData(flipped ? 0x60 : 0xA0);
 }
 
 void St7789Lcd::setBacklight(uint8_t pct) {
