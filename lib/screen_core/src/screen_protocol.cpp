@@ -94,7 +94,7 @@ void formatStatusJson(const ScreenState& state, char* out, size_t out_len) {
     snprintf(
         out, out_len,
         "{\"board\":\"Waveshare-ESP32-C6-LCD-1.47\",\"view\":\"%s\",\"rgb_mode\":\"%s\","
-        "\"rgb\":[%u,%u,%u],\"bl\":%u,\"flash_mb\":%u,\"free_heap\":%lu,\"total_heap\":%lu,"
+        "\"rgb\":[%u,%u,%u],\"bl\":%u,\"flipped\":%s,\"flash_mb\":%u,\"free_heap\":%lu,\"total_heap\":%lu,"
         "\"sd_mounted\":%s,\"sd_mb\":%lu,\"wifi\":%d,\"ble\":%d,\"uptime_s\":%lu,"
         "\"host_cpu\":%u,\"host_ram\":%u,\"host_ip\":\"%s\",\"text\":\"%s\"}",
         viewModeToString(state.view_mode),
@@ -103,6 +103,7 @@ void formatStatusJson(const ScreenState& state, char* out, size_t out_len) {
         static_cast<unsigned>(state.solid_color.g),
         static_cast<unsigned>(state.solid_color.b),
         static_cast<unsigned>(state.backlight_pct),
+        state.landscape_flipped ? "true" : "false",
         static_cast<unsigned>(state.flash_mb),
         static_cast<unsigned long>(state.free_heap),
         static_cast<unsigned long>(state.total_heap),
@@ -166,6 +167,22 @@ bool parseSerialCommand(const char* line, ScreenState& state, char* response, si
         state.scan_requested = true;
         state.ui_dirty = true;
         snprintf(response, resp_len, "OK SCAN_QUEUED");
+        return true;
+    }
+
+    if (equalsIgnoreCase(buf, "FLIP")) {
+        if (*args == '\0') {
+            state.landscape_flipped = !state.landscape_flipped;
+        } else if (equalsIgnoreCase(args, "1") || equalsIgnoreCase(args, "true")) {
+            state.landscape_flipped = true;
+        } else if (equalsIgnoreCase(args, "0") || equalsIgnoreCase(args, "false")) {
+            state.landscape_flipped = false;
+        } else {
+            snprintf(response, resp_len, "ERR FLIP accepts empty, 0, or 1");
+            return false;
+        }
+        state.ui_dirty = true;
+        snprintf(response, resp_len, "OK FLIP %u", state.landscape_flipped ? 1U : 0U);
         return true;
     }
 

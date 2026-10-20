@@ -103,6 +103,8 @@ def main() -> int:
     sub.add_parser("ping", help="Send PING and verify PONG")
     sub.add_parser("status", help="Query device JSON status")
     sub.add_parser("scan", help="Trigger an immediate Wi-Fi / BLE scan")
+    p_flip = sub.add_parser("flip", help="Flip landscape orientation 180 degrees")
+    p_flip.add_argument("state", nargs="?", choices=["0", "1"], help="Optional explicit flip state (0 or 1)")
 
     p_text = sub.add_parser("text", help="Display custom banner text on the LCD")
     p_text.add_argument("message", help="Message string to display")
@@ -137,6 +139,9 @@ def main() -> int:
             print(reply)
     elif args.subcmd == "scan":
         print(send_command(args.port, "SCAN"))
+    elif args.subcmd == "flip":
+        cmd = f"FLIP {args.state}" if args.state is not None else "FLIP"
+        print(send_command(args.port, cmd))
     elif args.subcmd == "text":
         print(send_command(args.port, f"TEXT {args.message}"))
     elif args.subcmd == "bl":

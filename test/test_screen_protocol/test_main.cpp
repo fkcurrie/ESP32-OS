@@ -100,6 +100,12 @@ void test_scan_and_unknown_commands(void) {
     TEST_ASSERT_TRUE(parseSerialCommand("SCAN", state, resp, sizeof(resp)));
     TEST_ASSERT_TRUE(state.scan_requested);
 
+    TEST_ASSERT_FALSE(state.landscape_flipped);
+    TEST_ASSERT_TRUE(parseSerialCommand("FLIP", state, resp, sizeof(resp)));
+    TEST_ASSERT_TRUE(state.landscape_flipped);
+    TEST_ASSERT_TRUE(parseSerialCommand("FLIP 0", state, resp, sizeof(resp)));
+    TEST_ASSERT_FALSE(state.landscape_flipped);
+
     TEST_ASSERT_FALSE(parseSerialCommand("FOOBAR 123", state, resp, sizeof(resp)));
     TEST_ASSERT_FALSE(parseSerialCommand("   ", state, resp, sizeof(resp)));
 }

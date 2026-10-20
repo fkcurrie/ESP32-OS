@@ -17,6 +17,7 @@ SemaphoreHandle_t g_state_mutex = nullptr;
 
 screen::ViewMode g_last_rendered_view = screen::ViewMode::COUNT;
 uint8_t g_last_backlight_pct = 100;
+bool g_last_landscape_flipped = false;
 uint8_t g_rainbow_pos = 0;
 
 // Button debounce & press timing
@@ -172,47 +173,37 @@ void processSerialInput() {
 }
 
 void renderHeader(const screen::ScreenState& st) {
-    g_lcd.fillRect(0, 0, board::LCD_WIDTH, 28, lcd::COLOR_NAVY);
-    g_lcd.drawString(8, 6, "ESP32-C6 LCD 1.47", lcd::COLOR_CYAN, lcd::COLOR_NAVY, 1, 18);
+    g_lcd.fillRect(0, 0, board::LCD_WIDTH, 22, lcd::COLOR_NAVY);
+    g_lcd.drawString(8, 7, "WAVESHARE ESP32-C6-LCD-1.47 (320x172)", lcd::COLOR_CYAN, lcd::COLOR_NAVY, 1, 38);
 
-    const char* tab_name = "DASH";
-    if (st.view_mode == screen::ViewMode::HOST_MONITOR) tab_name = "HOST";
-    else if (st.view_mode == screen::ViewMode::WIRELESS) tab_name = "RF";
-    g_lcd.drawString(134, 6, tab_name, lcd::COLOR_AMBER, lcd::COLOR_NAVY, 1, 5);
-    g_lcd.drawString(8, 17, "172x320 ST7789 | 8MB DIO", lcd::COLOR_MUTED, lcd::COLOR_NAVY, 1, 26);
+    const char* tab_name = "[DASH] ";
+    if (st.view_mode == screen::ViewMode::HOST_MONITOR) tab_name = "[HOST] ";
+    else if (st.view_mode == screen::ViewMode::WIRELESS) tab_name = "[RADIO]";
+    g_lcd.drawString(270, 7, tab_name, lcd::COLOR_AMBER, lcd::COLOR_NAVY, 1, 7);
 }
 
 void renderFooter(const screen::ScreenState& st, bool full_redraw) {
     if (full_redraw) {
-        g_lcd.drawCard(6, 250, 160, 64, lcd::COLOR_CARD, lcd::COLOR_BORDER);
-        g_lcd.drawString(12, 256, "MESSAGE / SERIAL", lcd::COLOR_CYAN, lcd::COLOR_CARD, 1, 20);
+        g_lcd.drawCard(6, 130, 308, 38, lcd::COLOR_CARD, lcd::COLOR_BORDER);
     }
-    char line1[25] = {0};
-    char line2[25] = {0};
-    strncpy(line1, st.custom_text, 24);
-    if (strlen(st.custom_text) > 24) {
-        strncpy(line2, st.custom_text + 24, 24);
-    }
-    g_lcd.drawString(12, 270, line1, lcd::COLOR_WHITE, lcd::COLOR_CARD, 1, 24);
-    g_lcd.drawString(12, 282, line2, lcd::COLOR_WHITE, lcd::COLOR_CARD, 1, 24);
+    char msg_line[52];
+    snprintf(msg_line, sizeof(msg_line), "MSG: %-43.43s", st.custom_text);
+    g_lcd.drawString(12, 137, msg_line, lcd::COLOR_WHITE, lcd::COLOR_CARD, 1, 48);
 
-    char meta[28];
-    snprintf(meta, sizeof(meta), "UP:%lus BL:%u%% BTN:GPIO9",
+    char meta[52];
+    snprintf(meta, sizeof(meta), "UP:%lus | BL:%u%% | GPIO9: Short=View Long=Dim",
              static_cast<unsigned long>(st.uptime_sec),
              static_cast<unsigned>(st.backlight_pct));
-    g_lcd.drawString(12, 298, meta, lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 24);
+    g_lcd.drawString(12, 153, meta, lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 48);
 }
 
 void renderDashboardView(const screen::ScreenState& st, bool full_redraw) {
     if (full_redraw) {
-        g_lcd.drawCard(6, 34, 160, 68, lcd::COLOR_CARD, lcd::COLOR_BORDER);
-        g_lcd.drawString(12, 40, "SOC & MEMORY", lcd::COLOR_CYAN, lcd::COLOR_CARD, 1, 16);
+        g_lcd.drawCard(6, 26, 151, 100, lcd::COLOR_CARD, lcd::COLOR_BORDER);
+        g_lcd.drawString(12, 33, "SOC & MEMORY", lcd::COLOR_CYAN, lcd::COLOR_CARD, 1, 20);
 
-        g_lcd.drawCard(6, 108, 160, 66, lcd::COLOR_CARD, lcd::COLOR_BORDER);
-        g_lcd.drawString(12, 114, "WIRELESS SCAN", lcd::COLOR_GREEN, lcd::COLOR_CARD, 1, 16);
-
-        g_lcd.drawCard(6, 180, 160, 64, lcd::COLOR_CARD, lcd::COLOR_BORDER);
-        g_lcd.drawString(12, 186, "STORAGE & PERIPHERALS", lcd::COLOR_AMBER, lcd::COLOR_CARD, 1, 22);
+        g_lcd.drawCard(163, 26, 151, 100, lcd::COLOR_CARD, lcd::COLOR_BORDER);
+        g_lcd.drawString(169, 33, "WIRELESS & IO", lcd::COLOR_GREEN, lcd::COLOR_CARD, 1, 20);
     }
 
     char buf[32];
@@ -220,75 +211,76 @@ void renderDashboardView(const screen::ScreenState& st, bool full_redraw) {
     uint32_t total_kb = st.total_heap / 1024;
     uint8_t ram_pct = (total_kb > 0) ? static_cast<uint8_t>((used_kb * 100) / total_kb) : 0;
 
-    snprintf(buf, sizeof(buf), "SRAM: %lu/%lu KB (%u%%)",
+    snprintf(buf, sizeof(buf), "SRAM: %lu/%luKB (%u%%)",
              static_cast<unsigned long>(used_kb),
              static_cast<unsigned long>(total_kb),
              static_cast<unsigned>(ram_pct));
-    g_lcd.drawString(12, 54, buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 1, 24);
-    g_lcd.drawProgressBar(12, 66, 148, 8, ram_pct, lcd::COLOR_CYAN, lcd::COLOR_BG);
+    g_lcd.drawString(12, 49, buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 1, 23);
+    g_lcd.drawProgressBar(12, 61, 139, 8, ram_pct, lcd::COLOR_CYAN, lcd::COLOR_BG);
 
-    snprintf(buf, sizeof(buf), "FLASH: %u MB XMC DIO", static_cast<unsigned>(st.flash_mb));
-    g_lcd.drawString(12, 82, buf, lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 24);
-
-    snprintf(buf, sizeof(buf), "Wi-Fi 6 APs : %d", static_cast<int>(st.wifi_count));
-    g_lcd.drawString(12, 130, buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 1, 22);
-    snprintf(buf, sizeof(buf), "BLE 5 Devs  : %d", static_cast<int>(st.ble_count));
-    g_lcd.drawString(12, 144, buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 1, 22);
-    g_lcd.drawString(12, 158, "802.15.4    : Ready", lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 22);
+    snprintf(buf, sizeof(buf), "Flash: %u MB XMC DIO", static_cast<unsigned>(st.flash_mb));
+    g_lcd.drawString(12, 76, buf, lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 23);
 
     if (st.sd_mounted) {
-        snprintf(buf, sizeof(buf), "SD Card: %lu MB OK", static_cast<unsigned long>(st.sd_total_mb));
-        g_lcd.drawString(12, 202, buf, lcd::COLOR_GREEN, lcd::COLOR_CARD, 1, 24);
+        snprintf(buf, sizeof(buf), "SD   : %lu MB OK", static_cast<unsigned long>(st.sd_total_mb));
+        g_lcd.drawString(12, 92, buf, lcd::COLOR_GREEN, lcd::COLOR_CARD, 1, 23);
     } else {
-        g_lcd.drawString(12, 202, "SD Card: None (GPIO4)", lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 24);
+        g_lcd.drawString(12, 92, "SD   : None (GPIO4)", lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 23);
     }
-    g_lcd.drawString(12, 216, "RGB LED: WS2812 (GPIO8)", lcd::COLOR_WHITE, lcd::COLOR_CARD, 1, 24);
-    g_lcd.drawString(12, 230, "USB JTAG/CDC: /ttyACM0", lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 24);
+    g_lcd.drawString(12, 108, "RGB  : WS2812 (GPIO8)", lcd::COLOR_WHITE, lcd::COLOR_CARD, 1, 23);
+
+    snprintf(buf, sizeof(buf), "Wi-Fi 6 : %d APs", static_cast<int>(st.wifi_count));
+    g_lcd.drawString(169, 49, buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 1, 23);
+    snprintf(buf, sizeof(buf), "BLE 5.0 : %d Devs", static_cast<int>(st.ble_count));
+    g_lcd.drawString(169, 65, buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 1, 23);
+    g_lcd.drawString(169, 81, "802.15.4: Ready", lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 23);
+    g_lcd.drawString(169, 97, "USB CDC : /ttyACM0", lcd::COLOR_AMBER, lcd::COLOR_CARD, 1, 23);
+    g_lcd.drawString(169, 111, "CPU     : 160MHz RISCV", lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 23);
 }
 
 void renderHostView(const screen::ScreenState& st, bool full_redraw) {
     if (full_redraw) {
-        g_lcd.drawCard(6, 34, 160, 210, lcd::COLOR_CARD, lcd::COLOR_BORDER);
-        g_lcd.drawString(12, 42, "HOST TELEMETRY", lcd::COLOR_CYAN, lcd::COLOR_CARD, 1, 20);
+        g_lcd.drawCard(6, 26, 151, 100, lcd::COLOR_CARD, lcd::COLOR_BORDER);
+        g_lcd.drawString(12, 33, "HOST CPU & RAM", lcd::COLOR_CYAN, lcd::COLOR_CARD, 1, 20);
+
+        g_lcd.drawCard(163, 26, 151, 100, lcd::COLOR_CARD, lcd::COLOR_BORDER);
+        g_lcd.drawString(169, 33, "HOST NETWORK", lcd::COLOR_AMBER, lcd::COLOR_CARD, 1, 20);
     }
 
     char buf[32];
-    snprintf(buf, sizeof(buf), "IP: %s", st.host_ip);
-    g_lcd.drawString(12, 62, buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 1, 24);
-
     snprintf(buf, sizeof(buf), "CPU LOAD: %u%%", static_cast<unsigned>(st.host_cpu_pct));
-    g_lcd.drawString(12, 88, buf, lcd::COLOR_GREEN, lcd::COLOR_CARD, 1, 24);
-    g_lcd.drawProgressBar(12, 102, 148, 14, st.host_cpu_pct, lcd::COLOR_GREEN, lcd::COLOR_BG);
+    g_lcd.drawString(12, 50, buf, lcd::COLOR_GREEN, lcd::COLOR_CARD, 1, 23);
+    g_lcd.drawProgressBar(12, 63, 139, 12, st.host_cpu_pct, lcd::COLOR_GREEN, lcd::COLOR_BG);
 
     snprintf(buf, sizeof(buf), "RAM USED: %u%%", static_cast<unsigned>(st.host_ram_pct));
-    g_lcd.drawString(12, 132, buf, lcd::COLOR_AMBER, lcd::COLOR_CARD, 1, 24);
-    g_lcd.drawProgressBar(12, 146, 148, 14, st.host_ram_pct, lcd::COLOR_AMBER, lcd::COLOR_BG);
+    g_lcd.drawString(12, 85, buf, lcd::COLOR_AMBER, lcd::COLOR_CARD, 1, 23);
+    g_lcd.drawProgressBar(12, 98, 139, 12, st.host_ram_pct, lcd::COLOR_AMBER, lcd::COLOR_BG);
 
-    g_lcd.drawString(12, 180, "Update via host CLI:", lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 24);
-    g_lcd.drawString(12, 194, "screen_ctl.py host", lcd::COLOR_CYAN, lcd::COLOR_CARD, 1, 24);
-    g_lcd.drawString(12, 212, "Short press BOOT: View", lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 24);
-    g_lcd.drawString(12, 224, "Long press BOOT : Dim", lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 24);
+    g_lcd.drawString(169, 50, "IPv4 Address:", lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 23);
+    g_lcd.drawString(169, 64, st.host_ip, lcd::COLOR_WHITE, lcd::COLOR_CARD, 1, 23);
+    g_lcd.drawString(169, 86, "Live stream CLI:", lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 23);
+    g_lcd.drawString(169, 100, "screen_ctl.py host", lcd::COLOR_CYAN, lcd::COLOR_CARD, 1, 23);
 }
 
 void renderWirelessView(const screen::ScreenState& st, bool full_redraw) {
     if (full_redraw) {
-        g_lcd.drawCard(6, 34, 160, 210, lcd::COLOR_CARD, lcd::COLOR_BORDER);
-        g_lcd.drawString(12, 42, "RADIO ENVIRONMENT", lcd::COLOR_GREEN, lcd::COLOR_CARD, 1, 20);
+        g_lcd.drawCard(6, 26, 151, 100, lcd::COLOR_CARD, lcd::COLOR_BORDER);
+        g_lcd.drawString(12, 33, "2.4GHz WI-FI 6", lcd::COLOR_CYAN, lcd::COLOR_CARD, 1, 20);
+
+        g_lcd.drawCard(163, 26, 151, 100, lcd::COLOR_CARD, lcd::COLOR_BORDER);
+        g_lcd.drawString(169, 33, "BLUETOOTH 5 LE", lcd::COLOR_PURPLE, lcd::COLOR_CARD, 1, 20);
     }
 
     char buf[32];
-    g_lcd.drawString(12, 64, "2.4GHz Wi-Fi 6", lcd::COLOR_CYAN, lcd::COLOR_CARD, 1, 20);
     snprintf(buf, sizeof(buf), "%d APs", static_cast<int>(st.wifi_count));
-    g_lcd.drawString(12, 78, buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 11);
+    g_lcd.drawString(12, 54, buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 11);
+    g_lcd.drawString(12, 84, "802.11ax 2.4GHz STA", lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 23);
+    g_lcd.drawString(12, 100, "MAC:14:C1:9F:05:7D:10", lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 23);
 
-    g_lcd.drawString(12, 112, "Bluetooth 5 LE", lcd::COLOR_PURPLE, lcd::COLOR_CARD, 1, 20);
     snprintf(buf, sizeof(buf), "%d Devs", static_cast<int>(st.ble_count));
-    g_lcd.drawString(12, 126, buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 11);
-
-    g_lcd.drawString(12, 164, "MAC: 14:C1:9F:05:7D:10", lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 24);
-    g_lcd.drawString(12, 180, "Chip: ESP32-C6FH4 v0.2", lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 24);
-    g_lcd.drawString(12, 196, "Send 'SCAN' on USB", lcd::COLOR_AMBER, lcd::COLOR_CARD, 1, 24);
-    g_lcd.drawString(12, 210, "for instant refresh.", lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 24);
+    g_lcd.drawString(169, 54, buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 11);
+    g_lcd.drawString(169, 84, "Active BLE Scan (2s)", lcd::COLOR_MUTED, lcd::COLOR_CARD, 1, 23);
+    g_lcd.drawString(169, 100, "Send 'SCAN' to refresh", lcd::COLOR_AMBER, lcd::COLOR_CARD, 1, 23);
 }
 
 void renderUiIfNeeded() {
@@ -321,6 +313,12 @@ void renderUiIfNeeded() {
     }
 
     bool full_redraw = (snapshot.view_mode != g_last_rendered_view);
+    if (snapshot.landscape_flipped != g_last_landscape_flipped) {
+        g_lcd.setLandscapeFlip(snapshot.landscape_flipped);
+        g_last_landscape_flipped = snapshot.landscape_flipped;
+        full_redraw = true;
+    }
+
     if (full_redraw) {
         g_lcd.fillScreen(lcd::COLOR_BG);
         renderHeader(snapshot);

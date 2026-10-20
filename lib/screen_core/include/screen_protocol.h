@@ -43,6 +43,7 @@ struct ScreenState {
     int16_t ble_count = 0;
     uint32_t uptime_sec = 0;
     bool scan_requested = false;
+    bool landscape_flipped = false;
     bool ui_dirty = true;
 
     // Host telemetry & custom banner

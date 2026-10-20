@@ -22,10 +22,10 @@ constexpr int PIN_LCD_DC   = 15;
 constexpr int PIN_LCD_RST  = 21;
 constexpr int PIN_LCD_BL   = 22;
 
-constexpr uint16_t LCD_WIDTH    = 172;
-constexpr uint16_t LCD_HEIGHT   = 320;
-constexpr uint16_t LCD_X_OFFSET = 34;
-constexpr uint16_t LCD_Y_OFFSET = 0;
+constexpr uint16_t LCD_WIDTH    = 320;
+constexpr uint16_t LCD_HEIGHT   = 172;
+constexpr uint16_t LCD_X_OFFSET = 0;
+constexpr uint16_t LCD_Y_OFFSET = 34;
 constexpr uint32_t LCD_SPI_HZ   = 80000000UL;  // 80 MHz
 
 // MicroSD Card Slot (SPI mode)
