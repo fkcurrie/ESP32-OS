@@ -37,6 +37,27 @@ const char* rgbModeToString(RgbMode mode) {
     }
 }
 
+const char* weatherKindToString(WeatherKind kind) {
+    switch (kind) {
+        case WeatherKind::SUNNY:
+            return "sunny";
+        case WeatherKind::PARTLY_CLOUDY:
+            return "partly";
+        case WeatherKind::CLOUDY:
+            return "cloudy";
+        case WeatherKind::RAIN:
+            return "rain";
+        case WeatherKind::LIGHTNING:
+            return "lightning";
+        case WeatherKind::LIGHT_SNOW:
+            return "light_snow";
+        case WeatherKind::HEAVY_SNOW:
+            return "heavy_snow";
+        default:
+            return "sunny";
+    }
+}
+
 bool equalsIgnoreCase(const char* a, const char* b) {
     while (*a && *b) {
         if (tolower(static_cast<unsigned char>(*a)) != tolower(static_cast<unsigned char>(*b))) {
@@ -46,6 +67,39 @@ bool equalsIgnoreCase(const char* a, const char* b) {
         ++b;
     }
     return *a == '\0' && *b == '\0';
+}
+
+bool parseWeatherKind(const char* str, WeatherKind* out) {
+    if (!str || !out) return false;
+    if (equalsIgnoreCase(str, "sunny") || equalsIgnoreCase(str, "clear")) {
+        *out = WeatherKind::SUNNY;
+        return true;
+    }
+    if (equalsIgnoreCase(str, "partly") || equalsIgnoreCase(str, "partly_cloudy")) {
+        *out = WeatherKind::PARTLY_CLOUDY;
+        return true;
+    }
+    if (equalsIgnoreCase(str, "cloudy") || equalsIgnoreCase(str, "overcast")) {
+        *out = WeatherKind::CLOUDY;
+        return true;
+    }
+    if (equalsIgnoreCase(str, "rain") || equalsIgnoreCase(str, "drizzle")) {
+        *out = WeatherKind::RAIN;
+        return true;
+    }
+    if (equalsIgnoreCase(str, "lightning") || equalsIgnoreCase(str, "storm") || equalsIgnoreCase(str, "thunder")) {
+        *out = WeatherKind::LIGHTNING;
+        return true;
+    }
+    if (equalsIgnoreCase(str, "light_snow") || equalsIgnoreCase(str, "snow")) {
+        *out = WeatherKind::LIGHT_SNOW;
+        return true;
+    }
+    if (equalsIgnoreCase(str, "heavy_snow") || equalsIgnoreCase(str, "blizzard")) {
+        *out = WeatherKind::HEAVY_SNOW;
+        return true;
+    }
+    return false;
 }
 
 bool parseIntInRange(const char* str, int min_val, int max_val, int* out) {
@@ -85,6 +139,27 @@ void copySanitizedJsonString(const char* src, char* dst, size_t dst_len) {
 
 }  // namespace
 
+const char* weatherKindLabel(WeatherKind kind) {
+    switch (kind) {
+        case WeatherKind::SUNNY:
+            return "SUNNY";
+        case WeatherKind::PARTLY_CLOUDY:
+            return "PART CLOUD";
+        case WeatherKind::CLOUDY:
+            return "CLOUDY";
+        case WeatherKind::RAIN:
+            return "RAIN";
+        case WeatherKind::LIGHTNING:
+            return "LIGHTNING";
+        case WeatherKind::LIGHT_SNOW:
+            return "LIGHT SNOW";
+        case WeatherKind::HEAVY_SNOW:
+            return "HEAVY SNOW";
+        default:
+            return "SUNNY";
+    }
+}
+
 void formatStatusJson(const ScreenState& state, char* out, size_t out_len) {
     char safe_text[64];
     char safe_ip[24];
@@ -96,6 +171,7 @@ void formatStatusJson(const ScreenState& state, char* out, size_t out_len) {
         "{\"board\":\"Waveshare-ESP32-C6-LCD-1.47\",\"view\":\"%s\",\"rgb_mode\":\"%s\","
         "\"rgb\":[%u,%u,%u],\"bl\":%u,\"flipped\":%s,\"flash_mb\":%u,\"free_heap\":%lu,\"total_heap\":%lu,"
         "\"sd_mounted\":%s,\"sd_mb\":%lu,\"wifi\":%d,\"ble\":%d,\"uptime_s\":%lu,"
+        "\"weather\":\"%s\",\"temp_c\":%d,\"high_c\":%d,\"low_c\":%d,"
         "\"host_cpu\":%u,\"host_ram\":%u,\"host_ip\":\"%s\",\"text\":\"%s\"}",
         viewModeToString(state.view_mode),
         rgbModeToString(state.rgb_mode),
@@ -112,6 +188,10 @@ void formatStatusJson(const ScreenState& state, char* out, size_t out_len) {
         static_cast<int>(state.wifi_count),
         static_cast<int>(state.ble_count),
         static_cast<unsigned long>(state.uptime_sec),
+        weatherKindToString(state.weather_kind),
+        static_cast<int>(state.weather_temp_c),
+        static_cast<int>(state.weather_high_c),
+        static_cast<int>(state.weather_low_c),
         static_cast<unsigned>(state.host_cpu_pct),
         static_cast<unsigned>(state.host_ram_pct),
         safe_ip,
@@ -298,6 +378,58 @@ bool parseSerialCommand(const char* line, ScreenState& state, char* response, si
         state.host_ip[sizeof(state.host_ip) - 1] = '\0';
         state.ui_dirty = true;
         snprintf(response, resp_len, "OK HOST %d %d %s", cpu, ram, state.host_ip);
+        return true;
+    }
+
+    if (equalsIgnoreCase(buf, "TIME")) {
+        int hh = 0, mm = 0, ss = 0, ds = 0;
+        int matched = sscanf(args, "%d:%d:%d.%d", &hh, &mm, &ss, &ds);
+        if (matched < 3 || hh < 0 || hh > 23 || mm < 0 || mm > 59 || ss < 0 || ss > 59 || ds < 0 || ds > 9) {
+            snprintf(response, resp_len, "ERR TIME requires HH:MM:SS[.d]");
+            return false;
+        }
+        state.clock_base_ds = static_cast<uint32_t>((hh * 3600L + mm * 60L + ss) * 10L + ds);
+        state.clock_sync_requested = true;
+        state.ui_dirty = true;
+        snprintf(response, resp_len, "OK TIME %02d:%02d:%02d.%d", hh, mm, ss, ds);
+        return true;
+    }
+
+    if (equalsIgnoreCase(buf, "WEATHER")) {
+        char arg_buf[96];
+        strncpy(arg_buf, args, sizeof(arg_buf) - 1);
+        arg_buf[sizeof(arg_buf) - 1] = '\0';
+
+        char* saveptr = nullptr;
+        char* tok_kind = strtok_r(arg_buf, " ", &saveptr);
+        char* tok_temp = strtok_r(nullptr, " ", &saveptr);
+        char* tok_high = strtok_r(nullptr, " ", &saveptr);
+        char* tok_low = strtok_r(nullptr, " ", &saveptr);
+
+        WeatherKind kind = WeatherKind::SUNNY;
+        int temp_c = 0, high_c = 0, low_c = 0;
+        if (!tok_kind || !tok_temp || !tok_high || !tok_low ||
+            !parseWeatherKind(tok_kind, &kind) ||
+            !parseIntInRange(tok_temp, -60, 60, &temp_c) ||
+            !parseIntInRange(tok_high, -60, 60, &high_c) ||
+            !parseIntInRange(tok_low, -60, 60, &low_c)) {
+            snprintf(response, resp_len, "ERR WEATHER requires <kind> <temp_c> <high_c> <low_c>");
+            return false;
+        }
+
+        state.weather_kind = kind;
+        state.weather_temp_c = static_cast<int16_t>(temp_c);
+        state.weather_high_c = static_cast<int16_t>(high_c);
+        state.weather_low_c = static_cast<int16_t>(low_c);
+        state.ui_dirty = true;
+        snprintf(
+            response,
+            resp_len,
+            "OK WEATHER %s %d %d %d",
+            weatherKindToString(state.weather_kind),
+            temp_c,
+            high_c,
+            low_c);
         return true;
     }
 

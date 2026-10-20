@@ -100,7 +100,7 @@ const uint8_t FONT_5X7[95][5] PROGMEM = {
     {0x00, 0x08, 0x36, 0x41, 0x00},  // 0x7B '{'
     {0x00, 0x00, 0x7F, 0x00, 0x00},  // 0x7C '|'
     {0x00, 0x41, 0x36, 0x08, 0x00},  // 0x7D '}'
-    {0x08, 0x04, 0x08, 0x10, 0x08}   // 0x7E '~'
+    {0x06, 0x09, 0x09, 0x06, 0x00}   // 0x7E '~' (rendered as degree symbol °)
 };
 
 }  // namespace
@@ -277,6 +277,33 @@ void St7789Lcd::drawRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t co
     fillRect(x + w - 1, y, 1, h, color);
 }
 
+void St7789Lcd::fillCircle(int16_t cx, int16_t cy, int16_t r, uint16_t color) {
+    if (r <= 0) return;
+    for (int16_t dy = -r; dy <= r; ++dy) {
+        int32_t dx_sq = static_cast<int32_t>(r) * r - static_cast<int32_t>(dy) * dy;
+        int16_t dx = 0;
+        while (static_cast<int32_t>(dx + 1) * (dx + 1) <= dx_sq) {
+            ++dx;
+        }
+        fillRect(cx - dx, cy + dy, 2 * dx + 1, 1, color);
+    }
+}
+
+void St7789Lcd::drawThickLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t r, uint16_t color) {
+    int16_t dx = abs(x1 - x0);
+    int16_t dy = abs(y1 - y0);
+    int16_t steps = (dx > dy) ? dx : dy;
+    if (steps == 0) {
+        fillCircle(x0, y0, r, color);
+        return;
+    }
+    for (int16_t i = 0; i <= steps; ++i) {
+        int16_t x = x0 + static_cast<int16_t>((static_cast<int32_t>(x1 - x0) * i) / steps);
+        int16_t y = y0 + static_cast<int16_t>((static_cast<int32_t>(y1 - y0) * i) / steps);
+        fillRect(x - r, y - r, 2 * r + 1, 2 * r + 1, color);
+    }
+}
+
 void St7789Lcd::drawCard(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t bg_color, uint16_t border_color) {
     fillRect(x + 1, y + 1, w - 2, h - 2, bg_color);
     drawRect(x, y, w, h, border_color);
@@ -298,13 +325,15 @@ void St7789Lcd::drawProgressBar(int16_t x, int16_t y, int16_t w, int16_t h, uint
     }
 }
 
-void St7789Lcd::drawChar(int16_t x, int16_t y, char c, uint16_t fg, uint16_t bg, uint8_t scale) {
-    if (scale == 0) scale = 1;
-    if (scale > 10) scale = 10;
+void St7789Lcd::drawCharScaled(int16_t x, int16_t y, char c, uint16_t fg, uint16_t bg, uint8_t scale_x, uint8_t scale_y) {
+    if (scale_x == 0) scale_x = 1;
+    if (scale_x > 10) scale_x = 10;
+    if (scale_y == 0) scale_y = 1;
+    if (scale_y > 16) scale_y = 16;
     if (c < 0x20 || c > 0x7E) c = '?';
 
-    const int16_t char_w = 6 * scale;
-    const int16_t char_h = 8 * scale;
+    const int16_t char_w = 6 * scale_x;
+    const int16_t char_h = 8 * scale_y;
     if (x < 0 || y < 0 || x + char_w > board::LCD_WIDTH || y + char_h > board::LCD_HEIGHT) {
         return;
     }
@@ -313,7 +342,6 @@ void St7789Lcd::drawChar(int16_t x, int16_t y, char c, uint16_t fg, uint16_t bg,
     const uint16_t fg_be = (fg >> 8) | (fg << 8);
     const uint16_t bg_be = (bg >> 8) | (bg << 8);
 
-    // One horizontal scanline buffer (max scale=10 -> 60 uint16_t pixels)
     uint16_t row_buf[60];
 
     setAddrWindow(x, y, x + char_w - 1, y + char_h - 1);
@@ -329,11 +357,11 @@ void St7789Lcd::drawChar(int16_t x, int16_t y, char c, uint16_t fg, uint16_t bg,
                 on = (pgm_read_byte(&glyph[col]) >> row) & 0x01;
             }
             uint16_t px = on ? fg_be : bg_be;
-            for (uint8_t sx = 0; sx < scale; ++sx) {
+            for (uint8_t sx = 0; sx < scale_x; ++sx) {
                 row_buf[idx++] = px;
             }
         }
-        for (uint8_t sy = 0; sy < scale; ++sy) {
+        for (uint8_t sy = 0; sy < scale_y; ++sy) {
             SPI.writeBytes(reinterpret_cast<const uint8_t*>(row_buf), char_w * 2);
         }
     }
@@ -342,21 +370,29 @@ void St7789Lcd::drawChar(int16_t x, int16_t y, char c, uint16_t fg, uint16_t bg,
     SPI.endTransaction();
 }
 
-void St7789Lcd::drawString(int16_t x, int16_t y, const char* str, uint16_t fg, uint16_t bg, uint8_t scale, uint8_t max_chars) {
+void St7789Lcd::drawStringScaled(int16_t x, int16_t y, const char* str, uint16_t fg, uint16_t bg, uint8_t scale_x, uint8_t scale_y, uint8_t max_chars) {
     if (!str) return;
-    const int16_t step = 6 * scale;
+    const int16_t step = 6 * scale_x;
     uint8_t count = 0;
     while (*str && (max_chars == 0 || count < max_chars)) {
         if (x + step > board::LCD_WIDTH) break;
-        drawChar(x, y, *str++, fg, bg, scale);
+        drawCharScaled(x, y, *str++, fg, bg, scale_x, scale_y);
         x += step;
         ++count;
     }
     while (max_chars > 0 && count < max_chars && x + step <= board::LCD_WIDTH) {
-        drawChar(x, y, ' ', fg, bg, scale);
+        drawCharScaled(x, y, ' ', fg, bg, scale_x, scale_y);
         x += step;
         ++count;
     }
+}
+
+void St7789Lcd::drawChar(int16_t x, int16_t y, char c, uint16_t fg, uint16_t bg, uint8_t scale) {
+    drawCharScaled(x, y, c, fg, bg, scale, scale);
+}
+
+void St7789Lcd::drawString(int16_t x, int16_t y, const char* str, uint16_t fg, uint16_t bg, uint8_t scale, uint8_t max_chars) {
+    drawStringScaled(x, y, str, fg, bg, scale, scale, max_chars);
 }
 
 }  // namespace lcd

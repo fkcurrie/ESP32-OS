@@ -234,37 +234,231 @@ uint8_t stepSmoothBar(uint8_t current, uint8_t target) {
     return static_cast<uint8_t>(static_cast<int>(current) + step);
 }
 
-void renderDashboardView(const screen::ScreenState& st, uint32_t now_ms, bool full_redraw) {
-    (void)st;
-    if (full_redraw) {
-        g_lcd.drawCard(6, 26, 151, 102, lcd::COLOR_CARD, lcd::COLOR_BORDER);
-        g_lcd.drawString(14, 31, "STOPWATCH", lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 10);
+uint32_t g_clock_sync_millis = 0;
+uint32_t g_clock_base_ds = (22UL * 3600UL + 18UL * 60UL) * 10UL;
 
-        g_lcd.drawCard(163, 26, 151, 102, lcd::COLOR_CARD, lcd::COLOR_BORDER);
-        g_lcd.drawString(171, 31, "20FPS WAVE", lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 10);
+void initClockFromCompileTime() {
+    int hh = 22, mm = 18, ss = 0;
+    if (sscanf(__TIME__, "%d:%d:%d", &hh, &mm, &ss) == 3) {
+        g_clock_base_ds = static_cast<uint32_t>((hh * 3600L + mm * 60L + ss) * 10L);
+        g_state.clock_base_ds = g_clock_base_ds;
+    }
+    g_clock_sync_millis = millis();
+}
+
+void drawCloudShape(int16_t cx, int16_t cy, uint16_t top_color, uint16_t mid_color) {
+    // Shadow/base layer
+    g_lcd.fillCircle(cx - 18, cy + 4, 14, mid_color);
+    g_lcd.fillCircle(cx + 18, cy + 5, 13, mid_color);
+    g_lcd.fillRect(cx - 18, cy + 4, 36, 15, mid_color);
+    // Highlight puffs
+    g_lcd.fillCircle(cx - 6, cy - 5, 16, top_color);
+    g_lcd.fillCircle(cx + 10, cy - 2, 14, top_color);
+    g_lcd.fillRect(cx - 16, cy + 2, 32, 13, top_color);
+}
+
+void drawSnowflake(int16_t cx, int16_t cy, int16_t r, uint16_t color) {
+    g_lcd.fillRect(cx - r, cy - 1, 2 * r + 1, 3, color);
+    g_lcd.fillRect(cx - 1, cy - r, 3, 2 * r + 1, color);
+    int16_t d = (r * 7) / 10;
+    g_lcd.drawThickLine(cx - d, cy - d, cx + d, cy + d, 1, color);
+    g_lcd.drawThickLine(cx - d, cy + d, cx + d, cy - d, 1, color);
+}
+
+void drawWeatherIcon(screen::WeatherKind kind) {
+    // Clear 112x136 icon region on the left
+    g_lcd.fillRect(4, 30, 116, 138, lcd::COLOR_BG);
+
+    switch (kind) {
+        case screen::WeatherKind::SUNNY: {
+            const int16_t cx = 62;
+            const int16_t cy = 98;
+            // 8 radiating sunbeams
+            g_lcd.drawThickLine(cx - 42, cy, cx + 42, cy, 2, lcd::ICON_SUN_YELLOW);
+            g_lcd.drawThickLine(cx, cy - 42, cx, cy + 42, 2, lcd::ICON_SUN_YELLOW);
+            g_lcd.drawThickLine(cx - 30, cy - 30, cx + 30, cy + 30, 2, lcd::ICON_SUN_YELLOW);
+            g_lcd.drawThickLine(cx - 30, cy + 30, cx + 30, cy - 30, 2, lcd::ICON_SUN_YELLOW);
+            g_lcd.fillCircle(cx, cy, 29, lcd::COLOR_BG);
+            g_lcd.fillCircle(cx, cy, 24, lcd::ICON_SUN_YELLOW);
+            g_lcd.fillCircle(cx, cy, 15, lcd::ICON_SUN_CORE);
+            break;
+        }
+        case screen::WeatherKind::PARTLY_CLOUDY: {
+            // Sun in upper-left
+            const int16_t sx = 42;
+            const int16_t sy = 72;
+            g_lcd.drawThickLine(sx - 28, sy, sx + 28, sy, 2, lcd::ICON_SUN_YELLOW);
+            g_lcd.drawThickLine(sx, sy - 28, sx, sy + 28, 2, lcd::ICON_SUN_YELLOW);
+            g_lcd.drawThickLine(sx - 20, sy - 20, sx + 20, sy + 20, 2, lcd::ICON_SUN_YELLOW);
+            g_lcd.drawThickLine(sx - 20, sy + 20, sx + 20, sy - 20, 2, lcd::ICON_SUN_YELLOW);
+            g_lcd.fillCircle(sx, sy, 21, lcd::COLOR_BG);
+            g_lcd.fillCircle(sx, sy, 17, lcd::ICON_SUN_YELLOW);
+            g_lcd.fillCircle(sx, sy, 10, lcd::ICON_SUN_CORE);
+            // Cloud in foreground
+            drawCloudShape(68, 104, lcd::ICON_CLOUD_TOP, lcd::ICON_CLOUD_MID);
+            break;
+        }
+        case screen::WeatherKind::CLOUDY: {
+            // Darker cloud behind + bright white cloud in front
+            drawCloudShape(48, 78, lcd::ICON_CLOUD_MID, lcd::ICON_CLOUD_DARK);
+            drawCloudShape(68, 104, lcd::ICON_CLOUD_TOP, lcd::ICON_CLOUD_MID);
+            break;
+        }
+        case screen::WeatherKind::RAIN: {
+            drawCloudShape(62, 74, lcd::ICON_CLOUD_TOP, lcd::ICON_CLOUD_MID);
+            // Vibrant blue falling rain streaks
+            g_lcd.drawThickLine(38, 106, 30, 130, 2, lcd::ICON_RAIN_BLUE);
+            g_lcd.drawThickLine(56, 106, 48, 130, 2, lcd::ICON_RAIN_BLUE);
+            g_lcd.drawThickLine(74, 106, 66, 130, 2, lcd::ICON_RAIN_BLUE);
+            g_lcd.drawThickLine(92, 106, 84, 130, 2, lcd::ICON_RAIN_BLUE);
+
+            g_lcd.drawThickLine(44, 136, 38, 154, 2, lcd::ICON_RAIN_BLUE);
+            g_lcd.drawThickLine(62, 136, 56, 154, 2, lcd::ICON_RAIN_BLUE);
+            g_lcd.drawThickLine(80, 136, 74, 154, 2, lcd::ICON_RAIN_BLUE);
+            break;
+        }
+        case screen::WeatherKind::LIGHTNING: {
+            drawCloudShape(62, 70, lcd::ICON_CLOUD_MID, lcd::ICON_CLOUD_DARK);
+            // Flanking raindrops
+            g_lcd.drawThickLine(34, 104, 26, 128, 2, lcd::ICON_RAIN_BLUE);
+            g_lcd.drawThickLine(92, 104, 84, 128, 2, lcd::ICON_RAIN_BLUE);
+            // Vivid yellow jagged lightning bolt
+            g_lcd.drawThickLine(66, 94, 50, 122, 3, lcd::ICON_BOLT_GOLD);
+            g_lcd.drawThickLine(50, 122, 68, 122, 2, lcd::ICON_BOLT_GOLD);
+            g_lcd.drawThickLine(68, 122, 50, 156, 3, lcd::ICON_BOLT_GOLD);
+            break;
+        }
+        case screen::WeatherKind::LIGHT_SNOW: {
+            drawCloudShape(62, 74, lcd::ICON_CLOUD_TOP, lcd::ICON_CLOUD_MID);
+            drawSnowflake(40, 118, 7, lcd::ICON_SNOW_ICE);
+            drawSnowflake(64, 138, 8, lcd::COLOR_WHITE);
+            drawSnowflake(86, 118, 7, lcd::ICON_SNOW_ICE);
+            break;
+        }
+        case screen::WeatherKind::HEAVY_SNOW:
+        default: {
+            drawCloudShape(62, 68, lcd::ICON_CLOUD_TOP, lcd::ICON_CLOUD_MID);
+            drawSnowflake(36, 112, 7, lcd::COLOR_WHITE);
+            drawSnowflake(62, 110, 7, lcd::ICON_SNOW_ICE);
+            drawSnowflake(88, 112, 7, lcd::COLOR_WHITE);
+            drawSnowflake(48, 136, 7, lcd::ICON_SNOW_ICE);
+            drawSnowflake(76, 136, 7, lcd::COLOR_WHITE);
+            // Snowdrift accumulation bar at bottom
+            g_lcd.fillRect(24, 154, 76, 6, lcd::ICON_SNOW_ICE);
+            g_lcd.fillRect(30, 151, 64, 4, lcd::COLOR_WHITE);
+            break;
+        }
+    }
+}
+
+void renderFullClockPage(uint32_t now_ms, bool full_redraw) {
+    static char s_last_clock[12] = "";
+
+    if (full_redraw) {
+        g_lcd.fillScreen(lcd::COLOR_BG);
+        g_lcd.drawString(10, 6, "TORONTO", lcd::COLOR_WHITE, lcd::COLOR_BG, 2, 8);
+        g_lcd.drawString(212, 6, "LIVE 0.1S", lcd::COLOR_WHITE, lcd::COLOR_BG, 2, 9);
+        g_lcd.fillRect(8, 25, 304, 1, lcd::COLOR_WHITE);
+        memset(s_last_clock, 0, sizeof(s_last_clock));
     }
 
-    // Left card: Giant 40px sub-second stopwatch (00.0 .. 99.9s) + 20 FPS sweep bar
-    uint32_t sec_mod = (now_ms / 1000UL) % 100UL;
-    uint32_t tenths = (now_ms / 100UL) % 10UL;
-    char left_buf[12];
-    snprintf(left_buf, sizeof(left_buf), "%02lu.%lu", static_cast<unsigned long>(sec_mod), static_cast<unsigned long>(tenths));
-    g_lcd.drawString(14, 53, left_buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 5, 4);
+    uint32_t elapsed_ds = (now_ms - g_clock_sync_millis) / 100UL;
+    uint32_t total_ds = (g_clock_base_ds + elapsed_ds) % 864000UL;
+    uint32_t hh = (total_ds / 36000UL) % 24UL;
+    uint32_t mm = (total_ds / 600UL) % 60UL;
+    uint32_t ss = (total_ds / 10UL) % 60UL;
+    uint32_t tenths = total_ds % 10UL;
 
-    // Smooth 20 FPS triangle wave over a 2-second period (0..100..0)
-    uint32_t sweep_ms = now_ms % 2000UL;
-    uint8_t sweep_pct = static_cast<uint8_t>(
-        (sweep_ms < 1000UL) ? (sweep_ms / 10UL) : ((2000UL - sweep_ms) / 10UL));
-    g_lcd.drawProgressBar(14, 102, 135, 18, sweep_pct, lcd::COLOR_WHITE, lcd::COLOR_BG);
+    char clock_buf[12];
+    snprintf(
+        clock_buf,
+        sizeof(clock_buf),
+        "%02lu:%02lu:%02lu.%lu",
+        static_cast<unsigned long>(hh),
+        static_cast<unsigned long>(mm),
+        static_cast<unsigned long>(ss),
+        static_cast<unsigned long>(tenths));
 
-    // Right card: Giant 40px live 20 FPS wave percentage (0..100%) + thick bar
-    uint32_t wave_ms = (now_ms + 500UL) % 3000UL;
-    uint8_t wave_pct = static_cast<uint8_t>(
-        (wave_ms < 1500UL) ? (wave_ms / 15UL) : ((3000UL - wave_ms) / 15UL));
-    char right_buf[12];
-    snprintf(right_buf, sizeof(right_buf), "%3u%%", static_cast<unsigned>(wave_pct));
-    g_lcd.drawString(171, 53, right_buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 5, 4);
-    g_lcd.drawProgressBar(171, 102, 135, 18, wave_pct, lcd::COLOR_WHITE, lcd::COLOR_BG);
+    // Draw 10 characters at scale_x=5 (30px/char -> 300px wide), scale_y=12 (96px tall!)
+    const int16_t start_x = 12;
+    const int16_t start_y = 36;
+    for (int i = 0; i < 10 && clock_buf[i] != '\0'; ++i) {
+        if (full_redraw || clock_buf[i] != s_last_clock[i]) {
+            g_lcd.drawCharScaled(
+                start_x + i * 30,
+                start_y,
+                clock_buf[i],
+                lcd::COLOR_WHITE,
+                lcd::COLOR_BG,
+                5,
+                12);
+            s_last_clock[i] = clock_buf[i];
+        }
+    }
+
+    // Smooth 20 FPS sub-second sweep bar across bottom
+    uint8_t sub_pct = static_cast<uint8_t>(((now_ms - g_clock_sync_millis) % 1000UL) / 10UL);
+    g_lcd.drawProgressBar(12, 144, 296, 18, sub_pct, lcd::COLOR_WHITE, lcd::COLOR_BG);
+}
+
+void renderTorontoWeatherPage(const screen::ScreenState& st, bool full_redraw) {
+    static screen::WeatherKind s_last_kind = screen::WeatherKind::COUNT;
+    static int16_t s_last_temp = -999;
+    static int16_t s_last_high = -999;
+    static int16_t s_last_low = -999;
+
+    if (full_redraw) {
+        g_lcd.fillScreen(lcd::COLOR_BG);
+        g_lcd.drawString(10, 6, "TORONTO", lcd::COLOR_WHITE, lcd::COLOR_BG, 2, 8);
+        g_lcd.fillRect(8, 25, 304, 1, lcd::COLOR_WHITE);
+        s_last_kind = screen::WeatherKind::COUNT;
+        s_last_temp = -999;
+        s_last_high = -999;
+        s_last_low = -999;
+    }
+
+    if (full_redraw || st.weather_kind != s_last_kind) {
+        char cond_buf[16];
+        snprintf(cond_buf, sizeof(cond_buf), "%11s", screen::weatherKindLabel(st.weather_kind));
+        g_lcd.drawString(180, 6, cond_buf, lcd::COLOR_WHITE, lcd::COLOR_BG, 2, 11);
+        drawWeatherIcon(st.weather_kind);
+        s_last_kind = st.weather_kind;
+    }
+
+    if (full_redraw || st.weather_temp_c != s_last_temp) {
+        char temp_buf[10];
+        snprintf(temp_buf, sizeof(temp_buf), "%3d~C", static_cast<int>(st.weather_temp_c));
+        g_lcd.drawStringScaled(128, 34, temp_buf, lcd::COLOR_WHITE, lcd::COLOR_BG, 6, 7, 5);
+        s_last_temp = st.weather_temp_c;
+    }
+
+    if (full_redraw || st.weather_high_c != s_last_high) {
+        char hi_buf[12];
+        snprintf(hi_buf, sizeof(hi_buf), "HI:%3d~C", static_cast<int>(st.weather_high_c));
+        g_lcd.drawString(132, 102, hi_buf, lcd::COLOR_WHITE, lcd::COLOR_BG, 3, 8);
+        s_last_high = st.weather_high_c;
+    }
+
+    if (full_redraw || st.weather_low_c != s_last_low) {
+        char lo_buf[12];
+        snprintf(lo_buf, sizeof(lo_buf), "LO:%3d~C", static_cast<int>(st.weather_low_c));
+        g_lcd.drawString(132, 136, lo_buf, lcd::COLOR_WHITE, lcd::COLOR_BG, 3, 8);
+        s_last_low = st.weather_low_c;
+    }
+}
+
+void renderDashboardView(const screen::ScreenState& st, uint32_t now_ms, bool full_redraw) {
+    static uint8_t s_last_subpage = 0xFF;
+    // Alternate every 5.0 seconds between Page 0 (Full Clock) and Page 1 (Toronto Weather)
+    uint8_t subpage = static_cast<uint8_t>((now_ms / 5000UL) % 2UL);
+    bool page_redraw = full_redraw || (subpage != s_last_subpage);
+    s_last_subpage = subpage;
+
+    if (subpage == 0) {
+        renderFullClockPage(now_ms, page_redraw);
+    } else {
+        renderTorontoWeatherPage(st, page_redraw);
+    }
 }
 
 void renderHostView(const screen::ScreenState& st, bool full_redraw) {
@@ -320,6 +514,11 @@ void renderUiIfNeeded() {
         g_state.free_heap = ESP.getFreeHeap();
         g_state.total_heap = ESP.getHeapSize();
         g_state.uptime_sec = now_ms / 1000UL;
+        if (g_state.clock_sync_requested) {
+            g_clock_base_ds = g_state.clock_base_ds;
+            g_clock_sync_millis = now_ms;
+            g_state.clock_sync_requested = false;
+        }
 
         if (g_state.ui_dirty || (now_ms - last_frame_ms >= FRAME_INTERVAL_MS)) {
             should_draw = true;
@@ -350,14 +549,16 @@ void renderUiIfNeeded() {
         g_last_rendered_view = snapshot.view_mode;
     }
 
-    renderHeader(snapshot, now_ms, full_redraw);
-
     switch (snapshot.view_mode) {
         case screen::ViewMode::HOST_MONITOR:
+            renderHeader(snapshot, now_ms, full_redraw);
             renderHostView(snapshot, full_redraw);
+            renderFooter(snapshot, now_ms, full_redraw);
             break;
         case screen::ViewMode::WIRELESS:
+            renderHeader(snapshot, now_ms, full_redraw);
             renderWirelessView(snapshot, full_redraw);
+            renderFooter(snapshot, now_ms, full_redraw);
             break;
         case screen::ViewMode::DASHBOARD:
         default:
@@ -365,7 +566,6 @@ void renderUiIfNeeded() {
             break;
     }
 
-    renderFooter(snapshot, now_ms, full_redraw);
     last_frame_ms = now_ms;
 }
 
@@ -381,6 +581,7 @@ void setup() {
     g_state.flash_mb = static_cast<uint16_t>(ESP.getFlashChipSize() / (1024UL * 1024UL));
     g_state.free_heap = ESP.getFreeHeap();
     g_state.total_heap = ESP.getHeapSize();
+    initClockFromCompileTime();
 
     g_lcd.begin();
     initSdCard();

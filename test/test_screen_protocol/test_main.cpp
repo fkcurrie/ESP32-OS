@@ -11,6 +11,7 @@ using screen::parseSerialCommand;
 using screen::RgbMode;
 using screen::ScreenState;
 using screen::ViewMode;
+using screen:: WeatherKind;
 using screen::wheelColor;
 
 void setUp(void) {}
@@ -131,6 +132,27 @@ void test_ui_helpers(void) {
     TEST_ASSERT_TRUE(c85.r > 0 || c85.g > 0 || c85.b > 0);
 }
 
+void test_time_and_weather_commands(void) {
+    ScreenState state;
+    char resp[128] = {0};
+
+    TEST_ASSERT_TRUE(parseSerialCommand("TIME 22:25:14.7", state, resp, sizeof(resp)));
+    TEST_ASSERT_EQUAL_UINT32((22UL * 3600UL + 25UL * 60UL + 14UL) * 10UL + 7UL, state.clock_base_ds);
+    TEST_ASSERT_TRUE(state.clock_sync_requested);
+    TEST_ASSERT_EQUAL_STRING("OK TIME 22:25:14.7", resp);
+
+    TEST_ASSERT_TRUE(parseSerialCommand("WEATHER heavy_snow -8 -4 -12", state, resp, sizeof(resp)));
+    TEST_ASSERT_EQUAL(WeatherKind::HEAVY_SNOW, state.weather_kind);
+    TEST_ASSERT_EQUAL_INT16(-8, state.weather_temp_c);
+    TEST_ASSERT_EQUAL_INT16(-4, state.weather_high_c);
+    TEST_ASSERT_EQUAL_INT16(-12, state.weather_low_c);
+    TEST_ASSERT_EQUAL_STRING("OK WEATHER heavy_snow -8 -4 -12", resp);
+    TEST_ASSERT_EQUAL_STRING("HEAVY SNOW", screen::weatherKindLabel(state.weather_kind));
+
+    TEST_ASSERT_FALSE(parseSerialCommand("TIME 99:00:00", state, resp, sizeof(resp)));
+    TEST_ASSERT_FALSE(parseSerialCommand("WEATHER tornado 20 25 10", state, resp, sizeof(resp)));
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -143,5 +165,6 @@ int main(int argc, char** argv) {
     RUN_TEST(test_host_and_view_commands);
     RUN_TEST(test_scan_and_unknown_commands);
     RUN_TEST(test_ui_helpers);
+    RUN_TEST(test_time_and_weather_commands);
     return UNITY_END();
 }

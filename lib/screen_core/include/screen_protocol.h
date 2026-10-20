@@ -21,6 +21,17 @@ enum class RgbMode : uint8_t {
     COUNT = 4
 };
 
+enum class WeatherKind : uint8_t {
+    SUNNY = 0,
+    PARTLY_CLOUDY = 1,
+    CLOUDY = 2,
+    RAIN = 3,
+    LIGHTNING = 4,
+    LIGHT_SNOW = 5,
+    HEAVY_SNOW = 6,
+    COUNT = 7
+};
+
 struct RgbColor {
     uint8_t r;
     uint8_t g;
@@ -46,6 +57,14 @@ struct ScreenState {
     bool landscape_flipped = false;
     bool ui_dirty = true;
 
+    // Clock (tenths of a second since midnight, 0..863999) & Toronto Weather
+    uint32_t clock_base_ds = (22UL * 3600UL + 18UL * 60UL) * 10UL;
+    bool clock_sync_requested = false;
+    WeatherKind weather_kind = WeatherKind::SUNNY;
+    int16_t weather_temp_c = 11;
+    int16_t weather_high_c = 20;
+    int16_t weather_low_c = 7;
+
     // Host telemetry & custom banner
     uint8_t host_cpu_pct = 0;
     uint8_t host_ram_pct = 0;
@@ -60,6 +79,9 @@ bool parseSerialCommand(const char* line, ScreenState& state, char* response, si
 
 // Format current state as a compact single-line JSON string.
 void formatStatusJson(const ScreenState& state, char* out, size_t out_len);
+
+// Return short uppercase display label for a weather condition.
+const char* weatherKindLabel(WeatherKind kind);
 
 // Cycle to the next view mode (used by short press on BOOT button).
 ViewMode nextViewMode(ViewMode current);

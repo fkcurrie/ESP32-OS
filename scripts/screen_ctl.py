@@ -7,8 +7,68 @@ import math
 import os
 import socket
 import sys
+import datetime
 import termios
 import time
+import urllib.request
+
+
+WEATHER_KINDS = [
+    "sunny",
+    "partly_cloudy",
+    "cloudy",
+    "rain",
+    "lightning",
+    "light_snow",
+    "heavy_snow",
+]
+
+
+def wmo_code_to_weather_kind(code: int) -> str:
+    """Map Open-Meteo WMO weather interpretation code to firmware WeatherKind."""
+    if code in (0, 1):
+        return "sunny"
+    if code == 2:
+        return "partly_cloudy"
+    if code in (3, 45, 48):
+        return "cloudy"
+    if code in (51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82):
+        return "rain"
+    if code in (71, 73, 77, 85):
+        return "light_snow"
+    if code in (75, 86):
+        return "heavy_snow"
+    if code in (95, 96, 99):
+        return "lightning"
+    return "partly_cloudy"
+
+
+def fetch_toronto_weather() -> tuple[str, int, int, int]:
+    """Fetch current Toronto weather (kind, temp_c, high_c, low_c) from Open-Meteo."""
+    url = (
+        "https://api.open-meteo.com/v1/forecast?"
+        "latitude=43.6532&longitude=-79.3832"
+        "&current=temperature_2m,weather_code"
+        "&daily=temperature_2m_max,temperature_2m_min"
+        "&timezone=America%2FToronto&forecast_days=1"
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": "esp32c6-screen-ctl/1.0"})
+    with urllib.request.urlopen(req, timeout=5.0) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    cur = data.get("current", {})
+    daily = data.get("daily", {})
+    code = int(cur.get("weather_code", 0))
+    temp_c = int(round(float(cur.get("temperature_2m", 11.0))))
+    high_c = int(round(float((daily.get("temperature_2m_max") or [20.0])[0])))
+    low_c = int(round(float((daily.get("temperature_2m_min") or [7.0])[0])))
+    return wmo_code_to_weather_kind(code), temp_c, high_c, low_c
+
+
+def format_current_time_ds() -> str:
+    """Format current local host time as HH:MM:SS.d."""
+    now = datetime.datetime.now()
+    tenths = now.microsecond // 100000
+    return f"{now.hour:02d}:{now.minute:02d}:{now.second:02d}.{tenths}"
 
 
 def configure_tty(fd: int) -> None:
@@ -122,6 +182,18 @@ def main() -> int:
     sub.add_parser("ping", help="Send PING and verify PONG")
     sub.add_parser("status", help="Query device JSON status")
     sub.add_parser("scan", help="Trigger an immediate Wi-Fi / BLE scan")
+    sub.add_parser("sync", help="Sync exact local time (HH:MM:SS.d) and live Toronto weather from Open-Meteo")
+
+    p_time = sub.add_parser("time", help="Sync digital clock (defaults to current host local time)")
+    p_time.add_argument("value", nargs="?", help="Optional explicit time string HH:MM:SS[.d]")
+
+    p_weather = sub.add_parser("weather", help="Set Toronto weather icon and temperatures (C)")
+    p_weather.add_argument("kind", nargs="?", choices=WEATHER_KINDS, default="sunny", help="Weather icon kind")
+    p_weather.add_argument("temp_c", nargs="?", type=int, default=11, help="Current temperature in C")
+    p_weather.add_argument("high_c", nargs="?", type=int, default=20, help="Day high temperature in C")
+    p_weather.add_argument("low_c", nargs="?", type=int, default=7, help="Day low temperature in C")
+    p_weather.add_argument("--demo", action="store_true", help="Cycle through all 7 weather icons on the screen")
+
     p_flip = sub.add_parser("flip", help="Flip landscape orientation 180 degrees")
     p_flip.add_argument("state", nargs="?", choices=["0", "1"], help="Optional explicit flip state (0 or 1)")
 
@@ -163,6 +235,41 @@ def main() -> int:
             print(reply)
     elif args.subcmd == "scan":
         print(send_command(args.port, "SCAN"))
+    elif args.subcmd == "sync":
+        try:
+            kind, temp_c, high_c, low_c = fetch_toronto_weather()
+        except Exception as exc:
+            print(f"WARN Open-Meteo fetch failed ({exc}), using fallback Toronto weather", file=sys.stderr)
+            kind, temp_c, high_c, low_c = ("sunny", 11, 20, 7)
+        fd = os.open(args.port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            configure_tty(fd)
+            send_command_fd(fd, "VIEW dashboard")
+            t_str = format_current_time_ds()
+            r_time = send_command_fd(fd, f"TIME {t_str}")
+            r_wea = send_command_fd(fd, f"WEATHER {kind} {temp_c} {high_c} {low_c}")
+            print(f"{r_time} | {r_wea}")
+        finally:
+            os.close(fd)
+    elif args.subcmd == "time":
+        t_str = args.value if args.value else format_current_time_ds()
+        print(send_command(args.port, f"TIME {t_str}"))
+    elif args.subcmd == "weather":
+        if args.demo:
+            samples = [
+                ("sunny", 22, 25, 14),
+                ("partly_cloudy", 18, 21, 11),
+                ("cloudy", 14, 16, 9),
+                ("rain", 11, 13, 7),
+                ("lightning", 19, 23, 15),
+                ("light_snow", -2, 0, -6),
+                ("heavy_snow", -8, -5, -14),
+            ]
+            for kind, t_cur, t_hi, t_lo in samples:
+                print(send_command(args.port, f"WEATHER {kind} {t_cur} {t_hi} {t_lo}"))
+                time.sleep(1.5)
+        else:
+            print(send_command(args.port, f"WEATHER {args.kind} {args.temp_c} {args.high_c} {args.low_c}"))
     elif args.subcmd == "flip":
         cmd = f"FLIP {args.state}" if args.state is not None else "FLIP"
         print(send_command(args.port, cmd))
@@ -227,4 +334,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
 
