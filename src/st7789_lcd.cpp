@@ -284,12 +284,17 @@ void St7789Lcd::drawCard(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t bg
 
 void St7789Lcd::drawProgressBar(int16_t x, int16_t y, int16_t w, int16_t h, uint8_t pct, uint16_t fill_color, uint16_t track_color) {
     if (pct > 100) pct = 100;
-    int16_t fill_w = static_cast<int16_t>((static_cast<int32_t>(w) * pct) / 100);
+    drawRect(x, y, w, h, COLOR_WHITE);
+    const int16_t inner_w = w - 4;
+    const int16_t inner_h = h - 4;
+    if (inner_w <= 0 || inner_h <= 0) return;
+
+    int16_t fill_w = static_cast<int16_t>((static_cast<int32_t>(inner_w) * pct) / 100);
     if (fill_w > 0) {
-        fillRect(x, y, fill_w, h, fill_color);
+        fillRect(x + 2, y + 2, fill_w, inner_h, fill_color);
     }
-    if (fill_w < w) {
-        fillRect(x + fill_w, y, w - fill_w, h, track_color);
+    if (fill_w < inner_w) {
+        fillRect(x + 2 + fill_w, y + 2, inner_w - fill_w, inner_h, track_color);
     }
 }
 

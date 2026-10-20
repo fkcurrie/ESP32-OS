@@ -172,21 +172,24 @@ void processSerialInput() {
     }
 }
 
-void renderHeader(const screen::ScreenState& st, bool full_redraw) {
+void renderHeader(const screen::ScreenState& st, uint32_t now_ms, bool full_redraw) {
     if (full_redraw) {
-        g_lcd.fillRect(0, 0, board::LCD_WIDTH, 24, lcd::COLOR_NAVY);
-        g_lcd.drawString(8, 4, "ESP32-C6", lcd::COLOR_CYAN, lcd::COLOR_NAVY, 2, 8);
+        g_lcd.fillRect(0, 0, board::LCD_WIDTH, 24, lcd::COLOR_BG);
+        g_lcd.fillRect(6, 22, 308, 1, lcd::COLOR_WHITE);
+        g_lcd.drawString(8, 3, "ESP32-C6", lcd::COLOR_WHITE, lcd::COLOR_BG, 2, 8);
     }
 
+    unsigned long sec = static_cast<unsigned long>(now_ms / 1000UL);
+    unsigned long tenths = static_cast<unsigned long>((now_ms / 100UL) % 10UL);
     char right_tag[16];
     if (st.view_mode == screen::ViewMode::HOST_MONITOR) {
-        snprintf(right_tag, sizeof(right_tag), "HOST %luS", static_cast<unsigned long>(st.uptime_sec));
+        snprintf(right_tag, sizeof(right_tag), "HOST %3lu.%lus", sec % 1000UL, tenths);
     } else if (st.view_mode == screen::ViewMode::WIRELESS) {
-        snprintf(right_tag, sizeof(right_tag), "RF   %luS", static_cast<unsigned long>(st.uptime_sec));
+        snprintf(right_tag, sizeof(right_tag), "RF   %3lu.%lus", sec % 1000UL, tenths);
     } else {
-        snprintf(right_tag, sizeof(right_tag), "UP %5lus", static_cast<unsigned long>(st.uptime_sec));
+        snprintf(right_tag, sizeof(right_tag), "UP %5lu.%lus", sec % 100000UL, tenths);
     }
-    g_lcd.drawString(188, 4, right_tag, lcd::COLOR_AMBER, lcd::COLOR_NAVY, 2, 10);
+    g_lcd.drawString(180, 3, right_tag, lcd::COLOR_WHITE, lcd::COLOR_BG, 2, 11);
 }
 
 void renderFooter(const screen::ScreenState& st, bool full_redraw) {
@@ -202,59 +205,79 @@ void renderFooter(const screen::ScreenState& st, bool full_redraw) {
     g_lcd.drawString(14, 142, banner, lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 24);
 }
 
+uint8_t stepSmoothBar(uint8_t current, uint8_t target) {
+    if (current == target) {
+        return current;
+    }
+    int diff = static_cast<int>(target) - static_cast<int>(current);
+    int step = diff / 2;
+    if (step == 0) {
+        step = (diff > 0) ? 1 : -1;
+    }
+    return static_cast<uint8_t>(static_cast<int>(current) + step);
+}
+
 void renderDashboardView(const screen::ScreenState& st, bool full_redraw) {
+    static uint8_t s_wifi_bar = 0;
+    static uint8_t s_ble_bar = 0;
+
     if (full_redraw) {
         g_lcd.drawCard(6, 26, 151, 102, lcd::COLOR_CARD, lcd::COLOR_BORDER);
-        g_lcd.drawString(14, 31, "WI-FI 6", lcd::COLOR_CYAN, lcd::COLOR_CARD, 2, 10);
+        g_lcd.drawString(14, 31, "WI-FI 6", lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 10);
 
         g_lcd.drawCard(163, 26, 151, 102, lcd::COLOR_CARD, lcd::COLOR_BORDER);
-        g_lcd.drawString(171, 31, "BLE 5.0", lcd::COLOR_PURPLE, lcd::COLOR_CARD, 2, 10);
+        g_lcd.drawString(171, 31, "BLE 5.0", lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 10);
     }
 
     char num_buf[8];
     snprintf(num_buf, sizeof(num_buf), "%-3d", static_cast<int>(st.wifi_count));
     g_lcd.drawString(14, 53, num_buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 5, 3);
-    g_lcd.drawString(110, 74, "AP", lcd::COLOR_CYAN, lcd::COLOR_CARD, 2, 2);
+    g_lcd.drawString(110, 74, "AP", lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 2);
 
-    uint8_t wifi_bar = static_cast<uint8_t>((st.wifi_count * 5 > 100) ? 100 : (st.wifi_count * 5));
-    g_lcd.drawProgressBar(14, 102, 135, 18, wifi_bar, lcd::COLOR_CYAN, lcd::COLOR_BG);
+    uint8_t target_wifi = static_cast<uint8_t>((st.wifi_count * 5 > 100) ? 100 : (st.wifi_count * 5));
+    s_wifi_bar = stepSmoothBar(s_wifi_bar, target_wifi);
+    g_lcd.drawProgressBar(14, 102, 135, 18, s_wifi_bar, lcd::COLOR_WHITE, lcd::COLOR_BG);
 
     snprintf(num_buf, sizeof(num_buf), "%-3d", static_cast<int>(st.ble_count));
     g_lcd.drawString(171, 53, num_buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 5, 3);
-    g_lcd.drawString(267, 74, "DV", lcd::COLOR_PURPLE, lcd::COLOR_CARD, 2, 2);
+    g_lcd.drawString(267, 74, "DV", lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 2);
 
-    uint8_t ble_bar = static_cast<uint8_t>((st.ble_count * 2 > 100) ? 100 : (st.ble_count * 2));
-    g_lcd.drawProgressBar(171, 102, 135, 18, ble_bar, lcd::COLOR_PURPLE, lcd::COLOR_BG);
+    uint8_t target_ble = static_cast<uint8_t>((st.ble_count * 2 > 100) ? 100 : (st.ble_count * 2));
+    s_ble_bar = stepSmoothBar(s_ble_bar, target_ble);
+    g_lcd.drawProgressBar(171, 102, 135, 18, s_ble_bar, lcd::COLOR_WHITE, lcd::COLOR_BG);
 }
 
 void renderHostView(const screen::ScreenState& st, bool full_redraw) {
+    static uint8_t s_cpu_bar = 0;
+    static uint8_t s_ram_bar = 0;
+
     if (full_redraw) {
         g_lcd.drawCard(6, 26, 151, 102, lcd::COLOR_CARD, lcd::COLOR_BORDER);
-        g_lcd.drawString(14, 31, "CPU LOAD", lcd::COLOR_GREEN, lcd::COLOR_CARD, 2, 10);
+        g_lcd.drawString(14, 31, "CPU LOAD", lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 10);
 
         g_lcd.drawCard(163, 26, 151, 102, lcd::COLOR_CARD, lcd::COLOR_BORDER);
-        g_lcd.drawString(171, 31, "RAM USED", lcd::COLOR_AMBER, lcd::COLOR_CARD, 2, 10);
+        g_lcd.drawString(171, 31, "RAM USED", lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 10);
     }
 
     char buf[12];
     snprintf(buf, sizeof(buf), "%3u%%", static_cast<unsigned>(st.host_cpu_pct));
-    uint16_t cpu_color = (st.host_cpu_pct >= 80) ? lcd::COLOR_RED : lcd::COLOR_GREEN;
     g_lcd.drawString(14, 53, buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 5, 4);
-    g_lcd.drawProgressBar(14, 102, 135, 18, st.host_cpu_pct, cpu_color, lcd::COLOR_BG);
+    s_cpu_bar = stepSmoothBar(s_cpu_bar, st.host_cpu_pct);
+    g_lcd.drawProgressBar(14, 102, 135, 18, s_cpu_bar, lcd::COLOR_WHITE, lcd::COLOR_BG);
 
     snprintf(buf, sizeof(buf), "%3u%%", static_cast<unsigned>(st.host_ram_pct));
-    uint16_t ram_color = (st.host_ram_pct >= 85) ? lcd::COLOR_RED : lcd::COLOR_AMBER;
     g_lcd.drawString(171, 53, buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 5, 4);
-    g_lcd.drawProgressBar(171, 102, 135, 18, st.host_ram_pct, ram_color, lcd::COLOR_BG);
+    s_ram_bar = stepSmoothBar(s_ram_bar, st.host_ram_pct);
+    g_lcd.drawProgressBar(171, 102, 135, 18, s_ram_bar, lcd::COLOR_WHITE, lcd::COLOR_BG);
 }
 
 void renderWirelessView(const screen::ScreenState& st, bool full_redraw) {
     if (full_redraw) {
         g_lcd.drawCard(6, 26, 151, 102, lcd::COLOR_CARD, lcd::COLOR_BORDER);
-        g_lcd.drawString(14, 31, "WIFI APs", lcd::COLOR_CYAN, lcd::COLOR_CARD, 2, 10);
+        g_lcd.drawString(14, 31, "WIFI APs", lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 10);
 
         g_lcd.drawCard(163, 26, 151, 102, lcd::COLOR_CARD, lcd::COLOR_BORDER);
-        g_lcd.drawString(171, 31, "BLE DEVS", lcd::COLOR_PURPLE, lcd::COLOR_CARD, 2, 10);
+        g_lcd.drawString(171, 31, "BLE DEVS", lcd::COLOR_WHITE, lcd::COLOR_CARD, 2, 10);
     }
 
     char buf[12];
@@ -266,8 +289,9 @@ void renderWirelessView(const screen::ScreenState& st, bool full_redraw) {
 }
 
 void renderUiIfNeeded() {
-    static uint32_t last_uptime_drawn = 0;
-    uint32_t now_sec = millis() / 1000UL;
+    constexpr uint32_t FRAME_INTERVAL_MS = 50;  // 20 FPS smooth refresh
+    static uint32_t last_frame_ms = 0;
+    uint32_t now_ms = millis();
 
     screen::ScreenState snapshot;
     bool should_draw = false;
@@ -275,9 +299,9 @@ void renderUiIfNeeded() {
     if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
         g_state.free_heap = ESP.getFreeHeap();
         g_state.total_heap = ESP.getHeapSize();
-        g_state.uptime_sec = now_sec;
+        g_state.uptime_sec = now_ms / 1000UL;
 
-        if (g_state.ui_dirty || now_sec != last_uptime_drawn) {
+        if (g_state.ui_dirty || (now_ms - last_frame_ms >= FRAME_INTERVAL_MS)) {
             should_draw = true;
             g_state.ui_dirty = false;
             snapshot = g_state;
@@ -306,7 +330,7 @@ void renderUiIfNeeded() {
         g_last_rendered_view = snapshot.view_mode;
     }
 
-    renderHeader(snapshot, full_redraw);
+    renderHeader(snapshot, now_ms, full_redraw);
 
     switch (snapshot.view_mode) {
         case screen::ViewMode::HOST_MONITOR:
@@ -322,7 +346,7 @@ void renderUiIfNeeded() {
     }
 
     renderFooter(snapshot, full_redraw);
-    last_uptime_drawn = now_sec;
+    last_frame_ms = now_ms;
 }
 
 }  // namespace
@@ -361,5 +385,5 @@ void loop() {
         last_rgb_ms = millis();
         updateRgbLed();
     }
-    delay(10);
+    delay(2);
 }
