@@ -295,6 +295,7 @@ void St7789Lcd::drawProgressBar(int16_t x, int16_t y, int16_t w, int16_t h, uint
 
 void St7789Lcd::drawChar(int16_t x, int16_t y, char c, uint16_t fg, uint16_t bg, uint8_t scale) {
     if (scale == 0) scale = 1;
+    if (scale > 10) scale = 10;
     if (c < 0x20 || c > 0x7E) c = '?';
 
     const int16_t char_w = 6 * scale;
@@ -307,31 +308,31 @@ void St7789Lcd::drawChar(int16_t x, int16_t y, char c, uint16_t fg, uint16_t bg,
     const uint16_t fg_be = (fg >> 8) | (fg << 8);
     const uint16_t bg_be = (bg >> 8) | (bg << 8);
 
-    // Max scale=3 -> 18x24 pixels = 432 uint16_t
-    uint16_t buf[18 * 24];
-    if (scale > 3) scale = 3;
-
-    int idx = 0;
-    for (uint8_t row = 0; row < 8; ++row) {
-        for (uint8_t sy = 0; sy < scale; ++sy) {
-            for (uint8_t col = 0; col < 6; ++col) {
-                bool on = false;
-                if (col < 5 && row < 7) {
-                    on = (pgm_read_byte(&glyph[col]) >> row) & 0x01;
-                }
-                uint16_t px = on ? fg_be : bg_be;
-                for (uint8_t sx = 0; sx < scale; ++sx) {
-                    buf[idx++] = px;
-                }
-            }
-        }
-    }
+    // One horizontal scanline buffer (max scale=10 -> 60 uint16_t pixels)
+    uint16_t row_buf[60];
 
     setAddrWindow(x, y, x + char_w - 1, y + char_h - 1);
     SPI.beginTransaction(SPISettings(board::LCD_SPI_HZ, MSBFIRST, SPI_MODE0));
     digitalWrite(board::PIN_LCD_CS, LOW);
     digitalWrite(board::PIN_LCD_DC, HIGH);
-    SPI.writeBytes(reinterpret_cast<const uint8_t*>(buf), idx * 2);
+
+    for (uint8_t row = 0; row < 8; ++row) {
+        int idx = 0;
+        for (uint8_t col = 0; col < 6; ++col) {
+            bool on = false;
+            if (col < 5 && row < 7) {
+                on = (pgm_read_byte(&glyph[col]) >> row) & 0x01;
+            }
+            uint16_t px = on ? fg_be : bg_be;
+            for (uint8_t sx = 0; sx < scale; ++sx) {
+                row_buf[idx++] = px;
+            }
+        }
+        for (uint8_t sy = 0; sy < scale; ++sy) {
+            SPI.writeBytes(reinterpret_cast<const uint8_t*>(row_buf), char_w * 2);
+        }
+    }
+
     digitalWrite(board::PIN_LCD_CS, HIGH);
     SPI.endTransaction();
 }
