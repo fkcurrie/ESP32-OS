@@ -141,19 +141,24 @@ void ShellSession::renderMenu(const SystemState& state, char* out_buf, size_t ma
               "  \033[1;32mStatus:\033[0m %s\r\n"
               "  \033[1;36mSelect option [1-9, +/-, s, q]:\033[0m ",
               state.hostname, net_tag, ip_str,
-              state.free_sram_bytes / 1024U, state.total_sram_bytes / 1024U,
-              state.uptime_sec, state.ssh_active_sessions,
+              static_cast<unsigned>(state.free_sram_bytes / 1024U),
+              static_cast<unsigned>(state.total_sram_bytes / 1024U),
+              static_cast<unsigned>(state.uptime_sec),
+              static_cast<unsigned>(state.ssh_active_sessions),
               screenModeLabel(state.screen_mode), themeName(state.theme),
               state.landscape_flipped ? "YES" : "NO",
-              bar, state.backlight_pct,
-              ledModeName(state.led_mode), state.led_r, state.led_g, state.led_b,
+              bar, static_cast<unsigned>(state.backlight_pct),
+              ledModeName(state.led_mode),
+              static_cast<unsigned>(state.led_r),
+              static_cast<unsigned>(state.led_g),
+              static_cast<unsigned>(state.led_b),
               state.headline, state.subtitle,
               menu_notice_);
 }
 
 bool ShellSession::handleMenuKey(SystemState& state, VirtualFs& vfs, char ch,
                                  char* out_buf, size_t max_len) {
-    if (ch == '\r' || ch == '\n') {
+    if (ch == '\r' || ch == '\n' || ch == 0x03) {
         renderMenu(state, out_buf, max_len);
         return true;
     }
@@ -536,11 +541,11 @@ void ShellSession::formatStatusJson(const SystemState& state, char* out_buf, siz
              static_cast<int>(state.wifi_rssi),
              state.wifi_ap_ssid,
              state.wifi_ap_ip,
-             state.ssh_port,
-             state.ssh_active_sessions,
-             state.free_sram_bytes,
-             state.total_sram_bytes,
-             state.uptime_sec);
+             static_cast<unsigned>(state.ssh_port),
+             static_cast<unsigned>(state.ssh_active_sessions),
+             static_cast<unsigned>(state.free_sram_bytes),
+             static_cast<unsigned>(state.total_sram_bytes),
+             static_cast<unsigned>(state.uptime_sec));
 }
 
 bool ShellSession::executeCommandLine(SystemState& state, VirtualFs& vfs,
@@ -637,6 +642,10 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
     cmd_out[0] = '\0';
     char* target_buf = redir_path ? cmd_out : out_buf;
     size_t target_max = redir_path ? sizeof(cmd_out) : max_len;
+
+    if (strcmp(prog, "s") == 0 || strcmp(prog, "true") == 0 || strcmp(prog, ":") == 0) {
+        return true;
+    }
 
     if (strcmp(prog, "exit") == 0 || strcmp(prog, "logout") == 0) {
         appendFmt(out_buf, max_len, "logout\r\n");
@@ -757,28 +766,29 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         }
         appendFmt(target_buf, target_max, "\n");
     } else if (strcmp(prog, "uptime") == 0) {
-        uint32_t up = state.uptime_sec;
-        uint32_t days = up / 86400U;
-        uint32_t hrs  = (up % 86400U) / 3600U;
-        uint32_t mins = (up % 3600U) / 60U;
-        uint32_t secs = up % 60U;
+        unsigned up = static_cast<unsigned>(state.uptime_sec);
+        unsigned days = up / 86400U;
+        unsigned hrs  = (up % 86400U) / 3600U;
+        unsigned mins = (up % 3600U) / 60U;
+        unsigned secs = up % 60U;
         appendFmt(target_buf, target_max,
                   " up %u days, %02u:%02u:%02u,  %u user(s),  load average: 0.08, 0.05, 0.01\r\n",
-                  days, hrs, mins, secs, state.ssh_active_sessions > 0 ? state.ssh_active_sessions : 1);
+                  days, hrs, mins, secs,
+                  static_cast<unsigned>(state.ssh_active_sessions > 0 ? state.ssh_active_sessions : 1));
     } else if (strcmp(prog, "free") == 0) {
-        uint32_t total = state.total_sram_bytes / 1024U;
-        uint32_t free_m = state.free_sram_bytes / 1024U;
-        uint32_t used = (total > free_m) ? (total - free_m) : 0U;
+        unsigned total = static_cast<unsigned>(state.total_sram_bytes / 1024U);
+        unsigned free_m = static_cast<unsigned>(state.free_sram_bytes / 1024U);
+        unsigned used = (total > free_m) ? (total - free_m) : 0U;
         appendFmt(target_buf, target_max,
                   "               total        used        free      shared  buff/cache   available\r\n"
                   "Mem:          %6u      %6u      %6u           0          16      %6u (kB)\r\n"
                   "Swap:              0           0           0\r\n",
                   total, used, free_m, free_m);
     } else if (strcmp(prog, "df") == 0) {
-        uint32_t total = state.rootfs_total_kb;
-        uint32_t used  = state.rootfs_used_kb;
-        uint32_t avail = (total > used) ? (total - used) : 0U;
-        uint32_t pct   = (total > 0) ? ((used * 100U) / total) : 0U;
+        unsigned total = static_cast<unsigned>(state.rootfs_total_kb);
+        unsigned used  = static_cast<unsigned>(state.rootfs_used_kb);
+        unsigned avail = (total > used) ? (total - used) : 0U;
+        unsigned pct   = (total > 0) ? ((used * 100U) / total) : 0U;
         appendFmt(target_buf, target_max,
                   "Filesystem      1K-blocks    Used Available Use%% Mounted on\r\n"
                   "/dev/mtdblock4       %4u    %4u      %4u  %2u%% /\r\n"
@@ -789,7 +799,8 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         if (state.sd_mounted) {
             appendFmt(target_buf, target_max,
                       "/dev/mmcblk0p1   %8u     128  %8u   1%% /mnt/sd\r\n",
-                      state.sd_total_mb * 1024U, state.sd_total_mb * 1024U - 128U);
+                      static_cast<unsigned>(state.sd_total_mb * 1024U),
+                      static_cast<unsigned>(state.sd_total_mb * 1024U - 128U));
         }
     } else if (strcmp(prog, "ps") == 0) {
         appendFmt(target_buf, target_max,

@@ -269,14 +269,16 @@ bool VirtualFs::readFile(const SystemState& state, const char* abs_path, char* o
                  "cpu MHz\t\t: %u.000\n"
                  "flash size\t: %u MB (XMC DIO)\n"
                  "display\t\t: Waveshare 1.47\" ST7789 (320x172 RGB565 @ 80MHz SPI2)\n",
-                 state.cpu_freq_mhz, state.cpu_freq_mhz, state.flash_size_mb);
+                 static_cast<unsigned>(state.cpu_freq_mhz),
+                 static_cast<unsigned>(state.cpu_freq_mhz),
+                 static_cast<unsigned>(state.flash_size_mb));
         return true;
     }
     if (strcmp(abs_path, "/proc/meminfo") == 0) {
-        uint32_t total_kb = state.total_sram_bytes / 1024U;
-        uint32_t free_kb  = state.free_sram_bytes / 1024U;
-        uint32_t min_kb   = state.min_free_sram_bytes / 1024U;
-        uint32_t used_kb  = (total_kb > free_kb) ? (total_kb - free_kb) : 0U;
+        unsigned total_kb = static_cast<unsigned>(state.total_sram_bytes / 1024U);
+        unsigned free_kb  = static_cast<unsigned>(state.free_sram_bytes / 1024U);
+        unsigned min_kb   = static_cast<unsigned>(state.min_free_sram_bytes / 1024U);
+        unsigned used_kb  = (total_kb > free_kb) ? (total_kb - free_kb) : 0U;
         snprintf(out_buf, max_len,
                  "MemTotal:         %6u kB\n"
                  "MemFree:          %6u kB\n"
@@ -289,7 +291,9 @@ bool VirtualFs::readFile(const SystemState& state, const char* abs_path, char* o
         return true;
     }
     if (strcmp(abs_path, "/proc/uptime") == 0) {
-        snprintf(out_buf, max_len, "%u.00 %u.00\n", state.uptime_sec, state.uptime_sec);
+        snprintf(out_buf, max_len, "%u.00 %u.00\n",
+                 static_cast<unsigned>(state.uptime_sec),
+                 static_cast<unsigned>(state.uptime_sec));
         return true;
     }
     if (strcmp(abs_path, "/proc/loadavg") == 0) {
@@ -303,7 +307,8 @@ bool VirtualFs::readFile(const SystemState& state, const char* abs_path, char* o
                  "    lo:       0       0    0    0    0     0          0         0        0       0    0    0\n"
                  " wlan0:%8u     120    0    0    0     0          0         0 %8u     115    0    0\n"
                  "   ap0:     512       8    0    0    0     0          0         0     1024      10    0    0\n",
-                 state.net_rx_bytes, state.net_tx_bytes);
+                 static_cast<unsigned>(state.net_rx_bytes),
+                 static_cast<unsigned>(state.net_tx_bytes));
         return true;
     }
     if (strcmp(abs_path, "/proc/net/wireless") == 0) {

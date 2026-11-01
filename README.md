@@ -1,72 +1,100 @@
-# Waveshare ESP32-C6-LCD-1.47 Firmware & Host Control Suite
+# C6-MicroLinux (`c6os`) — Waveshare ESP32-C6-LCD-1.47
 
-Custom firmware, portable protocol library, and Linux host CLI for the **Waveshare ESP32-C6-LCD-1.47** development board attached over USB-Serial/JTAG (`/dev/ttyACM0`).
+A custom, lightweight Linux-style micro-operating system and native **RFC-compliant SSHv2 server (`sshd`)** built from source for the **Waveshare ESP32-C6-LCD-1.47** (`ESP32-C6FH4` 160 MHz 32-bit RISC-V, 320 KB SRAM, 8 MB SPI Flash, 1.47" 320×172 ST7789 IPS LCD).
 
-## Hardware Profile & Verified Pinout
+Users can **SSH directly into the ESP32-C6** over Wi-Fi (`ssh root@<ip>`) or attach over USB-Serial (`/dev/ttyACM0`) to control the 1.47" LCD screen and onboard WS2812 RGB LED through an **interactive ANSI CLI Menu (`c6-menu`)** or a **POSIX-like shell (`c6-sh`)** with virtual `/proc`, `/sys`, and `/dev` filesystems.
 
-| Feature | Specification |
+---
+
+## Architecture & Key Features
+
+| Subsystem | Implementation |
 | :--- | :--- |
-| **Board** | Waveshare ESP32-C6-LCD-1.47 (non-touch) |
-| **SoC** | Espressif `ESP32-C6FH4` (QFN32, revision `v0.2`), 160 MHz single-core 32-bit RISC-V |
-| **Radios** | Wi-Fi 6 (802.11ax), Bluetooth 5 (LE), IEEE 802.15.4 (Zigbee / Thread) |
-| **USB Interface** | Built-in USB-Serial/JTAG (`303a:1001`) at `/dev/ttyACM0`, Base MAC `14:c1:9f:05:7d:10` |
-| **Flash & SRAM** | **8 MB SPI Flash** (`XMC 0x20/0x4017`, **DIO** mode), **320 KB SRAM** (`268 KB` usable heap), 0 PSRAM |
-| **Display** | 1.47" IPS TFT LCD (`ST7789`, `172×320` RGB565, column offset `+34` px, 80 MHz SPI) |
+| **Target SoC & Display** | `ESP32-C6FH4` (RV32IMAC @ 160 MHz, 320 KB SRAM, 8 MB DIO Flash) + Waveshare 1.47" ST7789 (`320x172` RGB565 @ 80 MHz SPI2) |
+| **SSHv2 Daemon (`sshd`)** | Built from source ([ssh_server.cpp](file:///home/fcurrie/Projects/small-led-screen/src/ssh_server.cpp), [ssh_packet.cpp](file:///home/fcurrie/Projects/small-led-screen/lib/c6os_core/src/ssh_packet.cpp)) on TCP Port `22` using `libsodium` + `mbedtls` (`curve25519-sha256` KEX, `ssh-ed25519` host key in NVS, `aes128-ctr` encryption, `hmac-sha2-256` MAC). Supports both `password` (`root` / `esp32c6`) and `publickey` authentication. |
+| **Interactive CLI Menu (`c6-menu`)** | Launches automatically upon SSH or Serial login ([c6os_shell.cpp](file:///home/fcurrie/Projects/small-led-screen/lib/c6os_core/src/c6os_shell.cpp)). Single-keystroke control (`[1]`–`[9]`, `[+]`/`[-]`, `[s]`, `[q]`) over LCD modes, custom headline/subtitle text, color themes, PWM backlight, 180° flip, WS2812 RGB LED, live `/dev/tty0` terminal mirroring, and Wi-Fi setup. |
+| **POSIX-like Shell (`c6-sh`)** | Built-in commands: `menu`, `screen`, `wifi`, `uname`, `uptime`, `free`, `df`, `ps`, `dmesg`, `ls`, `cd`, `pwd`, `cat`, `echo`, `rm`, `ip`/`ifconfig`, `hostname`, `passwd`, `reboot`, with output redirection (`>` / `>>`) and command chaining (`&&` / `;`). |
+| **Virtual Filesystem (`VirtualFs`)** | Synthetic `/proc` (`version`, `cpuinfo`, `meminfo`, `uptime`, `loadavg`, `net/dev`, `net/wireless`), `/sys/class/*` (`backlight/st7789/brightness`, `graphics/fb0/{mode,theme,text}`, `leds/ws2812/{mode,rgb}`), `/dev/tty0` framebuffer console, and persistent `/etc/*` & `/root/*` on LittleFS ([c6os_vfs.cpp](file:///home/fcurrie/Projects/small-led-screen/lib/c6os_core/src/c6os_vfs.cpp)). |
+| **4 LCD Render Modes** | `dashboard` (OS & SSH status cards), `console` (live 52×18 `/dev/tty0` Linux framebuffer terminal), `signboard` (full-screen custom typography banner), and `test` (SMPTE color bars & hardware diagnostics) ([screen_manager.cpp](file:///home/fcurrie/Projects/small-led-screen/src/screen_manager.cpp)). |
 
-### Onboard GPIO Pin Mapping
+---
 
-| Peripheral | Signal | GPIO | Notes |
-| :--- | :--- | :--- | :--- |
-| **SPI2 Bus** | `SCLK` | `GPIO 7` | Shared by ST7789 LCD and MicroSD slot |
-| **SPI2 Bus** | `MOSI` | `GPIO 6` | Shared by ST7789 LCD and MicroSD slot |
-| **SPI2 Bus** | `MISO` | `GPIO 5` | Used by MicroSD slot |
-| **ST7789 LCD** | `LCD_CS` | `GPIO 14` | Active-low chip select (80 MHz SPI) |
-| **ST7789 LCD** | `LCD_DC` | `GPIO 15` | Data (`1`) / Command (`0`) select |
-| **ST7789 LCD** | `LCD_RST` | `GPIO 21` | Active-low hardware reset |
-| **ST7789 LCD** | `LCD_BL` | `GPIO 22` | Backlight PWM (`1000 Hz`, 10-bit LEDC) |
-| **MicroSD Slot** | `SD_CS` | `GPIO 4` | Active-low chip select (4 MHz SPI) |
-| **RGB LED** | `RGB_DIN` | `GPIO 8` | Onboard addressable WS2812 RGB LED |
-| **BOOT Button** | `BOOT` | `GPIO 9` | Active-low input (short press: view, long press: dim) |
+## Connecting via SSH or USB-Serial
+
+### 1. Provision 2.4 GHz Wi-Fi (or Use Built-in SoftAP)
+
+By default, `C6-MicroLinux` broadcasts a fallback SoftAP (`SSID: C6-Linux-OS`, Password: `esp32linux`, IP: `192.168.4.1`) and also supports connecting to your 2.4 GHz LAN Wi-Fi network:
+
+```bash
+# Configure 2.4 GHz Wi-Fi via USB-Serial (/dev/ttyACM0)
+python3 scripts/c6os_ctl.py wifi "<YOUR_2.4GHZ_SSID>" "<YOUR_PASSWORD>"
+```
+
+Once connected, the LCD header and SSH card automatically display the board's IPv4 address.
+
+### 2. SSH into the ESP32-C6
+
+```bash
+# Interactive CLI Screen Control Menu over SSH (Default password: esp32c6)
+ssh root@<BOARD_IP>
+
+# Or execute non-interactive commands over SSH
+ssh root@<BOARD_IP> "screen mode signboard && screen text 'BUILD PASSED' 'All checks green'"
+ssh root@<BOARD_IP> "echo 'Hello from SSH!' >> /dev/tty0 && screen mode console"
+```
+
+### 3. USB-Serial Console (`/dev/ttyACM0`)
+
+```bash
+# Attach to the interactive ANSI Screen Control Menu over USB-Serial
+python3 scripts/c6os_ctl.py interactive
+
+# Query live JSON status
+python3 scripts/c6os_ctl.py status
+
+# Execute a shell command over USB-Serial
+python3 scripts/c6os_ctl.py exec "uname -a && cat /proc/meminfo"
+```
+
+---
+
+## Controlling the Screen via `/sys` and `/dev`
+
+Inside `c6-sh`, you can control hardware using either the `screen` utility or standard Linux device/sysfs redirection:
+
+```bash
+# Switch LCD rendering mode (dashboard | console | signboard | test)
+echo signboard > /sys/class/graphics/fb0/mode
+
+# Change color theme (cyan | matrix | amber | red | mono)
+echo matrix > /sys/class/graphics/fb0/theme
+
+# Adjust LCD PWM backlight (0 - 100%)
+echo 80 > /sys/class/backlight/st7789/brightness
+
+# Write lines directly to the LCD framebuffer terminal (/dev/tty0)
+echo " console > /sys/class/graphics/fb0/mode"
+echo "[OK] Deploying C6-MicroLinux..." > /dev/tty0
+echo "Kernel: $(uname -r)" >> /dev/tty0
+
+# Control the onboard WS2812 RGB LED
+echo "0 255 128" > /sys/class/leds/ws2812/rgb
+echo rainbow > /sys/class/leds/ws2812/mode
+```
 
 ---
 
 ## Building, Testing & Flashing
 
-### 1. Run Unit Tests (Host Native)
 ```bash
-timeout 30s pio test -e native
+# Run host-native unit tests (VFS, SSHv2 packet framing, CLI menu & shell)
+pio test -e native
+
+# Compile firmware for Waveshare ESP32-C6-LCD-1.47
+pio run -e waveshare_esp32c6_lcd_1.47
+
+# Flash firmware to /dev/ttyACM0
+pio run -e waveshare_esp32c6_lcd_147 -t upload
 ```
 
-### 2. Build & Flash Firmware
-```bash
-timeout 30s pio run -e waveshare_esp32c6_lcd_147 -t upload
-```
-
-### 3. Restore Factory Firmware Backup
-The original 4 MB factory flash dump (`0x000000..0x400000`) is stored in `backups/factory_firmware_4mb.bin` with its checksum tracked in [`backups/SHA256SUMS`](backups/SHA256SUMS):
-```bash
-./scripts/restore_factory.sh /dev/ttyACM0
-```
-
----
-
-## Host CLI Usage (`scripts/screen_ctl.py`)
-
-```bash
-# Query full hardware & UI state as JSON
-python3 scripts/screen_ctl.py status
-
-# Display custom text on the bottom card
-python3 scripts/screen_ctl.py text "Cluster Healthy"
-
-# Push live Linux host CPU, RAM, and IP telemetry to the Host Monitor view
-python3 scripts/screen_ctl.py host
-
-# Switch views (dashboard | host | wireless)
-python3 scripts/screen_ctl.py view dashboard
-
-# Control the onboard WS2812 RGB LED and LCD backlight
-python3 scripts/screen_ctl.py rgb 0 255 128
-python3 scripts/screen_ctl.py mode rainbow
-python3 scripts/screen_ctl.py bl 75
-```
+> **Note:** The previous Transit & Weather dashboard firmware is archived in [legacy/transit-dashboard/](file:///home/fcurrie/Projects/small-led-screen/legacy/transit-dashboard).
