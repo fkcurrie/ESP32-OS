@@ -11,11 +11,11 @@ Users can **SSH directly into the ESP32-C6** over Wi-Fi (`ssh root@<ip>`) or att
 | Subsystem | Implementation |
 | :--- | :--- |
 | **Target SoC & Display** | `ESP32-C6FH4` (RV32IMAC @ 160 MHz, 320 KB SRAM, 8 MB DIO Flash) + Waveshare 1.47" ST7789 (`320x172` RGB565 @ 80 MHz SPI2) |
-| **SSHv2 Daemon (`sshd`)** | Built from source ([ssh_server.cpp](file:///home/fcurrie/Projects/small-led-screen/src/ssh_server.cpp), [ssh_packet.cpp](file:///home/fcurrie/Projects/small-led-screen/lib/c6os_core/src/ssh_packet.cpp)) on TCP Port `22` using `libsodium` + `mbedtls` (`curve25519-sha256` KEX, `ssh-ed25519` host key in NVS, `aes128-ctr` encryption, `hmac-sha2-256` MAC). Supports both `password` (`root` / `esp32c6`) and `publickey` authentication. |
-| **Interactive CLI Menu (`c6-menu`)** | Launches automatically upon SSH or Serial login ([c6os_shell.cpp](file:///home/fcurrie/Projects/small-led-screen/lib/c6os_core/src/c6os_shell.cpp)). Single-keystroke control (`[1]`–`[9]`, `[+]`/`[-]`, `[s]`, `[q]`) over LCD modes, custom headline/subtitle text, color themes, PWM backlight, 180° flip, WS2812 RGB LED, live `/dev/tty0` terminal mirroring, and Wi-Fi setup. |
-| **POSIX-like Shell (`c6-sh`)** | Built-in commands: `menu`, `screen`, `wifi`, `uname`, `uptime`, `free`, `df`, `ps`, `dmesg`, `ls`, `cd`, `pwd`, `cat`, `echo`, `rm`, `ip`/`ifconfig`, `hostname`, `passwd`, `reboot`, with output redirection (`>` / `>>`) and command chaining (`&&` / `;`). |
-| **Virtual Filesystem (`VirtualFs`)** | Synthetic `/proc` (`version`, `cpuinfo`, `meminfo`, `uptime`, `loadavg`, `net/dev`, `net/wireless`), `/sys/class/*` (`backlight/st7789/brightness`, `graphics/fb0/{mode,theme,text}`, `leds/ws2812/{mode,rgb}`), `/dev/tty0` framebuffer console, and persistent `/etc/*` & `/root/*` on LittleFS ([c6os_vfs.cpp](file:///home/fcurrie/Projects/small-led-screen/lib/c6os_core/src/c6os_vfs.cpp)). |
-| **4 LCD Render Modes** | `dashboard` (OS & SSH status cards), `console` (live 52×18 `/dev/tty0` Linux framebuffer terminal), `signboard` (full-screen custom typography banner), and `test` (SMPTE color bars & hardware diagnostics) ([screen_manager.cpp](file:///home/fcurrie/Projects/small-led-screen/src/screen_manager.cpp)). |
+| **SSHv2 Daemon (`sshd`)** | Built from source ([`src/ssh_server.cpp`](src/ssh_server.cpp), [`lib/c6os_core/src/ssh_packet.cpp`](lib/c6os_core/src/ssh_packet.cpp)) on TCP Port `22` using `libsodium` + `mbedtls` (`curve25519-sha256` KEX, `ssh-ed25519` host key in NVS, `aes128-ctr` encryption, `hmac-sha2-256` MAC, RFC 8308 `SSH_MSG_EXT_INFO`). Supports concurrent multi-session SSH, `password` (`root` / `esp32c6`), and `publickey` authentication (including `ProxyJump`). |
+| **Interactive CLI Menu (`c6-menu`)** | Launches automatically upon SSH or Serial login ([`lib/c6os_core/src/c6os_shell.cpp`](lib/c6os_core/src/c6os_shell.cpp)). Single-keystroke control (`[1]`–`[9]`, `[+]`/`[-]`, `[t]`, `[s]`, `[q]`) over LCD modes, custom headline/subtitle text, color themes, PWM backlight, 180° flip, WS2812 RGB LED, live `/dev/tty0` terminal mirroring, `htop`, and Wi-Fi setup. |
+| **POSIX-like Shell (`c6-sh`) & Monitors** | Built-in commands: `top`, `htop`, `lscpu`, `vmstat`, `neofetch`, `menu`, `screen`, `wifi`, `uname`, `uptime`, `free`, `df`, `ps`, `dmesg`, `ls`, `cd`, `pwd`, `cat`, `echo`, `rm`, `ip`/`ifconfig`, `hostname`, `passwd`, `reboot`, with output redirection (`>` / `>>`) and command chaining (`&&` / `;`). |
+| **Virtual Filesystem (`VirtualFs`)** | Synthetic `/proc` (`version`, `cpuinfo`, `meminfo`, `uptime`, `loadavg`, `net/dev`, `net/wireless`), `/sys/class/*` (`backlight/st7789/brightness`, `graphics/fb0/{mode,theme,text}`, `leds/ws2812/{mode,rgb}`), `/dev/tty0` framebuffer console, and persistent `/etc/*` & `/root/*` on LittleFS ([`lib/c6os_core/src/c6os_vfs.cpp`](lib/c6os_core/src/c6os_vfs.cpp)). |
+| **4 LCD Render Modes** | `dashboard` (OS & SSH status cards), `console` (live 52×18 `/dev/tty0` Linux framebuffer terminal), `signboard` (full-screen custom typography banner), and `test` (SMPTE color bars & hardware diagnostics) ([`src/screen_manager.cpp`](src/screen_manager.cpp)). |
 
 ---
 
@@ -91,10 +91,10 @@ echo rainbow > /sys/class/leds/ws2812/mode
 pio test -e native
 
 # Compile firmware for Waveshare ESP32-C6-LCD-1.47
-pio run -e waveshare_esp32c6_lcd_1.47
+pio run -e waveshare_esp32c6_lcd_147
 
 # Flash firmware to /dev/ttyACM0
 pio run -e waveshare_esp32c6_lcd_147 -t upload
 ```
 
-> **Note:** The previous Transit & Weather dashboard firmware is archived in [legacy/transit-dashboard/](file:///home/fcurrie/Projects/small-led-screen/legacy/transit-dashboard).
+> **Note:** The previous Transit & Weather dashboard firmware is archived in [`legacy/transit-dashboard/`](legacy/transit-dashboard).
