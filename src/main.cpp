@@ -23,6 +23,8 @@ c6os::SshServer g_sshd(22);
 WiFiServer g_httpd(80);
 WiFiUDP g_syslog_udp;
 SemaphoreHandle_t g_mutex = nullptr;
+c6os::ShellSession g_bg_shell;
+char g_bg_out[1024];
 
 // Button debounce & press timing
 bool g_btn_pressed = false;
@@ -191,7 +193,6 @@ void pollHttpAndSyslog() {
                 char msg[112];
                 snprintf(msg, sizeof(msg), "syslogd: %.80s", sbuf);
                 g_state.appendDmesg(millis(), msg);
-                g_state.appendFbLine(msg);
                 g_state.ui_dirty = true;
                 xSemaphoreGive(g_mutex);
             }
@@ -201,6 +202,7 @@ void pollHttpAndSyslog() {
     // 2. Poll TCP 80 HTTP Webhook & REST API Server
     WiFiClient client = g_httpd.accept();
     if (!client) return;
+    client.setNoDelay(true);
 
     uint32_t t0 = millis();
     while (client.connected() && !client.available() && (millis() - t0 < 250)) {
@@ -211,14 +213,21 @@ void pollHttpAndSyslog() {
         return;
     }
 
-    String req_line = client.readStringUntil('\n');
-    req_line.trim();
+    char req_line[192];
+    size_t rlen = client.readBytesUntil('\n', req_line, sizeof(req_line) - 1);
+    while (rlen > 0 && (req_line[rlen - 1] == '\r' || req_line[rlen - 1] == ' ')) {
+        --rlen;
+    }
+    req_line[rlen] = '\0';
+
+    // Drain remaining HTTP request headers without heap allocations
+    char hdr_buf[128];
     while (client.available()) {
-        String hdr = client.readStringUntil('\n');
-        if (hdr.length() <= 1) break;
+        size_t hlen = client.readBytesUntil('\n', hdr_buf, sizeof(hdr_buf) - 1);
+        if (hlen == 0 || (hlen == 1 && hdr_buf[0] == '\r')) break;
     }
 
-    if (req_line.startsWith("GET /api/status")) {
+    if (strncmp(req_line, "GET /api/status", 15) == 0) {
         static char json[1024];
         json[0] = '\0';
         if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -228,22 +237,22 @@ void pollHttpAndSyslog() {
         }
         client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n");
         client.print(json);
-    } else if (req_line.startsWith("GET /api/cmd?q=")) {
-        int q_start = req_line.indexOf("?q=") + 3;
-        int q_end = req_line.indexOf(' ', q_start);
-        String q_raw = (q_end > q_start) ? req_line.substring(q_start, q_end) : req_line.substring(q_start);
+    } else if (strncmp(req_line, "GET /api/cmd?q=", 15) == 0) {
+        const char* q_start = req_line + 15;
+        const char* q_end = strchr(q_start, ' ');
+        size_t q_len = q_end ? static_cast<size_t>(q_end - q_start) : strlen(q_start);
         char cmd_buf[160];
-        strncpy(cmd_buf, q_raw.c_str(), sizeof(cmd_buf) - 1);
-        cmd_buf[sizeof(cmd_buf) - 1] = '\0';
+        if (q_len >= sizeof(cmd_buf)) q_len = sizeof(cmd_buf) - 1;
+        memcpy(cmd_buf, q_start, q_len);
+        cmd_buf[q_len] = '\0';
         urlDecodeInPlace(cmd_buf);
 
         char* out = static_cast<char*>(malloc(2048));
         if (out) {
             out[0] = '\0';
-            c6os::ShellSession http_sh;
             if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
                 g_state.http_requests++;
-                http_sh.executeCommandLine(g_state, g_vfs, cmd_buf, out, 2048);
+                g_bg_shell.executeCommandLine(g_state, g_vfs, cmd_buf, out, 2048);
                 xSemaphoreGive(g_mutex);
             }
             client.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n");
@@ -318,8 +327,12 @@ void networkTask(void* param) {
 
         bool connected = (WiFi.status() == WL_CONNECTED);
         if (connected) {
-            String ip = WiFi.localIP().toString();
-            String gw = WiFi.gatewayIP().toString();
+            IPAddress lip = WiFi.localIP();
+            IPAddress gwip = WiFi.gatewayIP();
+            char ip_str[20];
+            char gw_str[20];
+            snprintf(ip_str, sizeof(ip_str), "%u.%u.%u.%u", lip[0], lip[1], lip[2], lip[3]);
+            snprintf(gw_str, sizeof(gw_str), "%u.%u.%u.%u", gwip[0], gwip[1], gwip[2], gwip[3]);
             String ssid = WiFi.SSID();
             int32_t rssi = WiFi.RSSI();
 
@@ -330,10 +343,10 @@ void networkTask(void* param) {
             time_t now_epoch = time(nullptr);
 
             if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                bool ip_changed = (strcmp(g_state.wifi_ip, ip.c_str()) != 0);
+                bool ip_changed = (strcmp(g_state.wifi_ip, ip_str) != 0);
                 g_state.wifi_sta_connected = true;
-                strncpy(g_state.wifi_ip, ip.c_str(), sizeof(g_state.wifi_ip) - 1);
-                strncpy(g_state.wifi_gateway, gw.c_str(), sizeof(g_state.wifi_gateway) - 1);
+                strncpy(g_state.wifi_ip, ip_str, sizeof(g_state.wifi_ip) - 1);
+                strncpy(g_state.wifi_gateway, gw_str, sizeof(g_state.wifi_gateway) - 1);
                 strncpy(g_state.wifi_ssid, ssid.c_str(), sizeof(g_state.wifi_ssid) - 1);
                 g_state.wifi_rssi = rssi;
 
@@ -615,11 +628,7 @@ void setup() {
     g_state.appendDmesg(millis(), "httpd: REST API listening on 0.0.0.0:80");
     g_state.appendDmesg(millis(), "syslogd: UDP listener ready on 0.0.0.0:514");
     g_state.appendDmesg(millis(), "init: Executing /etc/rc.local & starting c6-sh");
-    {
-        char rc_out[512];
-        c6os::ShellSession boot_sh;
-        boot_sh.executeCommandLine(g_state, g_vfs, "sh /etc/rc.local", rc_out, sizeof(rc_out));
-    }
+    g_bg_shell.executeCommandLine(g_state, g_vfs, "sh /etc/rc.local", g_bg_out, sizeof(g_bg_out));
     g_screen.render(g_state, false);
 
     delay(600);
@@ -645,7 +654,7 @@ void loop() {
         if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
             if (g_state.ticker_enabled) {
                 g_state.ticker_offset++;
-                g_state.ui_dirty = true;
+                g_state.ticker_dirty = true;
             }
             xSemaphoreGive(g_mutex);
         }
@@ -654,13 +663,15 @@ void loop() {
     if (now - last_sec_tick >= 1000) {
         last_sec_tick = now;
         pollGpioHardware();
-        int16_t raw_deci_c = static_cast<int16_t>(temperatureRead() * 10.0f);
+        uint32_t up_sec = now / 1000U;
+        bool read_temp = ((up_sec % 5U) == 0U);
+        int16_t raw_deci_c = read_temp ? static_cast<int16_t>(temperatureRead() * 10.0f) : 0;
 
         if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            g_state.uptime_sec = now / 1000U;
+            g_state.uptime_sec = up_sec;
             g_state.free_sram_bytes = ESP.getFreeHeap();
             g_state.min_free_sram_bytes = ESP.getMinFreeHeap();
-            if (raw_deci_c > -200 && raw_deci_c < 1200) {
+            if (read_temp && raw_deci_c > -200 && raw_deci_c < 1200) {
                 g_state.cpu_temp_deci_c = raw_deci_c;
             }
 
@@ -672,17 +683,15 @@ void loop() {
             g_state.cpu_history[g_state.cpu_history_idx % 32] = load;
             g_state.cpu_history_idx = static_cast<uint8_t>((g_state.cpu_history_idx + 1) % 32);
 
-            // Execute due cron jobs
+            // Execute due cron jobs using shared background shell workspace
             for (size_t i = 0; i < c6os::MAX_CRON_JOBS; ++i) {
                 if (g_state.cron_jobs[i].active && g_state.cron_jobs[i].interval_sec > 0) {
                     if (g_state.uptime_sec - g_state.cron_jobs[i].last_run_sec >=
                         g_state.cron_jobs[i].interval_sec) {
                         g_state.cron_jobs[i].last_run_sec = g_state.uptime_sec;
                         g_state.cron_jobs[i].run_count++;
-                        char cron_out[512];
-                        c6os::ShellSession cron_sh;
-                        cron_sh.executeCommandLine(
-                            g_state, g_vfs, g_state.cron_jobs[i].cmd, cron_out, sizeof(cron_out));
+                        g_bg_shell.executeCommandLine(
+                            g_state, g_vfs, g_state.cron_jobs[i].cmd, g_bg_out, sizeof(g_bg_out));
                     }
                 }
             }
@@ -693,18 +702,30 @@ void loop() {
     }
 
     static c6os::SystemState snapshot;
-    bool should_render = false;
+    bool should_render_full = false;
+    bool should_render_ticker = false;
     if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(30)) == pdTRUE) {
         if (g_state.ui_dirty) {
             memcpy(&snapshot, &g_state, sizeof(snapshot));
             g_state.ui_dirty = false;
-            should_render = true;
+            g_state.ticker_dirty = false;
+            should_render_full = true;
+        } else if (g_state.ticker_dirty) {
+            snapshot.ticker_enabled = g_state.ticker_enabled;
+            snapshot.ticker_offset = g_state.ticker_offset;
+            snapshot.theme = g_state.theme;
+            strncpy(snapshot.ticker_text, g_state.ticker_text, sizeof(snapshot.ticker_text) - 1);
+            snapshot.ticker_text[sizeof(snapshot.ticker_text) - 1] = '\0';
+            g_state.ticker_dirty = false;
+            should_render_ticker = true;
         }
         xSemaphoreGive(g_mutex);
     }
 
-    if (should_render) {
+    if (should_render_full) {
         g_screen.render(snapshot, false);
+    } else if (should_render_ticker) {
+        g_screen.renderTickerOnly(snapshot);
     }
 
     if (now - last_led_tick >= 30) {

@@ -25,6 +25,7 @@ void ScreenManager::render(const SystemState& state, bool force_full_clear) {
     }
 
     const ThemePalette pal = getThemePalette(state.theme);
+    bool full_redraw = false;
     if (force_full_clear || state.screen_mode != last_mode_ || state.theme != last_theme_ ||
         (last_alert_ && !state.alert_active) || (last_ticker_ && !state.ticker_enabled) ||
         (state.screen_mode == ScreenMode::IMAGE_VIEW && state.fbi_pattern != last_fbi_pattern_)) {
@@ -32,6 +33,7 @@ void ScreenManager::render(const SystemState& state, bool force_full_clear) {
         last_mode_ = state.screen_mode;
         last_theme_ = state.theme;
         last_fbi_pattern_ = state.fbi_pattern;
+        full_redraw = true;
     }
     last_alert_ = state.alert_active;
     last_ticker_ = state.ticker_enabled;
@@ -47,24 +49,34 @@ void ScreenManager::render(const SystemState& state, bool force_full_clear) {
             renderDiagnostics(state, pal);
             break;
         case ScreenMode::MONITOR:
-            renderMonitor(state, pal);
+            renderMonitor(state, pal, full_redraw);
             break;
         case ScreenMode::IMAGE_VIEW:
             renderImageView(state, pal);
             break;
         case ScreenMode::OS_DASHBOARD:
         default:
-            renderDashboard(state, pal);
+            renderDashboard(state, pal, full_redraw);
             break;
     }
 
     renderOverlays(state, pal);
 }
 
-void ScreenManager::renderDashboard(const SystemState& state, const ThemePalette& pal) {
+void ScreenManager::renderTickerOnly(const SystemState& state) {
+    if (!state.ticker_enabled || state.ticker_text[0] == '\0') {
+        return;
+    }
+    const ThemePalette pal = getThemePalette(state.theme);
+    renderTickerBand(state, pal);
+}
+
+void ScreenManager::renderDashboard(const SystemState& state, const ThemePalette& pal, bool full_redraw) {
     // 1. Header Bar (y: 0..22)
-    lcd_.fillRect(0, 0, board::LCD_WIDTH, 22, pal.bg);
-    lcd_.fillRect(0, 21, board::LCD_WIDTH, 1, pal.border);
+    if (full_redraw) {
+        lcd_.fillRect(0, 0, board::LCD_WIDTH, 22, pal.bg);
+        lcd_.fillRect(0, 21, board::LCD_WIDTH, 1, pal.border);
+    }
 
     char hdr_left[32];
     snprintf(hdr_left, sizeof(hdr_left), "root@%s", state.hostname);
@@ -80,7 +92,9 @@ void ScreenManager::renderDashboard(const SystemState& state, const ThemePalette
     }
 
     // 2. Network & SSH Card (y: 25..77, h: 52)
-    lcd_.drawCard(2, 25, 316, 52, pal.bg, pal.border);
+    if (full_redraw) {
+        lcd_.drawCard(2, 25, 316, 52, pal.bg, pal.border);
+    }
     char ssh_cmd[48];
     const char* active_ip = state.wifi_sta_connected ? state.wifi_ip : state.wifi_ap_ip;
     snprintf(ssh_cmd, sizeof(ssh_cmd), "ssh root@%s", active_ip);
@@ -104,7 +118,9 @@ void ScreenManager::renderDashboard(const SystemState& state, const ThemePalette
     lcd_.drawString(8, 56, net_sub, pal.fg, pal.bg, 1, 50);
 
     // 3. Kernel & Hardware Telemetry Card (y: 80..121, h: 41)
-    lcd_.drawCard(2, 80, 316, 41, pal.bg, pal.border);
+    if (full_redraw) {
+        lcd_.drawCard(2, 80, 316, 41, pal.bg, pal.border);
+    }
     unsigned total_kb = static_cast<unsigned>(state.total_sram_bytes / 1024U);
     unsigned free_kb  = static_cast<unsigned>(state.free_sram_bytes / 1024U);
     unsigned used_kb  = (total_kb > free_kb) ? (total_kb - free_kb) : 0U;
@@ -126,7 +142,12 @@ void ScreenManager::renderDashboard(const SystemState& state, const ThemePalette
     lcd_.drawProgressBar(8, 100, 304, 14, ram_pct, pal.accent, pal.bg);
 
     // 4. User Banner / CLI Controlled Message Card (y: 124..170, h: 46)
-    lcd_.drawCard(2, 124, 316, 46, pal.bg, pal.accent);
+    if (full_redraw || state.custom_bar_visible != last_custom_bar_) {
+        lcd_.drawCard(2, 124, 316, 46, pal.bg, pal.accent);
+        last_custom_bar_ = state.custom_bar_visible;
+    } else {
+        lcd_.drawRect(2, 124, 316, 46, pal.accent);
+    }
     if (state.custom_bar_visible) {
         lcd_.drawString(8, 130, state.custom_bar_label, pal.accent, pal.bg, 1, 50);
         lcd_.drawProgressBar(8, 144, 304, 18, state.custom_bar_pct, pal.ok, pal.bg);
@@ -147,7 +168,7 @@ void ScreenManager::renderFbConsole(const SystemState& state, const ThemePalette
     // Render 18 console lines (y: 17..161, 8px per row)
     for (size_t i = 0; i < FB_CONSOLE_ROWS; ++i) {
         int16_t y = static_cast<int16_t>(17 + i * 8);
-        const char* line = (i < state.fb_line_count) ? state.fb_lines[i] : "";
+        const char* line = (i < state.fb_line_count) ? state.getFbLine(i) : "";
         uint16_t line_color = pal.fg;
         if (line[0] == '[') {
             line_color = pal.ok;  // dmesg timestamps highlighted
@@ -235,9 +256,11 @@ void ScreenManager::renderDiagnostics(const SystemState& state, const ThemePalet
     lcd_.drawString(8, 150, line6, pal.warn, pal.bg, 1, 50);
 }
 
-void ScreenManager::renderMonitor(const SystemState& state, const ThemePalette& pal) {
+void ScreenManager::renderMonitor(const SystemState& state, const ThemePalette& pal, bool full_redraw) {
     // 1. Header Bar (y: 0..16)
-    lcd_.fillRect(0, 0, board::LCD_WIDTH, 16, pal.accent);
+    if (full_redraw) {
+        lcd_.fillRect(0, 0, board::LCD_WIDTH, 16, pal.accent);
+    }
     char hdr[54];
     int t_int = static_cast<int>(state.cpu_temp_deci_c / 10);
     int t_frc = static_cast<int>(state.cpu_temp_deci_c % 10);
@@ -248,8 +271,10 @@ void ScreenManager::renderMonitor(const SystemState& state, const ThemePalette& 
     lcd_.drawString(2, 4, hdr, pal.bg, pal.accent, 1, 52);
 
     // 2. CPU Sparkline Graph Card (x: 2..158, y: 19..83)
-    lcd_.drawCard(2, 19, 156, 64, pal.bg, pal.border);
-    lcd_.drawString(6, 23, "CPU Load Sparkline", pal.accent, pal.bg, 1, 24);
+    if (full_redraw) {
+        lcd_.drawCard(2, 19, 156, 64, pal.bg, pal.border);
+        lcd_.drawString(6, 23, "CPU Load Sparkline", pal.accent, pal.bg, 1, 24);
+    }
     for (int i = 0; i < 32; ++i) {
         size_t idx = (state.cpu_history_idx + i) % 32;
         uint8_t val = state.cpu_history[idx];
@@ -264,7 +289,9 @@ void ScreenManager::renderMonitor(const SystemState& state, const ThemePalette& 
     }
 
     // 3. Memory, Thermal & Network Gauges (x: 162..318, y: 19..83)
-    lcd_.drawCard(162, 19, 156, 64, pal.bg, pal.border);
+    if (full_redraw) {
+        lcd_.drawCard(162, 19, 156, 64, pal.bg, pal.border);
+    }
     unsigned tot_kb = static_cast<unsigned>(state.total_sram_bytes / 1024U);
     unsigned fre_kb = static_cast<unsigned>(state.free_sram_bytes / 1024U);
     unsigned usd_kb = (tot_kb > fre_kb) ? (tot_kb - fre_kb) : 0U;
@@ -288,21 +315,22 @@ void ScreenManager::renderMonitor(const SystemState& state, const ThemePalette& 
     lcd_.drawString(166, 71, mline, pal.muted, pal.bg, 1, 24);
 
     // 4. Live Process Table (y: 86..170)
-    lcd_.drawCard(2, 86, 316, 84, pal.bg, pal.border);
-    lcd_.drawString(6, 90, "PID USER  S  CPU%  MEM%  COMMAND", pal.accent, pal.bg, 1, 50);
-    lcd_.fillRect(4, 99, 312, 1, pal.border);
+    if (full_redraw) {
+        lcd_.drawCard(2, 86, 316, 84, pal.bg, pal.border);
+        lcd_.drawString(6, 90, "PID USER  S  CPU%  MEM%  COMMAND", pal.accent, pal.bg, 1, 50);
+        lcd_.fillRect(4, 99, 312, 1, pal.border);
+        lcd_.drawString(6, 103, "  1 root  S   0.2   1.1  /sbin/init", pal.fg, pal.bg, 1, 50);
+        lcd_.drawString(6, 114, " 18 root  S   1.4   4.2  [st7789_fb0]", pal.ok, pal.bg, 1, 50);
+        lcd_.drawString(6, 136, " 45 root  S   0.3   2.1  httpd:80 + syslogd:514", pal.fg, pal.bg, 1, 50);
+    } else {
+        lcd_.drawRect(2, 86, 316, 84, pal.border);
+    }
 
     char pline[54];
-    snprintf(pline, sizeof(pline), "  1 root  S   0.2   1.1  /sbin/init");
-    lcd_.drawString(6, 103, pline, pal.fg, pal.bg, 1, 50);
-    snprintf(pline, sizeof(pline), " 18 root  S   1.4   4.2  [st7789_fb0]");
-    lcd_.drawString(6, 114, pline, pal.ok, pal.bg, 1, 50);
     snprintf(pline, sizeof(pline), " 29 root  S   %u.2   8.4  /usr/sbin/sshd (%u act)",
              static_cast<unsigned>(state.ssh_active_sessions > 0 ? 3 : 0),
              static_cast<unsigned>(state.ssh_active_sessions));
     lcd_.drawString(6, 125, pline, pal.fg, pal.bg, 1, 50);
-    snprintf(pline, sizeof(pline), " 45 root  S   0.3   2.1  httpd:80 + syslogd:514");
-    lcd_.drawString(6, 136, pline, pal.fg, pal.bg, 1, 50);
     snprintf(pline, sizeof(pline), " 61 root  R   %u.5   3.8  /bin/c6-htop --lcd",
              static_cast<unsigned>(state.cpu_load_pct / 3));
     lcd_.drawString(6, 147, pline, pal.accent, pal.bg, 1, 50);
@@ -385,22 +413,28 @@ void ScreenManager::renderImageView(const SystemState& state, const ThemePalette
     lcd_.drawStringScaled(8, 149, state.fbi_caption, pal.fg, pal.bg, 1, 2, 50);
 }
 
-void ScreenManager::renderOverlays(const SystemState& state, const ThemePalette& pal) {
-    // 1. Bottom Scrolling Marquee Ticker (y: 154..171)
-    if (state.ticker_enabled && state.ticker_text[0] != '\0') {
-        lcd_.fillRect(0, 153, board::LCD_WIDTH, 1, pal.accent);
-        lcd_.fillRect(0, 154, board::LCD_WIDTH, 18, pal.bg);
+void ScreenManager::renderTickerBand(const SystemState& state, const ThemePalette& pal) {
+    lcd_.fillRect(0, 153, board::LCD_WIDTH, 1, pal.accent);
+    lcd_.fillRect(0, 154, board::LCD_WIDTH, 2, pal.bg);
+    lcd_.fillRect(0, 156, 4, 16, pal.bg);
+    lcd_.fillRect(316, 156, 4, 16, pal.bg);
 
-        char window[54];
-        size_t len = strlen(state.ticker_text);
-        if (len == 0) len = 1;
-        size_t start = static_cast<size_t>(state.ticker_offset) % (len + 8);
-        for (size_t i = 0; i < 52; ++i) {
-            size_t idx = (start + i) % (len + 8);
-            window[i] = (idx < len) ? state.ticker_text[idx] : ' ';
-        }
-        window[52] = '\0';
-        lcd_.drawStringScaled(4, 156, window, pal.warn, pal.bg, 1, 2, 52);
+    char window[54];
+    size_t len = strlen(state.ticker_text);
+    if (len == 0) len = 1;
+    size_t start = static_cast<size_t>(state.ticker_offset) % (len + 8);
+    for (size_t i = 0; i < 52; ++i) {
+        size_t idx = (start + i) % (len + 8);
+        window[i] = (idx < len) ? state.ticker_text[idx] : ' ';
+    }
+    window[52] = '\0';
+    lcd_.drawStringScaled(4, 156, window, pal.warn, pal.bg, 1, 2, 52);
+}
+
+void ScreenManager::renderOverlays(const SystemState& state, const ThemePalette& pal) {
+    // 1. Bottom Scrolling Marquee Ticker (y: 153..171)
+    if (state.ticker_enabled && state.ticker_text[0] != '\0') {
+        renderTickerBand(state, pal);
     }
 
     // 2. High-Visibility Flashing Alert Overlay Banner (y: 44..124)

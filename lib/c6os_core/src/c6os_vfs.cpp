@@ -427,7 +427,7 @@ bool VirtualFs::readFile(const SystemState& state, const char* abs_path, char* o
     if (strcmp(abs_path, "/var/log/dmesg") == 0) {
         size_t pos = 0;
         for (size_t i = 0; i < state.dmesg_count; ++i) {
-            int w = snprintf(out_buf + pos, max_len - pos, "%s\n", state.dmesg[i]);
+            int w = snprintf(out_buf + pos, max_len - pos, "%s\n", state.getDmesgLine(i));
             if (w < 0 || static_cast<size_t>(w) >= max_len - pos) break;
             pos += static_cast<size_t>(w);
         }
@@ -436,7 +436,7 @@ bool VirtualFs::readFile(const SystemState& state, const char* abs_path, char* o
     if (strcmp(abs_path, "/dev/tty0") == 0 || strcmp(abs_path, "/dev/fb0") == 0) {
         size_t pos = 0;
         for (size_t i = 0; i < state.fb_line_count; ++i) {
-            int w = snprintf(out_buf + pos, max_len - pos, "%s\n", state.fb_lines[i]);
+            int w = snprintf(out_buf + pos, max_len - pos, "%s\n", state.getFbLine(i));
             if (w < 0 || static_cast<size_t>(w) >= max_len - pos) break;
             pos += static_cast<size_t>(w);
         }

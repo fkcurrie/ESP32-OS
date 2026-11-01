@@ -15,19 +15,22 @@ public:
           last_flipped_(false),
           last_alert_(false),
           last_ticker_(false),
+          last_custom_bar_(false),
           last_fbi_pattern_(255) {}
 
     void begin();
     void render(const SystemState& state, bool force_full_clear = false);
+    void renderTickerOnly(const SystemState& state);
 
 private:
-    void renderDashboard(const SystemState& state, const ThemePalette& pal);
+    void renderDashboard(const SystemState& state, const ThemePalette& pal, bool full_redraw);
     void renderFbConsole(const SystemState& state, const ThemePalette& pal);
     void renderSignboard(const SystemState& state, const ThemePalette& pal);
     void renderDiagnostics(const SystemState& state, const ThemePalette& pal);
-    void renderMonitor(const SystemState& state, const ThemePalette& pal);
+    void renderMonitor(const SystemState& state, const ThemePalette& pal, bool full_redraw);
     void renderImageView(const SystemState& state, const ThemePalette& pal);
     void renderOverlays(const SystemState& state, const ThemePalette& pal);
+    void renderTickerBand(const SystemState& state, const ThemePalette& pal);
 
     lcd::St7789Lcd lcd_;
     ScreenMode last_mode_;
@@ -36,6 +39,7 @@ private:
     bool last_flipped_;
     bool last_alert_;
     bool last_ticker_;
+    bool last_custom_bar_;
     uint8_t last_fbi_pattern_;
 };
 

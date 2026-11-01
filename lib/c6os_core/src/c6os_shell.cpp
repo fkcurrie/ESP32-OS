@@ -1892,13 +1892,12 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
                 if (w > 0) pos += static_cast<size_t>(w);
             }
             state.appendDmesg(state.uptime_sec * 1000U, msg);
-            state.appendFbConsoleLine(msg);
             state.syslog_packets++;
             appendFmt(target_buf, target_max, "OK LOGGER \"%s\"\r\n", msg);
         }
     } else if (strcmp(prog, "dmesg") == 0) {
         for (size_t i = 0; i < state.dmesg_count; ++i) {
-            appendFmt(target_buf, target_max, "%s\r\n", state.dmesg[i]);
+            appendFmt(target_buf, target_max, "%s\r\n", state.getDmesgLine(i));
         }
     } else if (strcmp(prog, "ip") == 0 || strcmp(prog, "ifconfig") == 0) {
         appendFmt(target_buf, target_max,

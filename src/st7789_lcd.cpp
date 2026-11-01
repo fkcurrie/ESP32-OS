@@ -129,19 +129,33 @@ void St7789Lcd::setAddrWindow(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2
     const uint16_t row_start = y1 + board::LCD_Y_OFFSET;
     const uint16_t row_end   = y2 + board::LCD_Y_OFFSET;
 
-    writeCommand(0x2A);  // CASET
-    writeData(col_start >> 8);
-    writeData(col_start & 0xFF);
-    writeData(col_end >> 8);
-    writeData(col_end & 0xFF);
+    const uint8_t caset[4] = {
+        static_cast<uint8_t>(col_start >> 8), static_cast<uint8_t>(col_start & 0xFF),
+        static_cast<uint8_t>(col_end >> 8),   static_cast<uint8_t>(col_end & 0xFF)
+    };
+    const uint8_t raset[4] = {
+        static_cast<uint8_t>(row_start >> 8), static_cast<uint8_t>(row_start & 0xFF),
+        static_cast<uint8_t>(row_end >> 8),   static_cast<uint8_t>(row_end & 0xFF)
+    };
 
-    writeCommand(0x2B);  // RASET
-    writeData(row_start >> 8);
-    writeData(row_start & 0xFF);
-    writeData(row_end >> 8);
-    writeData(row_end & 0xFF);
+    SPI.beginTransaction(SPISettings(board::LCD_SPI_HZ, MSBFIRST, SPI_MODE0));
+    digitalWrite(board::PIN_LCD_CS, LOW);
 
-    writeCommand(0x2C);  // RAMWR
+    digitalWrite(board::PIN_LCD_DC, LOW);
+    SPI.transfer(0x2A);  // CASET
+    digitalWrite(board::PIN_LCD_DC, HIGH);
+    SPI.writeBytes(caset, 4);
+
+    digitalWrite(board::PIN_LCD_DC, LOW);
+    SPI.transfer(0x2B);  // RASET
+    digitalWrite(board::PIN_LCD_DC, HIGH);
+    SPI.writeBytes(raset, 4);
+
+    digitalWrite(board::PIN_LCD_DC, LOW);
+    SPI.transfer(0x2C);  // RAMWR
+
+    digitalWrite(board::PIN_LCD_CS, HIGH);
+    SPI.endTransaction();
 }
 
 void St7789Lcd::begin() {
@@ -279,12 +293,15 @@ void St7789Lcd::drawRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t co
 
 void St7789Lcd::fillCircle(int16_t cx, int16_t cy, int16_t r, uint16_t color) {
     if (r <= 0) return;
-    for (int16_t dy = -r; dy <= r; ++dy) {
-        int32_t dx_sq = static_cast<int32_t>(r) * r - static_cast<int32_t>(dy) * dy;
-        int16_t dx = 0;
-        while (static_cast<int32_t>(dx + 1) * (dx + 1) <= dx_sq) {
-            ++dx;
+    const int32_t r_sq = static_cast<int32_t>(r) * r;
+    int16_t dx = r;
+    fillRect(cx - r, cy, 2 * r + 1, 1, color);
+    for (int16_t dy = 1; dy <= r; ++dy) {
+        const int32_t dy_sq = static_cast<int32_t>(dy) * dy;
+        while (dx > 0 && (static_cast<int32_t>(dx) * dx + dy_sq > r_sq)) {
+            --dx;
         }
+        fillRect(cx - dx, cy - dy, 2 * dx + 1, 1, color);
         fillRect(cx - dx, cy + dy, 2 * dx + 1, 1, color);
     }
 }
@@ -372,19 +389,60 @@ void St7789Lcd::drawCharScaled(int16_t x, int16_t y, char c, uint16_t fg, uint16
 
 void St7789Lcd::drawStringScaled(int16_t x, int16_t y, const char* str, uint16_t fg, uint16_t bg, uint8_t scale_x, uint8_t scale_y, uint8_t max_chars) {
     if (!str) return;
+    if (scale_x == 0) scale_x = 1;
+    if (scale_x > 10) scale_x = 10;
+    if (scale_y == 0) scale_y = 1;
+    if (scale_y > 16) scale_y = 16;
+
     const int16_t step = 6 * scale_x;
+    const int16_t box_h = 8 * scale_y;
+    if (x < 0 || y < 0 || y + box_h > board::LCD_HEIGHT) return;
+
+    char chars[64];
     uint8_t count = 0;
-    while (*str && (max_chars == 0 || count < max_chars)) {
-        if (x + step > board::LCD_WIDTH) break;
-        drawCharScaled(x, y, *str++, fg, bg, scale_x, scale_y);
-        x += step;
-        ++count;
+    int16_t cur_x = x;
+    while (*str && (max_chars == 0 || count < max_chars) && count < sizeof(chars)) {
+        if (cur_x + step > board::LCD_WIDTH) break;
+        char c = *str++;
+        if (c < 0x20 || c > 0x7E) c = '?';
+        chars[count++] = c;
+        cur_x += step;
     }
-    while (max_chars > 0 && count < max_chars && x + step <= board::LCD_WIDTH) {
-        drawCharScaled(x, y, ' ', fg, bg, scale_x, scale_y);
-        x += step;
-        ++count;
+    while (max_chars > 0 && count < max_chars && count < sizeof(chars) && cur_x + step <= board::LCD_WIDTH) {
+        chars[count++] = ' ';
+        cur_x += step;
     }
+    if (count == 0) return;
+
+    const int16_t box_w = count * step;
+    const uint16_t fg_be = (fg >> 8) | (fg << 8);
+    const uint16_t bg_be = (bg >> 8) | (bg << 8);
+    uint16_t scanline[board::LCD_WIDTH];
+
+    setAddrWindow(x, y, x + box_w - 1, y + box_h - 1);
+    SPI.beginTransaction(SPISettings(board::LCD_SPI_HZ, MSBFIRST, SPI_MODE0));
+    digitalWrite(board::PIN_LCD_CS, LOW);
+    digitalWrite(board::PIN_LCD_DC, HIGH);
+
+    for (uint8_t row = 0; row < 8; ++row) {
+        int idx = 0;
+        for (uint8_t ci = 0; ci < count; ++ci) {
+            const uint8_t* glyph = FONT_5X7[chars[ci] - 0x20];
+            for (uint8_t col = 0; col < 6; ++col) {
+                bool on = (col < 5 && row < 7) && ((pgm_read_byte(&glyph[col]) >> row) & 0x01);
+                uint16_t px = on ? fg_be : bg_be;
+                for (uint8_t sx = 0; sx < scale_x; ++sx) {
+                    scanline[idx++] = px;
+                }
+            }
+        }
+        for (uint8_t sy = 0; sy < scale_y; ++sy) {
+            SPI.writeBytes(reinterpret_cast<const uint8_t*>(scanline), box_w * 2);
+        }
+    }
+
+    digitalWrite(board::PIN_LCD_CS, HIGH);
+    SPI.endTransaction();
 }
 
 void St7789Lcd::drawChar(int16_t x, int16_t y, char c, uint16_t fg, uint16_t bg, uint8_t scale) {

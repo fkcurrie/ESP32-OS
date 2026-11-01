@@ -240,6 +240,7 @@ struct SystemState {
 
     // Hardware Action Flags (set by shell/menu, consumed by hardware tasks)
     bool ui_dirty;
+    bool ticker_dirty;
     bool wifi_reconnect_requested;
     bool wifi_scan_requested;
     bool reboot_requested;
@@ -249,13 +250,15 @@ struct SystemState {
     size_t wifi_scan_count;
     WifiScanEntry wifi_scan[MAX_WIFI_SCAN_RESULTS];
 
-    // Framebuffer Console (/dev/tty0 on physical LCD)
+    // Framebuffer Console (/dev/tty0 on physical LCD) — O(1) circular ring buffer
     char fb_lines[FB_CONSOLE_ROWS][FB_CONSOLE_COLS + 1];
     size_t fb_line_count;
+    size_t fb_head;
 
-    // Kernel Ring Buffer (dmesg)
+    // Kernel Ring Buffer (dmesg) — O(1) circular ring buffer
     char dmesg[DMESG_MAX_LINES][DMESG_LINE_LEN];
     size_t dmesg_count;
+    size_t dmesg_head;
 
     void initDefaults() {
         memset(this, 0, sizeof(*this));
@@ -334,6 +337,16 @@ struct SystemState {
         return count;
     }
 
+    const char* getFbLine(size_t logical_idx) const {
+        if (logical_idx >= fb_line_count) return "";
+        return fb_lines[(fb_head + logical_idx) % FB_CONSOLE_ROWS];
+    }
+
+    const char* getDmesgLine(size_t logical_idx) const {
+        if (logical_idx >= dmesg_count) return "";
+        return dmesg[(dmesg_head + logical_idx) % DMESG_MAX_LINES];
+    }
+
     void appendFbLine(const char* text) {
         appendFbConsoleLine(text);
     }
@@ -350,16 +363,13 @@ struct SystemState {
             if (*text == '\r') ++text;
             if (*text == '\n') ++text;
 
+            size_t slot = (fb_head + fb_line_count) % FB_CONSOLE_ROWS;
+            strncpy(fb_lines[slot], line, FB_CONSOLE_COLS);
+            fb_lines[slot][FB_CONSOLE_COLS] = '\0';
             if (fb_line_count < FB_CONSOLE_ROWS) {
-                strncpy(fb_lines[fb_line_count], line, FB_CONSOLE_COLS);
-                fb_lines[fb_line_count][FB_CONSOLE_COLS] = '\0';
                 ++fb_line_count;
             } else {
-                for (size_t i = 1; i < FB_CONSOLE_ROWS; ++i) {
-                    memcpy(fb_lines[i - 1], fb_lines[i], FB_CONSOLE_COLS + 1);
-                }
-                strncpy(fb_lines[FB_CONSOLE_ROWS - 1], line, FB_CONSOLE_COLS);
-                fb_lines[FB_CONSOLE_ROWS - 1][FB_CONSOLE_COLS] = '\0';
+                fb_head = (fb_head + 1) % FB_CONSOLE_ROWS;
             }
             if (len == 0 && *text == '\0') break;
         }
@@ -369,6 +379,7 @@ struct SystemState {
     void clearFbConsole() {
         memset(fb_lines, 0, sizeof(fb_lines));
         fb_line_count = 0;
+        fb_head = 0;
         ui_dirty = true;
     }
 
@@ -409,16 +420,13 @@ struct SystemState {
         }
         formatted[pos] = '\0';
 
+        size_t slot = (dmesg_head + dmesg_count) % DMESG_MAX_LINES;
+        strncpy(dmesg[slot], formatted, DMESG_LINE_LEN - 1);
+        dmesg[slot][DMESG_LINE_LEN - 1] = '\0';
         if (dmesg_count < DMESG_MAX_LINES) {
-            strncpy(dmesg[dmesg_count], formatted, DMESG_LINE_LEN - 1);
-            dmesg[dmesg_count][DMESG_LINE_LEN - 1] = '\0';
             ++dmesg_count;
         } else {
-            for (size_t i = 1; i < DMESG_MAX_LINES; ++i) {
-                memcpy(dmesg[i - 1], dmesg[i], DMESG_LINE_LEN);
-            }
-            strncpy(dmesg[DMESG_MAX_LINES - 1], formatted, DMESG_LINE_LEN - 1);
-            dmesg[DMESG_MAX_LINES - 1][DMESG_LINE_LEN - 1] = '\0';
+            dmesg_head = (dmesg_head + 1) % DMESG_MAX_LINES;
         }
         appendFbConsoleLine(formatted);
     }

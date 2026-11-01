@@ -282,14 +282,13 @@ bool sendChannelDataChunked(WiFiClient& client, SshTransportState& ts, SshWorksp
     size_t offset = 0;
     while (offset < len) {
         size_t chunk = len - offset;
-        if (chunk > 768) chunk = 768;
+        if (chunk > 1360) chunk = 1360;
 
-        uint8_t payload[800];
-        ssh::SshWriter w(payload, sizeof(payload));
+        ssh::SshWriter w(ws.client_kexinit, sizeof(ws.client_kexinit));
         w.putByte(ssh::SSH_MSG_CHANNEL_DATA);
         w.putUint32(recipient_chan);
         w.putString(reinterpret_cast<const uint8_t*>(data + offset), chunk);
-        if (!sendSshPacket(client, ts, ws, payload, w.length())) {
+        if (!sendSshPacket(client, ts, ws, ws.client_kexinit, w.length())) {
             return false;
         }
         offset += chunk;
@@ -386,11 +385,14 @@ void SshServer::pollAcceptAndServe(SystemState& state, VirtualFs& vfs, Semaphore
 
 void SshServer::serveAcceptedClient(WiFiClient client, SystemState& state, VirtualFs& vfs, SemaphoreHandle_t mutex) {
     client.setNoDelay(true);
-    String remote_ip = client.remoteIP().toString();
+    IPAddress rip = client.remoteIP();
+    char remote_ip[20];
+    snprintf(remote_ip, sizeof(remote_ip), "%u.%u.%u.%u", rip[0], rip[1], rip[2], rip[3]);
 
     if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         state.ssh_active_sessions++;
-        strncpy(state.ssh_client_ip, remote_ip.c_str(), sizeof(state.ssh_client_ip) - 1);
+        strncpy(state.ssh_client_ip, remote_ip, sizeof(state.ssh_client_ip) - 1);
+        state.ssh_client_ip[sizeof(state.ssh_client_ip) - 1] = '\0';
         char log_msg[72];
         snprintf(log_msg, sizeof(log_msg), "sshd: Connection from %s", state.ssh_client_ip);
         state.appendDmesg(millis(), log_msg);
@@ -406,7 +408,7 @@ void SshServer::serveAcceptedClient(WiFiClient client, SystemState& state, Virtu
             state.ssh_active_sessions--;
         }
         char log_msg[72];
-        snprintf(log_msg, sizeof(log_msg), "sshd: Closed session from %s", remote_ip.c_str());
+        snprintf(log_msg, sizeof(log_msg), "sshd: Closed session from %s", remote_ip);
         state.appendDmesg(millis(), log_msg);
         state.ui_dirty = true;
         xSemaphoreGive(mutex);
