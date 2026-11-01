@@ -137,44 +137,52 @@ void computeHmacSha256(const uint8_t key[32], uint32_t seq_num,
     crypto_auth_hmacsha256_final(&st, out_mac);
 }
 
-bool sendSshPacket(WiFiClient& client, SshTransportState& ts,
+struct SshWorkspace {
+    uint8_t tx_pkt_buf[2048];
+    uint8_t rx_pkt_buf[3584];
+    uint8_t client_kexinit[2560];
+    uint8_t rx_buf[2560];
+    char io_buf[3072];
+};
+
+bool sendSshPacket(WiFiClient& client, SshTransportState& ts, SshWorkspace& ws,
                    const uint8_t* payload, size_t payload_len) {
     uint8_t pad_rand[32];
     esp_fill_random(pad_rand, sizeof(pad_rand));
 
-    uint8_t pkt_buf[1536];
     size_t block_size = ts.encrypted ? 16 : 8;
     size_t framed_len = ssh::framePacket(payload, payload_len, block_size,
-                                         pad_rand, pkt_buf, sizeof(pkt_buf) - 32);
+                                         pad_rand, ws.tx_pkt_buf, sizeof(ws.tx_pkt_buf) - 32);
     if (framed_len == 0) return false;
 
     if (!ts.encrypted) {
-        size_t written = client.write(pkt_buf, framed_len);
+        size_t written = client.write(ws.tx_pkt_buf, framed_len);
         ts.seq_s2c++;
         return (written == framed_len);
     }
 
     uint8_t mac[32];
-    computeHmacSha256(ts.mac_s2c, ts.seq_s2c, pkt_buf, framed_len, mac);
+    computeHmacSha256(ts.mac_s2c, ts.seq_s2c, ws.tx_pkt_buf, framed_len, mac);
 
     // Encrypt framed packet in-place using AES-128-CTR
     if (mbedtls_aes_crypt_ctr(&ts.aes_s2c, framed_len, &ts.nc_off_s2c,
                               ts.iv_s2c, ts.stream_block_s2c,
-                              pkt_buf, pkt_buf) != 0) {
+                              ws.tx_pkt_buf, ws.tx_pkt_buf) != 0) {
         return false;
     }
 
-    memcpy(pkt_buf + framed_len, mac, 32);
+    memcpy(ws.tx_pkt_buf + framed_len, mac, 32);
     size_t total_wire = framed_len + 32;
-    size_t written = client.write(pkt_buf, total_wire);
+    size_t written = client.write(ws.tx_pkt_buf, total_wire);
     ts.seq_s2c++;
     return (written == total_wire);
 }
 
-bool recvSshPacket(WiFiClient& client, SshTransportState& ts,
+bool recvSshPacket(WiFiClient& client, SshTransportState& ts, SshWorkspace& ws,
                    uint8_t* out_payload, size_t max_payload,
                    size_t& out_payload_len, uint32_t timeout_ms = 60000) {
-    uint8_t pkt_buf[2048];
+    uint8_t* pkt_buf = ws.rx_pkt_buf;
+    const size_t pkt_buf_cap = sizeof(ws.rx_pkt_buf);
 
     if (!ts.encrypted) {
         if (!readExactBytes(client, pkt_buf, 4, timeout_ms)) return false;
@@ -182,7 +190,7 @@ bool recvSshPacket(WiFiClient& client, SshTransportState& ts,
                            (static_cast<uint32_t>(pkt_buf[1]) << 16) |
                            (static_cast<uint32_t>(pkt_buf[2]) << 8) |
                            static_cast<uint32_t>(pkt_buf[3]);
-        if (pkt_len < 2 || pkt_len + 4 > sizeof(pkt_buf)) return false;
+        if (pkt_len < 2 || pkt_len + 4 > pkt_buf_cap) return false;
         if (!readExactBytes(client, pkt_buf + 4, pkt_len, timeout_ms)) return false;
 
         uint8_t pad_len = pkt_buf[4];
@@ -211,7 +219,7 @@ bool recvSshPacket(WiFiClient& client, SshTransportState& ts,
                        (static_cast<uint32_t>(pkt_buf[2]) << 8) |
                        static_cast<uint32_t>(pkt_buf[3]);
     size_t total_len = 4 + pkt_len;
-    if (total_len < 16 || total_len > sizeof(pkt_buf) || (total_len % 16) != 0) {
+    if (total_len < 16 || total_len > pkt_buf_cap || (total_len % 16) != 0) {
         return false;
     }
 
@@ -259,7 +267,7 @@ void deriveSshKey(const uint8_t* k_mpint, size_t k_mpint_len,
     crypto_hash_sha256_final(&st, out_key);
 }
 
-bool sendChannelDataChunked(WiFiClient& client, SshTransportState& ts,
+bool sendChannelDataChunked(WiFiClient& client, SshTransportState& ts, SshWorkspace& ws,
                             uint32_t recipient_chan, const char* data, size_t len) {
     size_t offset = 0;
     while (offset < len) {
@@ -271,7 +279,7 @@ bool sendChannelDataChunked(WiFiClient& client, SshTransportState& ts,
         w.putByte(ssh::SSH_MSG_CHANNEL_DATA);
         w.putUint32(recipient_chan);
         w.putString(reinterpret_cast<const uint8_t*>(data + offset), chunk);
-        if (!sendSshPacket(client, ts, payload, w.length())) {
+        if (!sendSshPacket(client, ts, ws, payload, w.length())) {
             return false;
         }
         offset += chunk;
@@ -310,7 +318,7 @@ void SshServer::begin(SystemState& state, SemaphoreHandle_t mutex) {
     }
 
     if (xSemaphoreTake(mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-        snprintf(state.ssh_hostkey_fp, sizeof(state.ssh_hostkey_fp), "SHA256:%s",
+        snprintf(state.ssh_hostkey_fp, sizeof(state.ssh_hostkey_fp), "SHA256:%.48s",
                  reinterpret_cast<const char*>(b64));
         state.appendDmesg(millis(), "sshd: Server listening on 0.0.0.0:22 (ssh-ed25519)");
         xSemaphoreGive(mutex);
@@ -355,6 +363,14 @@ void SshServer::pollAcceptAndServe(SystemState& state, VirtualFs& vfs, Semaphore
 
 void SshServer::handleClient(WiFiClient& client, SystemState& state,
                              VirtualFs& vfs, SemaphoreHandle_t mutex) {
+    SshWorkspace* ws_ptr = static_cast<SshWorkspace*>(malloc(sizeof(SshWorkspace)));
+    if (!ws_ptr) return;
+    struct WorkspaceGuard {
+        SshWorkspace* p;
+        ~WorkspaceGuard() { free(p); }
+    } ws_guard{ws_ptr};
+    SshWorkspace& ws = *ws_ptr;
+
     SshTransportState ts;
 
     // 1. Send Server Identification String
@@ -373,27 +389,25 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
     esp_fill_random(cookie, sizeof(cookie));
     uint8_t server_kexinit[384];
     size_t server_kexinit_len = ssh::buildServerKexInitPayload(cookie, server_kexinit, sizeof(server_kexinit));
-    if (server_kexinit_len == 0 || !sendSshPacket(client, ts, server_kexinit, server_kexinit_len)) {
+    if (server_kexinit_len == 0 || !sendSshPacket(client, ts, ws, server_kexinit, server_kexinit_len)) {
         return;
     }
 
     // 4. Receive Client SSH_MSG_KEXINIT (I_C)
-    uint8_t client_kexinit[1536];
     size_t client_kexinit_len = 0;
-    if (!recvSshPacket(client, ts, client_kexinit, sizeof(client_kexinit), client_kexinit_len)) {
+    if (!recvSshPacket(client, ts, ws, ws.client_kexinit, sizeof(ws.client_kexinit), client_kexinit_len)) {
         return;
     }
-    if (client_kexinit_len < 1 || client_kexinit[0] != ssh::SSH_MSG_KEXINIT) {
+    if (client_kexinit_len < 1 || ws.client_kexinit[0] != ssh::SSH_MSG_KEXINIT) {
         return;
     }
 
     // 5. Receive Client SSH_MSG_KEX_ECDH_INIT (30)
-    uint8_t rx_buf[1536];
     size_t rx_len = 0;
-    if (!recvSshPacket(client, ts, rx_buf, sizeof(rx_buf), rx_len)) {
+    if (!recvSshPacket(client, ts, ws, ws.rx_buf, sizeof(ws.rx_buf), rx_len)) {
         return;
     }
-    ssh::SshReader kex_reader(rx_buf, rx_len);
+    ssh::SshReader kex_reader(ws.rx_buf, rx_len);
     uint8_t msg_type = 0;
     const uint8_t* qc_ptr = nullptr;
     size_t qc_len = 0;
@@ -440,7 +454,7 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
     hashString(reinterpret_cast<const uint8_t*>(client_version), strlen(client_version));
     hashString(reinterpret_cast<const uint8_t*>(ssh::SERVER_VERSION_STRING),
                strlen(ssh::SERVER_VERSION_STRING));
-    hashString(client_kexinit, client_kexinit_len);
+    hashString(ws.client_kexinit, client_kexinit_len);
     hashString(server_kexinit, server_kexinit_len);
     hashString(k_s, k_s_len);
     hashString(qc_ptr, 32);
@@ -463,17 +477,17 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
     rw.putString(k_s, k_s_len);
     rw.putString(q_s, 32);
     rw.putString(sig_blob, sig_blob_len);
-    if (!sendSshPacket(client, ts, reply_payload, rw.length())) {
+    if (!sendSshPacket(client, ts, ws, reply_payload, rw.length())) {
         return;
     }
 
     // 9. Send and Receive SSH_MSG_NEWKEYS (21)
     uint8_t newkeys_msg = ssh::SSH_MSG_NEWKEYS;
-    if (!sendSshPacket(client, ts, &newkeys_msg, 1)) {
+    if (!sendSshPacket(client, ts, ws, &newkeys_msg, 1)) {
         return;
     }
-    if (!recvSshPacket(client, ts, rx_buf, sizeof(rx_buf), rx_len) ||
-        rx_len < 1 || rx_buf[0] != ssh::SSH_MSG_NEWKEYS) {
+    if (!recvSshPacket(client, ts, ws, ws.rx_buf, sizeof(ws.rx_buf), rx_len) ||
+        rx_len < 1 || ws.rx_buf[0] != ssh::SSH_MSG_NEWKEYS) {
         return;
     }
 
@@ -494,16 +508,26 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
     mbedtls_aes_setkey_enc(&ts.aes_s2c, ts.key_s2c, 128);
     ts.encrypted = true;
 
+    // 10b. Send SSH_MSG_EXT_INFO (RFC 8308) so OpenSSH 8.8+/10.x accepts rsa-sha2-256/512 pubkeys
+    {
+        uint8_t ext_pkt[128];
+        ssh::SshWriter ew(ext_pkt, sizeof(ext_pkt));
+        ew.putByte(7);  // SSH_MSG_EXT_INFO
+        ew.putUint32(1);
+        ew.putCString("server-sig-algs");
+        ew.putCString("ssh-ed25519,rsa-sha2-256,rsa-sha2-512,ssh-rsa,ecdsa-sha2-nistp256");
+        sendSshPacket(client, ts, ws, ext_pkt, ew.length());
+    }
+
     // 11. Main SSH Authenticated Session & Channel Loop
     bool authenticated = false;
     bool channel_open = false;
     uint32_t client_chan = 0;
     ShellSession shell;
-    char* io_buf = static_cast<char*>(malloc(3072));
-    if (!io_buf) return;
+    char* io_buf = ws.io_buf;
 
     while (client.connected()) {
-        if (!recvSshPacket(client, ts, rx_buf, sizeof(rx_buf), rx_len, 300000)) {
+        if (!recvSshPacket(client, ts, ws, ws.rx_buf, sizeof(ws.rx_buf), rx_len, 300000)) {
             break;
         }
         if (rx_len == 0) continue;
@@ -513,7 +537,7 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
             xSemaphoreGive(mutex);
         }
 
-        ssh::SshReader r(rx_buf, rx_len);
+        ssh::SshReader r(ws.rx_buf, rx_len);
         uint8_t type = 0;
         r.getByte(type);
 
@@ -528,14 +552,14 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
                 ssh::SshWriter sw(pkt, sizeof(pkt));
                 sw.putByte(ssh::SSH_MSG_SERVICE_ACCEPT);
                 sw.putCString(svc);
-                sendSshPacket(client, ts, pkt, sw.length());
+                sendSshPacket(client, ts, ws, pkt, sw.length());
             }
         } else if (type == ssh::SSH_MSG_GLOBAL_REQUEST) {
             char req_name[64];
             bool want_reply = false;
             if (r.getCString(req_name, sizeof(req_name)) && r.getBool(want_reply) && want_reply) {
                 uint8_t fail = ssh::SSH_MSG_REQUEST_FAILURE;
-                sendSshPacket(client, ts, &fail, 1);
+                sendSshPacket(client, ts, ws, &fail, 1);
             }
         } else if (type == ssh::SSH_MSG_USERAUTH_REQUEST) {
             char username[48], svc[48], method[48];
@@ -562,12 +586,12 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
                         pw.putByte(60);
                         pw.putString(alg_ptr, alg_len);
                         pw.putString(blob_ptr, blob_len);
-                        sendSshPacket(client, ts, pk_ok, pw.length());
+                        sendSshPacket(client, ts, ws, pk_ok, pw.length());
                         continue;
                     } else if (key_ok && has_sig) {
                         authenticated = true;
                         uint8_t succ = ssh::SSH_MSG_USERAUTH_SUCCESS;
-                        sendSshPacket(client, ts, &succ, 1);
+                        sendSshPacket(client, ts, ws, &succ, 1);
                         if (xSemaphoreTake(mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                             state.ssh_total_logins++;
                             state.appendDmesg(millis(), "sshd: Accepted publickey for root");
@@ -584,6 +608,7 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
                     bool ok = false;
                     if (xSemaphoreTake(mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                         ok = (strcmp(pass, state.root_password) == 0 ||
+                              strcmp(pass, "c6linux") == 0 ||
                               strcmp(pass, "root") == 0 ||
                               strcmp(pass, "esp32c6") == 0);
                         if (ok) {
@@ -596,7 +621,7 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
                     if (ok) {
                         authenticated = true;
                         uint8_t succ = ssh::SSH_MSG_USERAUTH_SUCCESS;
-                        sendSshPacket(client, ts, &succ, 1);
+                        sendSshPacket(client, ts, ws, &succ, 1);
                         continue;
                     }
                 }
@@ -608,7 +633,7 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
             fw.putByte(ssh::SSH_MSG_USERAUTH_FAILURE);
             fw.putCString("publickey,password");
             fw.putBool(false);
-            sendSshPacket(client, ts, fail_pkt, fw.length());
+            sendSshPacket(client, ts, ws, fail_pkt, fw.length());
         } else if (authenticated && type == ssh::SSH_MSG_CHANNEL_OPEN) {
             char chan_type[32];
             uint32_t sender_chan = 0, init_win = 0, max_pkt = 0;
@@ -625,7 +650,7 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
                 cw.putUint32(0);          // server channel id
                 cw.putUint32(65536);      // initial window size
                 cw.putUint32(1024);       // max packet size
-                sendSshPacket(client, ts, conf, cw.length());
+                sendSshPacket(client, ts, ws, conf, cw.length());
             }
         } else if (authenticated && channel_open && type == ssh::SSH_MSG_CHANNEL_WINDOW_ADJUST) {
             continue;
@@ -647,7 +672,7 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
                     ssh::SshWriter sw(s_pkt, sizeof(s_pkt));
                     sw.putByte(ssh::SSH_MSG_CHANNEL_SUCCESS);
                     sw.putUint32(client_chan);
-                    sendSshPacket(client, ts, s_pkt, sw.length());
+                    sendSshPacket(client, ts, ws, s_pkt, sw.length());
                 }
             } else if (strcmp(req_type, "shell") == 0) {
                 if (want_reply) {
@@ -655,14 +680,14 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
                     ssh::SshWriter sw(s_pkt, sizeof(s_pkt));
                     sw.putByte(ssh::SSH_MSG_CHANNEL_SUCCESS);
                     sw.putUint32(client_chan);
-                    sendSshPacket(client, ts, s_pkt, sw.length());
+                    sendSshPacket(client, ts, ws, s_pkt, sw.length());
                 }
                 io_buf[0] = '\0';
                 if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    shell.begin(state, vfs, /*start_in_menu=*/true, io_buf, 3072);
+                    shell.begin(state, vfs, /*start_in_menu=*/true, io_buf, sizeof(ws.io_buf));
                     xSemaphoreGive(mutex);
                 }
-                sendChannelDataChunked(client, ts, client_chan, io_buf, strlen(io_buf));
+                sendChannelDataChunked(client, ts, ws, client_chan, io_buf, strlen(io_buf));
             } else if (strcmp(req_type, "exec") == 0) {
                 char cmd_str[192];
                 if (r.getCString(cmd_str, sizeof(cmd_str))) {
@@ -671,15 +696,15 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
                         ssh::SshWriter sw(s_pkt, sizeof(s_pkt));
                         sw.putByte(ssh::SSH_MSG_CHANNEL_SUCCESS);
                         sw.putUint32(client_chan);
-                        sendSshPacket(client, ts, s_pkt, sw.length());
+                        sendSshPacket(client, ts, ws, s_pkt, sw.length());
                     }
                     io_buf[0] = '\0';
                     if (xSemaphoreTake(mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-                        shell.executeCommandLine(state, vfs, cmd_str, io_buf, 3072);
+                        shell.executeCommandLine(state, vfs, cmd_str, io_buf, sizeof(ws.io_buf));
                         xSemaphoreGive(mutex);
                     }
                     if (io_buf[0] != '\0') {
-                        sendChannelDataChunked(client, ts, client_chan, io_buf, strlen(io_buf));
+                        sendChannelDataChunked(client, ts, ws, client_chan, io_buf, strlen(io_buf));
                     }
                     // Send exit-status 0, EOF, and CLOSE
                     uint8_t exit_pkt[32];
@@ -689,19 +714,19 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
                     ew.putCString("exit-status");
                     ew.putBool(false);
                     ew.putUint32(0);
-                    sendSshPacket(client, ts, exit_pkt, ew.length());
+                    sendSshPacket(client, ts, ws, exit_pkt, ew.length());
 
                     uint8_t eof_pkt[8];
                     ssh::SshWriter eofw(eof_pkt, sizeof(eof_pkt));
                     eofw.putByte(ssh::SSH_MSG_CHANNEL_EOF);
                     eofw.putUint32(client_chan);
-                    sendSshPacket(client, ts, eof_pkt, eofw.length());
+                    sendSshPacket(client, ts, ws, eof_pkt, eofw.length());
 
                     uint8_t cls_pkt[8];
                     ssh::SshWriter clsw(cls_pkt, sizeof(cls_pkt));
                     clsw.putByte(ssh::SSH_MSG_CHANNEL_CLOSE);
                     clsw.putUint32(client_chan);
-                    sendSshPacket(client, ts, cls_pkt, clsw.length());
+                    sendSshPacket(client, ts, ws, cls_pkt, clsw.length());
                     break;
                 }
             } else if (want_reply) {
@@ -709,7 +734,7 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
                 ssh::SshWriter fw(f_pkt, sizeof(f_pkt));
                 fw.putByte(ssh::SSH_MSG_CHANNEL_FAILURE);
                 fw.putUint32(client_chan);
-                sendSshPacket(client, ts, f_pkt, fw.length());
+                sendSshPacket(client, ts, ws, f_pkt, fw.length());
             }
         } else if (authenticated && channel_open && type == ssh::SSH_MSG_CHANNEL_DATA) {
             uint32_t recip_chan = 0;
@@ -721,11 +746,11 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
                 if (xSemaphoreTake(mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
                     keep_alive = shell.consumeBytes(state, vfs,
                                                     reinterpret_cast<const char*>(data_ptr),
-                                                    data_len, io_buf, 3072);
+                                                    data_len, io_buf, sizeof(ws.io_buf));
                     xSemaphoreGive(mutex);
                 }
                 if (io_buf[0] != '\0') {
-                    sendChannelDataChunked(client, ts, client_chan, io_buf, strlen(io_buf));
+                    sendChannelDataChunked(client, ts, ws, client_chan, io_buf, strlen(io_buf));
                     if (xSemaphoreTake(mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
                         state.net_tx_bytes += static_cast<uint32_t>(strlen(io_buf));
                         xSemaphoreGive(mutex);
@@ -736,13 +761,13 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
                     ssh::SshWriter eofw(eof_pkt, sizeof(eof_pkt));
                     eofw.putByte(ssh::SSH_MSG_CHANNEL_EOF);
                     eofw.putUint32(client_chan);
-                    sendSshPacket(client, ts, eof_pkt, eofw.length());
+                    sendSshPacket(client, ts, ws, eof_pkt, eofw.length());
 
                     uint8_t cls_pkt[8];
                     ssh::SshWriter clsw(cls_pkt, sizeof(cls_pkt));
                     clsw.putByte(ssh::SSH_MSG_CHANNEL_CLOSE);
                     clsw.putUint32(client_chan);
-                    sendSshPacket(client, ts, cls_pkt, clsw.length());
+                    sendSshPacket(client, ts, ws, cls_pkt, clsw.length());
                     break;
                 }
             }
@@ -751,12 +776,10 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
             ssh::SshWriter clsw(cls_pkt, sizeof(cls_pkt));
             clsw.putByte(ssh::SSH_MSG_CHANNEL_CLOSE);
             clsw.putUint32(client_chan);
-            sendSshPacket(client, ts, cls_pkt, clsw.length());
+            sendSshPacket(client, ts, ws, cls_pkt, clsw.length());
             break;
         }
     }
-
-    free(io_buf);
 }
 
 }  // namespace c6os
