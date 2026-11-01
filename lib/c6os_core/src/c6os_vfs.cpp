@@ -56,16 +56,25 @@ void VirtualFs::initDefaultFiles(const SystemState& state) {
              "ctrl_interface=/var/run/wpa_supplicant\nnetwork={\n  ssid=\"%s\"\n  psk=\"***\"\n}\n",
              state.wifi_cfg_ssid[0] ? state.wifi_cfg_ssid : "unconfigured");
     setFile("/etc/wpa_supplicant.conf", wpa_buf);
+    setFile("/etc/rc.local",
+            "#!/bin/c6-sh\n"
+            "# /etc/rc.local - executed by init at boot\n"
+            "echo \"rc.local: boot services initialized\" > /dev/tty0\n");
+    setFile("/etc/crontab",
+            "# /etc/crontab: <interval_sec> <command>\n"
+            "# Use 'crontab -l' or 'crontab -a <sec> <cmd>'\n");
 
     setFile("/root/README.txt",
-            "C6-MicroLinux Screen Quick Reference:\n"
+            "C6-MicroLinux Screen & Board Quick Reference:\n"
             "  menu                         - Open interactive ANSI TUI menu\n"
-            "  screen mode dashboard        - Show OS & SSH status dashboard\n"
-            "  screen mode console          - Show live /dev/tty0 console on LCD\n"
-            "  screen mode signboard        - Show full-screen custom signboard\n"
-            "  screen text \"Hello\" \"Sub\"    - Update screen headline & subtitle\n"
-            "  screen bl 80                 - Set LCD backlight to 80%\n"
-            "  echo \"Hi LCD\" > /dev/tty0    - Print line to LCD framebuffer terminal\n");
+            "  screen mode monitor          - On-LCD graphical htop & sparkline\n"
+            "  screen ticker \"Hello\"        - Scrolling bottom marquee on LCD\n"
+            "  screen alert \"ALERT!\"        - Flashing high-priority alert banner\n"
+            "  fbi <logo|tux|matrix|grid>   - Display graphical artwork on LCD\n"
+            "  fbgrab --ascii               - Render color ASCII LCD preview in SSH\n"
+            "  sensors, pinout, gpio        - Die temperature, board pinout & GPIO/PWM\n"
+            "  crontab, watch, edit, sh     - Periodic cron jobs, editor & shell scripts\n"
+            "  date, ntpdate, ping, netstat - Wall-clock NTP, network probe & sockets\n");
 }
 
 void VirtualFs::normalizePath(const char* cwd, const char* input_path, char* out_path, size_t max_len) {
@@ -139,10 +148,13 @@ bool VirtualFs::isDirectory(const char* abs_path) const {
         "/sys/class",
         "/sys/class/backlight",
         "/sys/class/backlight/st7789",
+        "/sys/class/gpio",
         "/sys/class/graphics",
         "/sys/class/graphics/fb0",
         "/sys/class/leds",
         "/sys/class/leds/ws2812",
+        "/sys/class/thermal",
+        "/sys/class/thermal/thermal_zone0",
         "/var",
         "/var/log"
     };
@@ -161,7 +173,11 @@ bool VirtualFs::listDirectory(const char* abs_path, char* out_buf, size_t max_le
         return true;
     }
     if (strcmp(abs_path, "/bin") == 0) {
-        snprintf(out_buf, max_len, "c6-menu*  c6-sh*  cat*  df*  dmesg*  echo*  free*  htop*  ip*  ls*  lscpu*  neofetch*  passwd*  ps*  reboot*  screen*  top*  uname*  uptime*  vmstat*  wifi*\n");
+        snprintf(out_buf, max_len,
+                 "c6-menu*  c6-sh*  cat*  crontab*  date*  df*  dmesg*  echo*  edit*  fbgrab*  "
+                 "fbi*  free*  gpio*  htop*  ip*  ls*  lscpu*  nano*  neofetch*  netstat*  "
+                 "ntpdate*  passwd*  ping*  pinout*  ps*  reboot*  screen*  sensors*  sh*  "
+                 "ss*  top*  uname*  uptime*  vmstat*  watch*  wifi*\n");
         return true;
     }
     if (strcmp(abs_path, "/proc") == 0) {
@@ -181,7 +197,7 @@ bool VirtualFs::listDirectory(const char* abs_path, char* out_buf, size_t max_le
         return true;
     }
     if (strcmp(abs_path, "/sys/class") == 0) {
-        snprintf(out_buf, max_len, "backlight/  graphics/  leds/\n");
+        snprintf(out_buf, max_len, "backlight/  gpio/  graphics/  leds/  thermal/\n");
         return true;
     }
     if (strcmp(abs_path, "/sys/class/backlight") == 0) {
@@ -192,12 +208,16 @@ bool VirtualFs::listDirectory(const char* abs_path, char* out_buf, size_t max_le
         snprintf(out_buf, max_len, "brightness  max_brightness\n");
         return true;
     }
+    if (strcmp(abs_path, "/sys/class/gpio") == 0) {
+        snprintf(out_buf, max_len, "status\n");
+        return true;
+    }
     if (strcmp(abs_path, "/sys/class/graphics") == 0) {
         snprintf(out_buf, max_len, "fb0/\n");
         return true;
     }
     if (strcmp(abs_path, "/sys/class/graphics/fb0") == 0) {
-        snprintf(out_buf, max_len, "mode  name  stride  text  theme  virtual_size\n");
+        snprintf(out_buf, max_len, "alert  mode  name  stride  text  theme  ticker  virtual_size\n");
         return true;
     }
     if (strcmp(abs_path, "/sys/class/leds") == 0) {
@@ -206,6 +226,14 @@ bool VirtualFs::listDirectory(const char* abs_path, char* out_buf, size_t max_le
     }
     if (strcmp(abs_path, "/sys/class/leds/ws2812") == 0) {
         snprintf(out_buf, max_len, "mode  rgb\n");
+        return true;
+    }
+    if (strcmp(abs_path, "/sys/class/thermal") == 0) {
+        snprintf(out_buf, max_len, "thermal_zone0/\n");
+        return true;
+    }
+    if (strcmp(abs_path, "/sys/class/thermal/thermal_zone0") == 0) {
+        snprintf(out_buf, max_len, "temp  type\n");
         return true;
     }
     if (strcmp(abs_path, "/var") == 0) {
@@ -349,6 +377,29 @@ bool VirtualFs::readFile(const SystemState& state, const char* abs_path, char* o
         snprintf(out_buf, max_len, "%s\n%s\n", state.headline, state.subtitle);
         return true;
     }
+    if (strcmp(abs_path, "/sys/class/graphics/fb0/ticker") == 0) {
+        snprintf(out_buf, max_len, "%s\n", state.ticker_enabled ? state.ticker_text : "off");
+        return true;
+    }
+    if (strcmp(abs_path, "/sys/class/graphics/fb0/alert") == 0) {
+        snprintf(out_buf, max_len, "%s\n", state.alert_active ? state.alert_text : "off");
+        return true;
+    }
+    if (strcmp(abs_path, "/sys/class/thermal/thermal_zone0/temp") == 0) {
+        snprintf(out_buf, max_len, "%d\n", static_cast<int>(state.cpu_temp_deci_c) * 100);
+        return true;
+    }
+    if (strcmp(abs_path, "/sys/class/thermal/thermal_zone0/type") == 0) {
+        snprintf(out_buf, max_len, "esp32c6-tsens\n");
+        return true;
+    }
+    if (strcmp(abs_path, "/sys/class/gpio/status") == 0) {
+        snprintf(out_buf, max_len, "out_mask=0x%08x in_mask=0x%08x boot_presses=%u\n",
+                 static_cast<unsigned>(state.gpio_out_mask),
+                 static_cast<unsigned>(state.gpio_in_mask),
+                 static_cast<unsigned>(state.button_press_count));
+        return true;
+    }
     if (strcmp(abs_path, "/sys/class/leds/ws2812/mode") == 0) {
         snprintf(out_buf, max_len, "%s\n", ledModeName(state.led_mode));
         return true;
@@ -444,8 +495,35 @@ bool VirtualFs::writeFile(SystemState& state, const char* abs_path, const char* 
             state.screen_mode = ScreenMode::SIGNBOARD;
         } else if (strcmp(clean, "test") == 0 || strcmp(clean, "diagnostics") == 0 || strcmp(clean, "3") == 0) {
             state.screen_mode = ScreenMode::DIAGNOSTICS;
+        } else if (strcmp(clean, "monitor") == 0 || strcmp(clean, "htop") == 0 || strcmp(clean, "4") == 0) {
+            state.screen_mode = ScreenMode::MONITOR;
+        } else if (strcmp(clean, "image") == 0 || strcmp(clean, "fbi") == 0 || strcmp(clean, "5") == 0) {
+            state.screen_mode = ScreenMode::IMAGE_VIEW;
         } else {
             return false;
+        }
+        state.ui_dirty = true;
+        return true;
+    }
+    if (strcmp(abs_path, "/sys/class/graphics/fb0/ticker") == 0) {
+        if (strcmp(clean, "off") == 0 || clean[0] == '\0') {
+            state.ticker_enabled = false;
+        } else {
+            state.ticker_enabled = true;
+            strncpy(state.ticker_text, clean, sizeof(state.ticker_text) - 1);
+            state.ticker_text[sizeof(state.ticker_text) - 1] = '\0';
+            state.ticker_offset = 0;
+        }
+        state.ui_dirty = true;
+        return true;
+    }
+    if (strcmp(abs_path, "/sys/class/graphics/fb0/alert") == 0) {
+        if (strcmp(clean, "off") == 0 || clean[0] == '\0') {
+            state.alert_active = false;
+        } else {
+            state.alert_active = true;
+            strncpy(state.alert_text, clean, sizeof(state.alert_text) - 1);
+            state.alert_text[sizeof(state.alert_text) - 1] = '\0';
         }
         state.ui_dirty = true;
         return true;

@@ -85,12 +85,16 @@ ShellSession::ShellSession()
       prev_mode_(SessionMode::SHELL_CLI),
       sort_mode_(MonitorSort::CPU),
       tree_view_(false),
-      line_len_(0) {
+      line_len_(0),
+      watch_interval_sec_(2) {
     strncpy(cwd_, "/root", sizeof(cwd_) - 1);
     cwd_[sizeof(cwd_) - 1] = '\0';
     memset(line_buf_, 0, sizeof(line_buf_));
     memset(pending_ssid_, 0, sizeof(pending_ssid_));
-    strncpy(menu_notice_, "Ready. Press [1-9] for screen, [t] for htop, [s] for shell.", sizeof(menu_notice_) - 1);
+    memset(watch_cmd_, 0, sizeof(watch_cmd_));
+    memset(edit_path_, 0, sizeof(edit_path_));
+    memset(edit_buf_, 0, sizeof(edit_buf_));
+    strncpy(menu_notice_, "Ready. Press [1-9,0], [m] LCD-htop, [k] ticker, [a] alert, [t] htop, [s] shell.", sizeof(menu_notice_) - 1);
 }
 
 void ShellSession::begin(SystemState& state, VirtualFs& vfs, bool start_in_menu,
@@ -128,6 +132,8 @@ void ShellSession::renderMenu(const SystemState& state, char* out_buf, size_t ma
 
     const char* ip_str = state.wifi_sta_connected ? state.wifi_ip : state.wifi_ap_ip;
     const char* net_tag = state.wifi_sta_connected ? state.wifi_ssid : "AP:C6-Linux-OS";
+    int temp_c = state.cpu_temp_deci_c / 10;
+    int temp_d = abs(state.cpu_temp_deci_c % 10);
 
     appendFmt(out_buf, max_len,
               "\033[2J\033[H"
@@ -135,14 +141,14 @@ void ShellSession::renderMenu(const SystemState& state, char* out_buf, size_t ma
               "\033[1;36m|\033[0m  \033[1;37mC6-MicroLinux (c6os 6.12-riscv32) — Interactive Screen Controller\033[0m \033[1;36m|\033[0m\r\n"
               "\033[1;36m+--------------------------------------------------------------------+\033[0m\r\n"
               "\033[1;36m|\033[0m  Host: \033[1;32mroot@%-14s\033[0m  Net: \033[1;33m%-15s\033[0m (\033[1;37m%-14s\033[0m) \033[1;36m|\033[0m\r\n"
-              "\033[1;36m|\033[0m  SRAM: \033[1;37m%3u KB free\033[0m / %3u KB   Uptime: \033[1;37m%6u s\033[0m      SSH Sessions: \033[1;32m%u\033[0m \033[1;36m|\033[0m\r\n"
+              "\033[1;36m|\033[0m  SRAM: \033[1;37m%3u KB free\033[0m/%3u KB   Temp: \033[1;33m%2d.%dC\033[0m   Up: \033[1;37m%5us\033[0m   SSH: \033[1;32m%u\033[0m     \033[1;36m|\033[0m\r\n"
               "\033[1;36m+--------------------------------------------------------------------+\033[0m\r\n"
               "\033[1;36m|\033[0m  LCD Mode : \033[1;36m%-18s\033[0m  Theme    : \033[1;35m%-10s\033[0m Flip: \033[1;37m%-3s\033[0m    \033[1;36m|\033[0m\r\n"
               "\033[1;36m|\033[0m  Backlight: [\033[1;33m%s\033[0m] \033[1;37m%3u%%\033[0m   RGB LED  : \033[1;32m%-7s\033[0m (%3u,%3u,%3u)   \033[1;36m|\033[0m\r\n"
               "\033[1;36m|\033[0m  Headline : \033[1;37m\"%-48.48s\"\033[0m     \033[1;36m|\033[0m\r\n"
-              "\033[1;36m|\033[0m  Subtitle : \033[0;37m\"%-48.48s\"\033[0m     \033[1;36m|\033[0m\r\n"
+              "\033[1;36m|\033[0m  Ticker   : \033[1;33m%-6s\033[0m | Alert: \033[1;31m%-6s\033[0m | Cron Jobs: \033[1;32m%u\033[0m | HTTP/Syslog: \033[1;32mON\033[0m \033[1;36m|\033[0m\r\n"
               "\033[1;36m+--------------------------------------------------------------------+\033[0m\r\n"
-              "\033[1;36m|\033[0m  \033[1;33m[1]\033[0m Cycle LCD Mode   (Dashboard -> Console -> Signboard -> Test)  \033[1;36m|\033[0m\r\n"
+              "\033[1;36m|\033[0m  \033[1;33m[1]\033[0m Cycle LCD Mode   (Dash -> Console -> Sign -> Test -> Monitor) \033[1;36m|\033[0m\r\n"
               "\033[1;36m|\033[0m  \033[1;33m[2]\033[0m Set Screen Text  (Update Headline & Subtitle on LCD)          \033[1;36m|\033[0m\r\n"
               "\033[1;36m|\033[0m  \033[1;33m[3]\033[0m Cycle Color Theme (Cyber Cyan / Matrix / Amber / Red / Mono)  \033[1;36m|\033[0m\r\n"
               "\033[1;36m|\033[0m  \033[1;33m[4]\033[0m Set Backlight %%  (Or press \033[1;32m+\033[0m / \033[1;32m-\033[0m to step brightness +/-10%%)   \033[1;36m|\033[0m\r\n"
@@ -150,15 +156,16 @@ void ShellSession::renderMenu(const SystemState& state, char* out_buf, size_t ma
               "\033[1;36m|\033[0m  \033[1;33m[6]\033[0m Control Onboard WS2812 RGB LED (Mode & Color)                 \033[1;36m|\033[0m\r\n"
               "\033[1;36m|\033[0m  \033[1;33m[7]\033[0m Live LCD Terminal Mirror (Type lines directly onto /dev/tty0) \033[1;36m|\033[0m\r\n"
               "\033[1;36m|\033[0m  \033[1;33m[8]\033[0m Configure Wi-Fi Network (Scan & Join 2.4 GHz SSID)            \033[1;36m|\033[0m\r\n"
-              "\033[1;36m|\033[0m  \033[1;33m[9]\033[0m Kernel & Hardware Diagnostics (/proc/cpuinfo, meminfo, dmesg) \033[1;36m|\033[0m\r\n"
-              "\033[1;36m|\033[0m  \033[1;33m[t]\033[0m Launch \033[1;32mhtop\033[0m Live Task & Resource Monitor                      \033[1;36m|\033[0m\r\n"
-              "\033[1;36m|\033[0m  \033[1;32m[s]\033[0m Drop to Linux Shell (c6-sh)            \033[1;31m[q]\033[0m Disconnect Session \033[1;36m|\033[0m\r\n"
+              "\033[1;36m|\033[0m  \033[1;33m[9]\033[0m Kernel & Hardware Diagnostics (/proc, sensors, pinout)        \033[1;36m|\033[0m\r\n"
+              "\033[1;36m|\033[0m  \033[1;33m[m]\033[0m On-LCD \033[1;36mhtop\033[0m Telemetry Mode  \033[1;33m[k]\033[0m Marquee Ticker  \033[1;33m[a]\033[0m LCD Alert \033[1;36m|\033[0m\r\n"
+              "\033[1;36m|\033[0m  \033[1;33m[t]\033[0m SSH \033[1;32mhtop\033[0m Monitor  \033[1;32m[s]\033[0m Linux Shell (c6-sh)       \033[1;31m[q]\033[0m Disconnect\033[1;36m|\033[0m\r\n"
               "\033[1;36m+--------------------------------------------------------------------+\033[0m\r\n"
               "  \033[1;32mStatus:\033[0m %s\r\n"
-              "  \033[1;36mSelect option [1-9, +/-, t, s, q]:\033[0m ",
+              "  \033[1;36mSelect option [1-9, +/-, m, k, a, t, s, q]:\033[0m ",
               state.hostname, net_tag, ip_str,
               static_cast<unsigned>(state.free_sram_bytes / 1024U),
               static_cast<unsigned>(state.total_sram_bytes / 1024U),
+              temp_c, temp_d,
               static_cast<unsigned>(state.uptime_sec),
               static_cast<unsigned>(state.ssh_active_sessions),
               screenModeLabel(state.screen_mode), themeName(state.theme),
@@ -168,7 +175,10 @@ void ShellSession::renderMenu(const SystemState& state, char* out_buf, size_t ma
               static_cast<unsigned>(state.led_r),
               static_cast<unsigned>(state.led_g),
               static_cast<unsigned>(state.led_b),
-              state.headline, state.subtitle,
+              state.headline,
+              state.ticker_enabled ? "ACTIVE" : "OFF",
+              state.alert_active ? "ACTIVE" : "OFF",
+              static_cast<unsigned>(state.activeCronCount()),
               menu_notice_);
 }
 
@@ -314,14 +324,18 @@ void ShellSession::renderTop(const SystemState& state, bool is_htop, bool clear_
         if (fsh_pct < 5U) fsh_pct = 5U;
         buildBar(fsh_bar, 20, fsh_pct, '|');
 
+        int temp_c = state.cpu_temp_deci_c / 10;
+        int temp_d = abs(state.cpu_temp_deci_c % 10);
+
         appendFmt(out_buf, max_len,
-                  "  \033[1;36m0\033[0m  [\033[1;32m%s\033[0m \033[1;37m%2u.%u%%\033[0m]   \033[1;36mTasks:\033[0m \033[1;37m9\033[0m, 2 kthr; \033[1;32m1 running\033[0m\033[K\r\n"
+                  "  \033[1;36m0\033[0m  [\033[1;32m%s\033[0m \033[1;37m%2u.%u%%\033[0m]   \033[1;36mTasks:\033[0m \033[1;37m9\033[0m, 2 kthr; \033[1;32m1 running\033[0m (\033[1;33m%d.%d°C\033[0m)\033[K\r\n"
                   "  \033[1;36mMem\033[0m[\033[1;33m%s\033[0m \033[1;37m%3u/%3uK\033[0m] \033[1;36mLoad average:\033[0m \033[1;37m0.%02u 0.09 0.04\033[0m\033[K\r\n"
                   "  \033[1;36mFsh\033[0m[\033[1;35m%s\033[0m \033[1;37m%3u/%4uK\033[0m] \033[1;36mUptime:\033[0m \033[1;37m%02u:%02u:%02u\033[0m (rv32imac @ %uMHz)\033[K\r\n"
                   "  \033[1;36mNet\033[0m[\033[1;32m%-13s %4ddBm\033[0m \033[1;37mwlan0\033[0m]   \033[1;36mLCD:\033[0m \033[1;37m%s\033[0m (%s, BL:%u%%)\033[K\r\n"
                   "\033[K\r\n"
                   "\033[30;42m  PID USER      PRI  NI  VIRT   RES   SHR S  CPU%%  MEM%%   TIME+  Command                        \033[0m\033[K\r\n",
                   cpu_bar, total_cpu_tenths / 10U, total_cpu_tenths % 10U,
+                  temp_c, temp_d,
                   mem_bar, used_kb, total_kb,
                   10U + (total_cpu_tenths / 15U),
                   fsh_bar, static_cast<unsigned>(state.rootfs_used_kb), static_cast<unsigned>(state.rootfs_total_kb),
@@ -354,6 +368,26 @@ void ShellSession::renderTop(const SystemState& state, bool is_htop, bool clear_
     }
 }
 
+void ShellSession::renderWatchFrame(SystemState& state, VirtualFs& vfs, bool clear_screen,
+                                    char* out_buf, size_t max_len) {
+    char date_str[48];
+    formatDateStr(state, false, date_str, sizeof(date_str));
+    appendFmt(out_buf, max_len,
+              "%s\033[1;36mEvery %u.0s: \033[1;37m%-32s\033[0m  \033[1;32m%s:\033[0m %s\033[K\r\n\033[K\r\n",
+              clear_screen ? "\033[2J\033[H" : "\033[H",
+              static_cast<unsigned>(watch_interval_sec_ > 0 ? watch_interval_sec_ : 2),
+              watch_cmd_, state.hostname, date_str);
+
+    char cmd_out[1024];
+    cmd_out[0] = '\0';
+    SessionMode saved_mode = mode_;
+    mode_ = SessionMode::SHELL_CLI;
+    executeCommandLine(state, vfs, watch_cmd_, cmd_out, sizeof(cmd_out));
+    mode_ = saved_mode;
+
+    appendFmt(out_buf, max_len, "%s\033[K\r\n\033[7m [watch] Press 'q' or Ctrl+C to exit live watch \033[0m\033[K", cmd_out);
+}
+
 void ShellSession::renderMonitorTick(const SystemState& state, char* out_buf, size_t max_len) const {
     if (out_buf && max_len > 0) out_buf[0] = '\0';
     if (mode_ == SessionMode::TOP_VIEW) {
@@ -363,9 +397,19 @@ void ShellSession::renderMonitorTick(const SystemState& state, char* out_buf, si
     }
 }
 
+void ShellSession::renderMonitorTick(SystemState& state, VirtualFs& vfs, char* out_buf, size_t max_len) {
+    if (out_buf && max_len > 0) out_buf[0] = '\0';
+    if (mode_ == SessionMode::TOP_VIEW) {
+        renderTop(state, /*is_htop=*/false, /*clear_screen=*/false, out_buf, max_len);
+    } else if (mode_ == SessionMode::HTOP_VIEW) {
+        renderTop(state, /*is_htop=*/true, /*clear_screen=*/false, out_buf, max_len);
+    } else if (mode_ == SessionMode::WATCH_VIEW) {
+        renderWatchFrame(state, vfs, /*clear_screen=*/false, out_buf, max_len);
+    }
+}
+
 bool ShellSession::handleMonitorKey(SystemState& state, VirtualFs& vfs, char ch,
                                     char* out_buf, size_t max_len) {
-    (void)vfs;
     if (ch == 'q' || ch == 'Q' || ch == 0x03) {
         mode_ = prev_mode_;
         if (mode_ == SessionMode::MENU_MAIN) {
@@ -376,6 +420,10 @@ bool ShellSession::handleMonitorKey(SystemState& state, VirtualFs& vfs, char ch,
             appendFmt(out_buf, max_len, "\r\n");
             renderPrompt(state, out_buf, max_len);
         }
+        return true;
+    }
+    if (mode_ == SessionMode::WATCH_VIEW) {
+        renderWatchFrame(state, vfs, /*clear_screen=*/false, out_buf, max_len);
         return true;
     }
     if (ch == 'p' || ch == 'P') {
@@ -543,12 +591,48 @@ bool ShellSession::handleMenuKey(SystemState& state, VirtualFs& vfs, char ch,
             if (vfs.readFile(state, "/proc/meminfo", buf, sizeof(buf))) {
                 appendWithCrLf(out_buf, max_len, buf);
             }
+            appendFmt(out_buf, max_len, "\033[1;36m=== Thermal & Hardware Sensors ===\033[0m\r\n");
+            appendFmt(out_buf, max_len,
+                      "Die Temp: +%d.%d C | BOOT Button Presses: %u | HTTP(:80) Reqs: %u | Syslog(:514) Pkts: %u\r\n",
+                      state.cpu_temp_deci_c / 10, abs(state.cpu_temp_deci_c % 10),
+                      static_cast<unsigned>(state.button_press_count),
+                      static_cast<unsigned>(state.http_requests),
+                      static_cast<unsigned>(state.syslog_packets));
             appendFmt(out_buf, max_len,
                       "\r\n\033[1;33mPress Enter to return to menu...\033[0m");
             return true;
         }
-        case '\r':
-        case '\n':
+        case 'm':
+        case 'M': {
+            if (state.screen_mode == ScreenMode::MONITOR) {
+                state.screen_mode = ScreenMode::OS_DASHBOARD;
+                snprintf(menu_notice_, sizeof(menu_notice_), "Returned LCD to OS Dashboard.");
+            } else {
+                state.screen_mode = ScreenMode::MONITOR;
+                snprintf(menu_notice_, sizeof(menu_notice_), "Activated On-LCD Graphical htop Telemetry Mode!");
+            }
+            state.ui_dirty = true;
+            renderMenu(state, out_buf, max_len);
+            return true;
+        }
+        case 'k':
+        case 'K': {
+            mode_ = SessionMode::MENU_PROMPT_TICKER;
+            line_len_ = 0;
+            appendFmt(out_buf, max_len,
+                      "\r\n\033[1;33mEnter Scrolling Ticker Text\033[0m (or 'off' to disable, current: %s): ",
+                      state.ticker_enabled ? state.ticker_text : "off");
+            return true;
+        }
+        case 'a':
+        case 'A': {
+            mode_ = SessionMode::MENU_PROMPT_ALERT;
+            line_len_ = 0;
+            appendFmt(out_buf, max_len,
+                      "\r\n\033[1;31mEnter Alert Banner Message\033[0m (or 'off' to clear, current: %s): ",
+                      state.alert_active ? state.alert_text : "off");
+            return true;
+        }
         case ' ': {
             snprintf(menu_notice_, sizeof(menu_notice_), "Refreshed menu.");
             renderMenu(state, out_buf, max_len);
@@ -577,7 +661,7 @@ bool ShellSession::handleMenuKey(SystemState& state, VirtualFs& vfs, char ch,
         }
         default:
             snprintf(menu_notice_, sizeof(menu_notice_),
-                     "Unknown key '%c'. Choose [1-9], [+/-], [t] htop, [s] shell, or [q] quit.",
+                     "Unknown key '%c'. Choose [1-9], [+/-], [m] LCD-htop, [k] ticker, [a] alert, [t] htop, [s] shell.",
                      isprint(static_cast<unsigned char>(ch)) ? ch : '?');
             renderMenu(state, out_buf, max_len);
             return true;
@@ -794,6 +878,64 @@ bool ShellSession::handleLineComplete(SystemState& state, VirtualFs& vfs,
             renderMenu(state, out_buf, max_len);
             return true;
         }
+        case SessionMode::MENU_PROMPT_TICKER: {
+            if (line[0] != '\0') {
+                vfs.writeFile(state, "/sys/class/graphics/fb0/ticker", line, false);
+                snprintf(menu_notice_, sizeof(menu_notice_), "Ticker %s",
+                         state.ticker_enabled ? "enabled" : "disabled");
+            }
+            mode_ = SessionMode::MENU_MAIN;
+            renderMenu(state, out_buf, max_len);
+            return true;
+        }
+        case SessionMode::MENU_PROMPT_ALERT: {
+            if (line[0] != '\0') {
+                vfs.writeFile(state, "/sys/class/graphics/fb0/alert", line, false);
+                snprintf(menu_notice_, sizeof(menu_notice_), "Alert %s",
+                         state.alert_active ? "ACTIVATED" : "CLEARED");
+            }
+            mode_ = SessionMode::MENU_MAIN;
+            renderMenu(state, out_buf, max_len);
+            return true;
+        }
+        case SessionMode::EDIT_VIEW: {
+            if (strcmp(line, ".save") == 0 || strcmp(line, ".wq") == 0 || strcmp(line, ".exit") == 0 ||
+                strcmp(line, ":wq") == 0 || strcmp(line, ":w") == 0 || strcmp(line, ":x") == 0) {
+                vfs.writeFile(state, edit_path_, edit_buf_, false);
+                if (strcmp(edit_path_, "/etc/crontab") == 0) {
+                    syncCronFromVfs(state, vfs);
+                }
+                mode_ = SessionMode::SHELL_CLI;
+                appendFmt(out_buf, max_len, "\033[1;32m[Saved %u bytes to %s]\033[0m\r\n",
+                          static_cast<unsigned>(strlen(edit_buf_)), edit_path_);
+                renderPrompt(state, out_buf, max_len);
+                return true;
+            }
+            if (strcmp(line, ".abort") == 0 || strcmp(line, ".q!") == 0 ||
+                strcmp(line, ":q!") == 0 || strcmp(line, ":q") == 0) {
+                mode_ = SessionMode::SHELL_CLI;
+                appendFmt(out_buf, max_len, "\033[1;33m[Discarded edits to %s]\033[0m\r\n", edit_path_);
+                renderPrompt(state, out_buf, max_len);
+                return true;
+            }
+            if (strcmp(line, ".clear") == 0 || strcmp(line, ":clear") == 0) {
+                edit_buf_[0] = '\0';
+                appendFmt(out_buf, max_len, "[Buffer cleared]\r\n\033[1;36medit>\033[0m ");
+                return true;
+            }
+            if (strcmp(line, ".show") == 0 || strcmp(line, ":show") == 0) {
+                appendFmt(out_buf, max_len, "\033[1;36m--- %s ---\033[0m\r\n", edit_path_);
+                appendWithCrLf(out_buf, max_len, edit_buf_);
+                appendFmt(out_buf, max_len, "\033[1;36m----------------\033[0m\r\n\033[1;36medit>\033[0m ");
+                return true;
+            }
+            size_t cur = strlen(edit_buf_);
+            if (cur + strlen(line) + 2 < sizeof(edit_buf_)) {
+                snprintf(edit_buf_ + cur, sizeof(edit_buf_) - cur, "%s\n", line);
+            }
+            appendFmt(out_buf, max_len, "\033[1;36medit>\033[0m ");
+            return true;
+        }
         case SessionMode::SHELL_CLI:
         default: {
             if (!executeCommandLine(state, vfs, line, out_buf, max_len)) {
@@ -807,16 +949,109 @@ bool ShellSession::handleLineComplete(SystemState& state, VirtualFs& vfs,
     }
 }
 
+void ShellSession::formatDateStr(const SystemState& state, bool force_utc, char* out_buf, size_t max_len) {
+    uint32_t ts = state.epoch_offset_sec + state.uptime_sec;
+    if (!force_utc) {
+        ts += 11U * 3600U;  // AEDT (UTC+11) Melbourne local offset
+    }
+    uint32_t sec_of_day = ts % 86400U;
+    uint32_t hrs  = sec_of_day / 3600U;
+    uint32_t mins = (sec_of_day % 3600U) / 60U;
+    uint32_t secs = sec_of_day % 60U;
+
+    uint32_t days_since_epoch = ts / 86400U;
+    static const char* const DOW[7] = {"Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"};
+    const char* dow = DOW[days_since_epoch % 7U];
+
+    // Approximate calendar date around Nov 2026 (epoch 1793491200 = 2026-11-01 00:00:00 UTC)
+    int32_t delta_days = static_cast<int32_t>(days_since_epoch) - 20758;
+    int day_num = 1 + delta_days;
+    const char* month = "Nov";
+    int year = 2026;
+    if (day_num < 1) {
+        month = "Oct";
+        day_num += 31;
+    } else if (day_num > 30) {
+        month = "Dec";
+        day_num -= 30;
+    }
+
+    snprintf(out_buf, max_len, "%s %s %2d %02u:%02u:%02u %s %d",
+             dow, month, day_num,
+             static_cast<unsigned>(hrs), static_cast<unsigned>(mins), static_cast<unsigned>(secs),
+             force_utc ? "UTC" : state.tz_name, year);
+}
+
+void ShellSession::syncCronFromVfs(SystemState& state, const VirtualFs& vfs) {
+    char content[VFS_MAX_FILE_SIZE];
+    for (size_t i = 0; i < MAX_CRON_JOBS; ++i) {
+        state.cron_jobs[i].active = false;
+        state.cron_jobs[i].interval_sec = 0;
+        state.cron_jobs[i].last_run_sec = state.uptime_sec;
+        state.cron_jobs[i].cmd[0] = '\0';
+    }
+    if (!vfs.readFile(state, "/etc/crontab", content, sizeof(content))) {
+        return;
+    }
+    size_t slot = 0;
+    char* saveptr = nullptr;
+    char* line = strtok_r(content, "\n", &saveptr);
+    while (line && slot < MAX_CRON_JOBS) {
+        while (*line == ' ' || *line == '\t' || *line == '\r') ++line;
+        if (*line != '\0' && *line != '#') {
+            unsigned int sec = 0;
+            int offset = 0;
+            if (sscanf(line, "%u %n", &sec, &offset) >= 1 && sec > 0 && line[offset] != '\0') {
+                state.cron_jobs[slot].active = true;
+                state.cron_jobs[slot].interval_sec = static_cast<uint16_t>(sec);
+                state.cron_jobs[slot].last_run_sec = state.uptime_sec;
+                strncpy(state.cron_jobs[slot].cmd, line + offset, sizeof(state.cron_jobs[slot].cmd) - 1);
+                state.cron_jobs[slot].cmd[sizeof(state.cron_jobs[slot].cmd) - 1] = '\0';
+                // Trim trailing CR/space
+                size_t clen = strlen(state.cron_jobs[slot].cmd);
+                while (clen > 0 && (state.cron_jobs[slot].cmd[clen - 1] == '\r' ||
+                                    state.cron_jobs[slot].cmd[clen - 1] == ' ')) {
+                    state.cron_jobs[slot].cmd[--clen] = '\0';
+                }
+                ++slot;
+            }
+        }
+        line = strtok_r(nullptr, "\n", &saveptr);
+    }
+}
+
+void ShellSession::syncVfsFromCron(SystemState& state, VirtualFs& vfs) {
+    char buf[VFS_MAX_FILE_SIZE];
+    size_t pos = static_cast<size_t>(snprintf(
+        buf, sizeof(buf),
+        "# /etc/crontab: <interval_sec> <command>\n"));
+    for (size_t i = 0; i < MAX_CRON_JOBS; ++i) {
+        if (state.cron_jobs[i].active && state.cron_jobs[i].interval_sec > 0) {
+            int w = snprintf(buf + pos, sizeof(buf) - pos, "%u %s\n",
+                             static_cast<unsigned>(state.cron_jobs[i].interval_sec),
+                             state.cron_jobs[i].cmd);
+            if (w > 0 && static_cast<size_t>(w) < sizeof(buf) - pos) {
+                pos += static_cast<size_t>(w);
+            }
+        }
+    }
+    vfs.writeFile(state, "/etc/crontab", buf, false);
+}
+
 void ShellSession::formatStatusJson(const SystemState& state, char* out_buf, size_t max_len) {
     snprintf(out_buf, max_len,
              "{\"os\":\"C6-MicroLinux\",\"kernel\":\"6.12.0-c6os-riscv32\","
              "\"hostname\":\"%s\",\"board\":\"Waveshare-ESP32-C6-LCD-1.47\","
              "\"mode\":\"%s\",\"theme\":\"%s\",\"bl\":%u,\"flipped\":%s,"
              "\"headline\":\"%s\",\"subtitle\":\"%s\","
+             "\"ticker_enabled\":%s,\"ticker\":\"%s\","
+             "\"alert_active\":%s,\"alert\":\"%s\","
              "\"led_mode\":\"%s\",\"rgb\":[%u,%u,%u],"
+             "\"temp_c\":%d.%d,\"cron_jobs\":%u,\"boot_btn_presses\":%u,"
              "\"wifi_connected\":%s,\"wifi_ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,"
              "\"ap_ssid\":\"%s\",\"ap_ip\":\"%s\","
              "\"ssh_port\":%u,\"ssh_sessions\":%u,"
+             "\"http_port\":%u,\"http_requests\":%u,\"syslog_port\":%u,\"syslog_packets\":%u,"
              "\"free_sram\":%u,\"total_sram\":%u,\"uptime_s\":%u}\r\n",
              state.hostname,
              screenModeName(state.screen_mode),
@@ -825,8 +1060,15 @@ void ShellSession::formatStatusJson(const SystemState& state, char* out_buf, siz
              state.landscape_flipped ? "true" : "false",
              state.headline,
              state.subtitle,
+             state.ticker_enabled ? "true" : "false",
+             state.ticker_text,
+             state.alert_active ? "true" : "false",
+             state.alert_text,
              ledModeName(state.led_mode),
              state.led_r, state.led_g, state.led_b,
+             state.cpu_temp_deci_c / 10, abs(state.cpu_temp_deci_c % 10),
+             static_cast<unsigned>(state.activeCronCount()),
+             static_cast<unsigned>(state.button_press_count),
              state.wifi_sta_connected ? "true" : "false",
              state.wifi_ssid,
              state.wifi_ip,
@@ -835,6 +1077,10 @@ void ShellSession::formatStatusJson(const SystemState& state, char* out_buf, siz
              state.wifi_ap_ip,
              static_cast<unsigned>(state.ssh_port),
              static_cast<unsigned>(state.ssh_active_sessions),
+             static_cast<unsigned>(state.http_port),
+             static_cast<unsigned>(state.http_requests),
+             static_cast<unsigned>(state.syslog_port),
+             static_cast<unsigned>(state.syslog_packets),
              static_cast<unsigned>(state.free_sram_bytes),
              static_cast<unsigned>(state.total_sram_bytes),
              static_cast<unsigned>(state.uptime_sec));
@@ -958,19 +1204,27 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
                   "C6-MicroLinux (c6os 6.12.0-riscv32) Built-in Commands:\r\n"
                   "  menu                         Launch interactive ANSI Screen Control Menu\r\n"
                   "  screen status                Print live screen & system state as JSON\r\n"
-                  "  screen mode <mode>           Set mode: dashboard | console | signboard | test\r\n"
+                  "  screen mode <mode>           dashboard | console | signboard | test | monitor | image\r\n"
                   "  screen text <head> [sub]     Set screen headline and subtitle\r\n"
+                  "  screen ticker <text|off>     Set smooth scrolling bottom marquee ticker\r\n"
+                  "  screen alert <msg|off>       Trigger/clear high-visibility flashing LCD alert\r\n"
                   "  screen theme <theme>         Set theme: cyan | matrix | amber | red | mono\r\n"
                   "  screen bl <0..100>           Set LCD backlight brightness percentage\r\n"
                   "  screen flip <on|off|toggle>  Control 180-degree landscape flip\r\n"
                   "  screen console <text>        Append line to /dev/tty0 LCD terminal\r\n"
                   "  screen clear                 Clear /dev/tty0 LCD terminal\r\n"
                   "  screen led <mode> [r g b]    Set RGB LED: off | solid | pulse | rainbow | ssh\r\n"
-                  "  wifi status|scan|connect     Manage 2.4 GHz Wi-Fi & SoftAP\r\n"
-                  "  top [-b -n 1]                Live Linux process & CPU/SRAM monitor\r\n"
-                  "  htop [-b -n 1]               Interactive color task manager & bar graphs\r\n"
-                  "  lscpu, vmstat, neofetch      CPU architecture, VM stats & system summary\r\n"
-                  "  uname, uptime, free, df, ps, dmesg, ls, cd, pwd, cat, echo, rm, ip, passwd, reboot\r\n");
+                  "  fbgrab [--ascii | <path>]    Capture LCD framebuffer preview or PPM image\r\n"
+                  "  fbi <logo|tux|matrix|grid>   Render graphical artwork on 172x320 LCD\r\n"
+                  "  sensors                      Read ESP32-C6 die temperature, PWM & RF sensors\r\n"
+                  "  pinout                       Display Waveshare ESP32-C6-LCD-1.47 GPIO pinout\r\n"
+                  "  gpio <status|mode|read|write|pwm> Control & inspect board GPIO/PWM pins\r\n"
+                  "  crontab <-l|-a <sec> <cmd>|-r> Manage periodic background cron jobs\r\n"
+                  "  watch [-n <sec>] <cmd>       Execute & monitor a command periodically\r\n"
+                  "  edit / nano <path> [lines..] Interactive or inline file editor (/etc, /root)\r\n"
+                  "  sh <script.sh>               Execute a shell script from VFS\r\n"
+                  "  date, ntpdate, ping, netstat Wall-clock time, NTP sync, ICMP ping & sockets\r\n"
+                  "  top, htop, lscpu, vmstat, neofetch, wifi, uname, uptime, free, df, ps, dmesg\r\n");
     } else if (strcmp(prog, "uname") == 0) {
         bool all = false, rel = false, mach = false, node = false;
         for (size_t i = 1; i < argc; ++i) {
@@ -1095,12 +1349,20 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
                   "  PID USER       VSZ STAT COMMAND\r\n"
                   "    1 root      4096 S    /sbin/init\r\n"
                   "    2 root         0 SW   [kthreadd]\r\n"
+                  "    6 root      2048 S    /sbin/buttond --gpio=9 [presses=%u]\r\n"
                   "    8 root      6144 S    /sbin/lcdd --driver=st7789 --spi=80MHz\r\n"
                   "   12 root      8192 S    /sbin/wpa_supplicant -i wlan0\r\n"
+                  "   16 root      4096 S    /usr/sbin/crond -f [jobs=%u]\r\n"
                   "   18 root     12288 S    /usr/sbin/sshd -p %u [sessions=%u]\r\n"
+                  "   20 root      6144 S    /usr/sbin/httpd -p %u [reqs=%u]\r\n"
+                  "   22 root      4096 S    /sbin/syslogd -u %u [pkts=%u]\r\n"
                   "   24 root      6144 S    /bin/c6-sh (/dev/ttyACM0)\r\n"
                   "   31 root      6144 R    /bin/c6-sh (/dev/pts/0)\r\n",
-                  state.ssh_port, state.ssh_active_sessions);
+                  static_cast<unsigned>(state.button_press_count),
+                  static_cast<unsigned>(state.activeCronCount()),
+                  state.ssh_port, state.ssh_active_sessions,
+                  static_cast<unsigned>(state.http_port), static_cast<unsigned>(state.http_requests),
+                  static_cast<unsigned>(state.syslog_port), static_cast<unsigned>(state.syslog_packets));
     } else if (strcmp(prog, "top") == 0 || strcmp(prog, "/bin/top") == 0 ||
                strcmp(prog, "htop") == 0 || strcmp(prog, "/bin/htop") == 0) {
         bool is_htop = (strcmp(prog, "htop") == 0 || strcmp(prog, "/bin/htop") == 0);
@@ -1159,15 +1421,481 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
                   "\033[1;36m       '---'        \033[1;36mKernel\033[0m: 6.12.0-c6os-riscv32\r\n"
                   "\033[1;32m    RISC-V 32-bit   \033[1;36mUptime\033[0m: %um %us\r\n"
                   "                    \033[1;36mDisplay\033[0m: 172x320 ST7789 (%s, BL %u%%)\r\n"
-                  "                    \033[1;36mCPU\033[0m: ESP32-C6FH4 (1) @ %uMHz\r\n"
+                  "                    \033[1;36mCPU\033[0m: ESP32-C6FH4 (1) @ %uMHz (+%d.%d°C)\r\n"
                   "                    \033[1;36mMemory\033[0m: %uKiB / %uKiB (%s)\r\n",
                   state.hostname,
                   mins, secs,
                   screenModeName(state.screen_mode),
                   static_cast<unsigned>(state.backlight_pct),
                   static_cast<unsigned>(state.cpu_freq_mhz),
+                  state.cpu_temp_deci_c / 10, abs(state.cpu_temp_deci_c % 10),
                   used_kb, total_kb,
                   state.wifi_ip);
+    } else if (strcmp(prog, "sensors") == 0 || strcmp(prog, "/bin/sensors") == 0) {
+        int tc = state.cpu_temp_deci_c / 10;
+        int td = abs(state.cpu_temp_deci_c % 10);
+        appendFmt(target_buf, target_max,
+                  "esp32c6_tsens-isa-0000\r\n"
+                  "Adapter: On-die SAR Thermal Sensor (/sys/class/thermal/thermal_zone0)\r\n"
+                  "die_temp:     \033[1;32m+%d.%d°C\033[0m  (high = +85.0°C, crit = +105.0°C)\r\n"
+                  "\r\n"
+                  "st7789_backlight-pwm-0001\r\n"
+                  "Adapter: LEDC Timer0 PWM Driver (GPIO 22)\r\n"
+                  "brightness:   \033[1;33m%3u%%\033[0m     (max = 100%%, freq = 12.0 kHz)\r\n"
+                  "\r\n"
+                  "wlan0_rf-wifi6-0002\r\n"
+                  "Adapter: Espressif 802.11b/g/n/ax 2.4GHz Transceiver\r\n"
+                  "rssi:         \033[1;36m%4d dBm\033[0m (ssid = %s)\r\n"
+                  "vdd33_pa:     +3.31 V  (min = +3.00 V, max = +3.60 V)\r\n",
+                  tc, td,
+                  static_cast<unsigned>(state.backlight_pct),
+                  static_cast<int>(state.wifi_rssi),
+                  state.wifi_sta_connected ? state.wifi_ssid : "disconnected");
+    } else if (strcmp(prog, "crontab") == 0 || strcmp(prog, "/bin/crontab") == 0) {
+        if (argc < 2 || strcmp(argv[1], "-l") == 0) {
+            appendFmt(target_buf, target_max, "# Active Periodic Jobs (/etc/crontab):\r\n");
+            size_t count = 0;
+            for (size_t i = 0; i < MAX_CRON_JOBS; ++i) {
+                if (state.cron_jobs[i].active) {
+                    appendFmt(target_buf, target_max, "  [%u] every %4us : %s (last_run=%us)\r\n",
+                              static_cast<unsigned>(i + 1),
+                              static_cast<unsigned>(state.cron_jobs[i].interval_sec),
+                              state.cron_jobs[i].cmd,
+                              static_cast<unsigned>(state.cron_jobs[i].last_run_sec));
+                    ++count;
+                }
+            }
+            if (count == 0) {
+                appendFmt(target_buf, target_max, "  (no active cron jobs — use 'crontab -a <sec> <cmd>')\r\n");
+            }
+        } else if (strcmp(argv[1], "-r") == 0) {
+            for (size_t i = 0; i < MAX_CRON_JOBS; ++i) {
+                state.cron_jobs[i].active = false;
+                state.cron_jobs[i].cmd[0] = '\0';
+            }
+            syncVfsFromCron(state, vfs);
+            appendFmt(target_buf, target_max, "crontab: all periodic jobs removed.\r\n");
+        } else if ((strcmp(argv[1], "-a") == 0 || strcmp(argv[1], "-e") == 0) && argc >= 4) {
+            int sec = atoi(argv[2]);
+            if (sec < 1) sec = 1;
+            int slot = -1;
+            for (size_t i = 0; i < MAX_CRON_JOBS; ++i) {
+                if (!state.cron_jobs[i].active) {
+                    slot = static_cast<int>(i);
+                    break;
+                }
+            }
+            if (slot < 0) slot = static_cast<int>(MAX_CRON_JOBS - 1);
+            char joined_cmd[80] = {0};
+            size_t pos = 0;
+            for (size_t i = 3; i < argc; ++i) {
+                int w = snprintf(joined_cmd + pos, sizeof(joined_cmd) - pos, "%s%s",
+                                 argv[i], (i + 1 < argc) ? " " : "");
+                if (w > 0) pos += static_cast<size_t>(w);
+            }
+            state.cron_jobs[slot].active = true;
+            state.cron_jobs[slot].interval_sec = static_cast<uint16_t>(sec);
+            state.cron_jobs[slot].last_run_sec = state.uptime_sec;
+            strncpy(state.cron_jobs[slot].cmd, joined_cmd, sizeof(state.cron_jobs[slot].cmd) - 1);
+            state.cron_jobs[slot].cmd[sizeof(state.cron_jobs[slot].cmd) - 1] = '\0';
+            syncVfsFromCron(state, vfs);
+            state.ui_dirty = true;
+            appendFmt(target_buf, target_max, "crontab: installed job #%d: every %ds -> %s\r\n",
+                      slot + 1, sec, state.cron_jobs[slot].cmd);
+        } else {
+            appendFmt(target_buf, target_max,
+                      "Usage: crontab -l | crontab -a <interval_sec> <command> | crontab -r\r\n");
+        }
+    } else if (strcmp(prog, "watch") == 0 || strcmp(prog, "/bin/watch") == 0) {
+        uint16_t interval = 2;
+        bool batch = (redir_path != nullptr) || (mode_ != SessionMode::SHELL_CLI);
+        size_t cmd_start = 1;
+        while (cmd_start < argc && argv[cmd_start][0] == '-') {
+            if (strcmp(argv[cmd_start], "-n") == 0 && cmd_start + 1 < argc) {
+                int v = atoi(argv[cmd_start + 1]);
+                if (v >= 1) interval = static_cast<uint16_t>(v);
+                cmd_start += 2;
+            } else if (strncmp(argv[cmd_start], "-n", 2) == 0 && argv[cmd_start][2] != '\0') {
+                int v = atoi(argv[cmd_start] + 2);
+                if (v >= 1) interval = static_cast<uint16_t>(v);
+                ++cmd_start;
+            } else if (strcmp(argv[cmd_start], "-b") == 0 || strcmp(argv[cmd_start], "-1") == 0) {
+                batch = true;
+                ++cmd_start;
+            } else {
+                ++cmd_start;
+            }
+        }
+        if (cmd_start >= argc) {
+            appendFmt(target_buf, target_max, "Usage: watch [-n <sec>] [-b] <command...>\r\n");
+        } else {
+            watch_interval_sec_ = interval;
+            watch_cmd_[0] = '\0';
+            size_t pos = 0;
+            for (size_t i = cmd_start; i < argc; ++i) {
+                int w = snprintf(watch_cmd_ + pos, sizeof(watch_cmd_) - pos, "%s%s",
+                                 argv[i], (i + 1 < argc) ? " " : "");
+                if (w > 0) pos += static_cast<size_t>(w);
+            }
+            if (batch) {
+                renderWatchFrame(state, vfs, false, target_buf, target_max);
+                appendFmt(target_buf, target_max, "\r\n");
+            } else {
+                prev_mode_ = mode_;
+                mode_ = SessionMode::WATCH_VIEW;
+                renderWatchFrame(state, vfs, true, target_buf, target_max);
+            }
+        }
+    } else if (strcmp(prog, "fbgrab") == 0 || strcmp(prog, "/bin/fbgrab") == 0) {
+        const char* save_path = nullptr;
+        for (size_t i = 1; i < argc; ++i) {
+            if (argv[i][0] != '-') {
+                save_path = argv[i];
+            }
+        }
+        if (save_path) {
+            char norm[64];
+            VirtualFs::normalizePath(cwd_, save_path, norm, sizeof(norm));
+            char ppm[384];
+            snprintf(ppm, sizeof(ppm),
+                     "P3\n# C6-MicroLinux fb0 snapshot (%s, theme=%s, 320x172)\n16 8\n255\n"
+                     "0 255 255  0 180 255  0 128 255  0 64 128\n",
+                     screenModeName(state.screen_mode), themeName(state.theme));
+            vfs.writeFile(state, norm, ppm, false);
+            appendFmt(target_buf, target_max,
+                      "fbgrab: captured /dev/fb0 (320x172 RGB565, mode=%s) -> %s (%u bytes)\r\n",
+                      screenModeName(state.screen_mode), norm, static_cast<unsigned>(strlen(ppm)));
+        }
+        // Render ANSI ASCII preview of the physical 320x172 LCD
+        appendFmt(target_buf, target_max,
+                  "\033[1;36m+--- /dev/fb0 (320x172 ST7789 | mode=%-9s | theme=%-6s | BL=%3u%%) ---+\033[0m\r\n",
+                  screenModeName(state.screen_mode), themeName(state.theme),
+                  static_cast<unsigned>(state.backlight_pct));
+        if (state.alert_active) {
+            appendFmt(target_buf, target_max,
+                      "\033[1;37;41m| [!! ALERT OVERLAY !!] %-51.51s |\033[0m\r\n",
+                      state.alert_text);
+        }
+        if (state.screen_mode == ScreenMode::MONITOR) {
+            appendFmt(target_buf, target_max,
+                      "| \033[1;32m[C6-HTOP MONITOR]\033[0m CPU:%2u%% Temp:+%d.%dC  SRAM:%3u/%3uKB  WLAN:%4ddBm       |\r\n"
+                      "| CPU Sparkline: \033[1;36m▁▂▃▄▃▅▄▆▅▃▂▄▆▅▃▄▅▆▄▃▂▃▄▅▃▂▃▄▅▆▄▃\033[0m                           |\r\n"
+                      "| \033[7m PID USER   CPU%% MEM%% COMMAND                                             \033[0m |\r\n"
+                      "|   8 root    3.4  3.1 /sbin/lcdd --driver=st7789                           |\r\n"
+                      "|  18 root    4.5  7.3 /usr/sbin/sshd -p 22 [sessions=%u]                    |\r\n"
+                      "|  20 root    1.2  1.6 /usr/sbin/httpd -p 80 & syslogd -u 514               |\r\n",
+                      static_cast<unsigned>(state.cpu_load_pct),
+                      state.cpu_temp_deci_c / 10, abs(state.cpu_temp_deci_c % 10),
+                      static_cast<unsigned>(state.free_sram_bytes / 1024U),
+                      static_cast<unsigned>(state.total_sram_bytes / 1024U),
+                      static_cast<int>(state.wifi_rssi),
+                      static_cast<unsigned>(state.ssh_active_sessions));
+        } else if (state.screen_mode == ScreenMode::IMAGE_VIEW) {
+            static const char* const PAT_NAMES[4] = {"RISC-V / C6 Cyber Emblem", "Linux Tux Mascot", "Matrix Digital Rain", "RGB565 Calibration Grid"};
+            appendFmt(target_buf, target_max,
+                      "| \033[1;35m[FBI IMAGE VIEWER]\033[0m Artwork: %-45s |\r\n"
+                      "|        \033[1;36m.########.   .########.\033[0m                                            |\r\n"
+                      "|       \033[1;36m##        ## ##        ##\033[0m   \033[1;33m%-39.39s\033[0m |\r\n"
+                      "|        \033[1;36m'########'   '########'\033[0m                                            |\r\n",
+                      PAT_NAMES[state.fbi_pattern % 4], state.fbi_caption);
+        } else {
+            appendFmt(target_buf, target_max,
+                      "| \033[1;36mroot@%-16s\033[0m                     \033[1;32mSSH root@%-15s [LIVE]\033[0m |\r\n"
+                      "| SSID: %-16s  SRAM: %3u/%3uKB  Temp: +%d.%dC  Up: %6us         |\r\n"
+                      "| Headline : \033[1;37m%-62.62s\033[0m |\r\n"
+                      "| Subtitle : \033[1;36m%-62.62s\033[0m |\r\n",
+                      state.hostname,
+                      state.wifi_sta_connected ? state.wifi_ip : state.wifi_ap_ip,
+                      state.wifi_sta_connected ? state.wifi_ssid : state.wifi_ap_ssid,
+                      static_cast<unsigned>(state.free_sram_bytes / 1024U),
+                      static_cast<unsigned>(state.total_sram_bytes / 1024U),
+                      state.cpu_temp_deci_c / 10, abs(state.cpu_temp_deci_c % 10),
+                      static_cast<unsigned>(state.uptime_sec),
+                      state.headline, state.subtitle);
+        }
+        if (state.ticker_enabled) {
+            appendFmt(target_buf, target_max,
+                      "\033[1;33;44m| >>> MARQUEE: %-60.60s |\033[0m\r\n",
+                      state.ticker_text);
+        }
+        appendFmt(target_buf, target_max,
+                  "\033[1;36m+---------------------------------------------------------------------------+\033[0m\r\n");
+    } else if (strcmp(prog, "fbi") == 0 || strcmp(prog, "/bin/fbi") == 0) {
+        if (argc >= 2) {
+            if (strcmp(argv[1], "tux") == 0 || strcmp(argv[1], "1") == 0) {
+                state.fbi_pattern = 1;
+                strncpy(state.fbi_caption, "Tux the Linux Penguin (RV32)", sizeof(state.fbi_caption) - 1);
+            } else if (strcmp(argv[1], "matrix") == 0 || strcmp(argv[1], "2") == 0) {
+                state.fbi_pattern = 2;
+                strncpy(state.fbi_caption, "C6-MicroLinux Digital Rain", sizeof(state.fbi_caption) - 1);
+            } else if (strcmp(argv[1], "grid") == 0 || strcmp(argv[1], "bars") == 0 || strcmp(argv[1], "3") == 0) {
+                state.fbi_pattern = 3;
+                strncpy(state.fbi_caption, "ST7789 320x172 Geometry Grid", sizeof(state.fbi_caption) - 1);
+            } else {
+                state.fbi_pattern = 0;
+                strncpy(state.fbi_caption, "ESP32-C6 RISC-V Cyber Emblem", sizeof(state.fbi_caption) - 1);
+            }
+            if (argc >= 3) {
+                char joined_cap[48] = {0};
+                size_t cpos = 0;
+                for (size_t i = 2; i < argc; ++i) {
+                    int w = snprintf(joined_cap + cpos, sizeof(joined_cap) - cpos, "%s%s",
+                                     argv[i], (i + 1 < argc) ? " " : "");
+                    if (w > 0) cpos += static_cast<size_t>(w);
+                }
+                strncpy(state.fbi_caption, joined_cap, sizeof(state.fbi_caption) - 1);
+                state.fbi_caption[sizeof(state.fbi_caption) - 1] = '\0';
+            }
+        }
+        state.screen_mode = ScreenMode::IMAGE_VIEW;
+        state.ui_dirty = true;
+        appendFmt(target_buf, target_max,
+                  "fbi: displaying pattern #%u (\"%s\") on /dev/fb0 (320x172 ST7789)\r\n",
+                  static_cast<unsigned>(state.fbi_pattern), state.fbi_caption);
+    } else if (strcmp(prog, "pinout") == 0 || strcmp(prog, "/bin/pinout") == 0) {
+        appendFmt(target_buf, target_max,
+                  "\033[1;36m=== Waveshare ESP32-C6-LCD-1.47 Hardware Pinout (RV32IMAC) ===\033[0m\r\n"
+                  "                 \033[1;33m+---[ USB Type-C ]---+\033[0m\r\n"
+                  "            5V   | 1               22 | GND\r\n"
+                  "           GND   | 2               21 | 3V3 (OUT)\r\n"
+                  "          3V3    | 3               20 | \033[1;32mGPIO 0\033[0m  (ADC0 / XTAL_32K_P)\r\n"
+                  "  (ADC1)  \033[1;32mGPIO 1\033[0m | 4               19 | \033[1;32mGPIO 2\033[0m  (ADC2 / FSPIQ)\r\n"
+                  "  (ADC3)  \033[1;32mGPIO 3\033[0m | 5   \033[1;36mST7789 LCD\033[0m  18 | \033[1;32mGPIO 18\033[0m (SDIO / UART1_TX)\r\n"
+                  "  (TF_CS) \033[1;35mGPIO 4\033[0m | 6   \033[1;36m172 x 320\033[0m   17 | \033[1;32mGPIO 19\033[0m (SDIO / UART1_RX)\r\n"
+                  "  (MISO)  \033[1;35mGPIO 5\033[0m | 7   \033[1;36m80MHz SPI2\033[0m  16 | \033[1;32mGPIO 20\033[0m (GPIO / PWM)\r\n"
+                  "  (MOSI)  \033[1;31mGPIO 6\033[0m | 8               15 | \033[1;31mGPIO 21\033[0m (LCD_RST - Reserved)\r\n"
+                  "  (SCLK)  \033[1;31mGPIO 7\033[0m | 9               14 | \033[1;31mGPIO 22\033[0m (LCD_BL PWM)\r\n"
+                  "  (USER)  \033[1;32mGPIO10\033[0m | 10              13 | \033[1;32mGPIO 23\033[0m (User Header / PWM)\r\n"
+                  "  (USER)  \033[1;32mGPIO11\033[0m | 11              12 | \033[1;33mGPIO 9\033[0m  (BOOT Button / buttond)\r\n"
+                  "                 \033[1;33m+--------------------+\033[0m\r\n"
+                  "  \033[1;31mInternal:\033[0m LCD_CS=GPIO14, LCD_DC=GPIO15, WS2812_RGB=GPIO8, USB_D-/D+=GPIO12/13\r\n");
+    } else if (strcmp(prog, "gpio") == 0 || strcmp(prog, "/bin/gpio") == 0) {
+        auto isReservedLcdPin = [](int pin) {
+            return (pin == 6 || pin == 7 || pin == 12 || pin == 13 ||
+                    pin == 14 || pin == 15 || pin == 21 || pin == 22);
+        };
+        if (argc < 2 || strcmp(argv[1], "status") == 0) {
+            appendFmt(target_buf, target_max,
+                      "GPIO Controller Status (ESP32-C6 IOMUX):\r\n"
+                      "  Output Mask : 0x%08x\r\n"
+                      "  Input Mask  : 0x%08x\r\n"
+                      "  BOOT Button : GPIO 9 (pull-up, %u presses logged by buttond)\r\n"
+                      "  User Pins   : GPIO 0, 1, 2, 3, 10, 11, 18, 19, 20, 23\r\n",
+                      static_cast<unsigned>(state.gpio_out_mask),
+                      static_cast<unsigned>(state.gpio_in_mask),
+                      static_cast<unsigned>(state.button_press_count));
+        } else if (argc >= 3) {
+            int pin = atoi(argv[2]);
+            if (pin < 0 || pin > 23) {
+                appendFmt(target_buf, target_max, "gpio: invalid pin %d (valid range: 0..23)\r\n", pin);
+            } else if (isReservedLcdPin(pin) && strcmp(argv[1], "read") != 0) {
+                appendFmt(target_buf, target_max,
+                          "gpio: pin %d is reserved for ST7789 SPI2 / USB hardware protection\r\n", pin);
+            } else if (strcmp(argv[1], "mode") == 0 && argc >= 4) {
+                state.gpio_cmd_pin = static_cast<int8_t>(pin);
+                if (strcmp(argv[3], "out") == 0 || strcmp(argv[3], "output") == 0) {
+                    state.gpio_cmd_action = 1;
+                } else if (strcmp(argv[3], "pullup") == 0) {
+                    state.gpio_cmd_action = 3;
+                } else {
+                    state.gpio_cmd_action = 2;
+                }
+                appendFmt(target_buf, target_max, "OK GPIO %d MODE %s\r\n", pin, argv[3]);
+            } else if (strcmp(argv[1], "write") == 0 && argc >= 4) {
+                int val = (atoi(argv[3]) != 0 || strcmp(argv[3], "high") == 0 || strcmp(argv[3], "on") == 0) ? 1 : 0;
+                if (val) state.gpio_out_mask |= (1UL << pin);
+                else state.gpio_out_mask &= ~(1UL << pin);
+                state.gpio_cmd_pin = static_cast<int8_t>(pin);
+                state.gpio_cmd_action = 4;
+                state.gpio_cmd_val = static_cast<uint8_t>(val);
+                appendFmt(target_buf, target_max, "OK GPIO %d WRITE %d\r\n", pin, val);
+            } else if (strcmp(argv[1], "pwm") == 0 && argc >= 4) {
+                int duty = atoi(argv[3]);
+                if (duty < 0) duty = 0;
+                if (duty > 255) duty = 255;
+                state.gpio_cmd_pin = static_cast<int8_t>(pin);
+                state.gpio_cmd_action = 5;
+                state.gpio_cmd_val = static_cast<uint8_t>(duty);
+                appendFmt(target_buf, target_max, "OK GPIO %d PWM %d/255\r\n", pin, duty);
+            } else if (strcmp(argv[1], "read") == 0) {
+                int bit = ((state.gpio_in_mask >> pin) & 1U) | ((state.gpio_out_mask >> pin) & 1U);
+                appendFmt(target_buf, target_max, "GPIO %d = %d (%s)\r\n",
+                          pin, bit, bit ? "HIGH" : "LOW");
+            } else {
+                appendFmt(target_buf, target_max,
+                          "Usage: gpio <status | mode <pin> <in|out|pullup> | read <pin> | write <pin> <0|1> | pwm <pin> <0..255>>\r\n");
+            }
+        } else {
+            appendFmt(target_buf, target_max,
+                      "Usage: gpio <status | mode <pin> <in|out|pullup> | read <pin> | write <pin> <0|1> | pwm <pin> <0..255>>\r\n");
+        }
+    } else if (strcmp(prog, "date") == 0 || strcmp(prog, "/bin/date") == 0) {
+        bool utc = false;
+        for (size_t i = 1; i < argc; ++i) {
+            if (strcmp(argv[i], "-u") == 0 || strcmp(argv[i], "--utc") == 0) {
+                utc = true;
+            } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+                uint32_t new_ep = static_cast<uint32_t>(strtoul(argv[i + 1], nullptr, 10));
+                if (new_ep > 1000000000UL) {
+                    state.epoch_offset_sec = new_ep - state.uptime_sec;
+                }
+                ++i;
+            }
+        }
+        char dstr[64];
+        formatDateStr(state, utc, dstr, sizeof(dstr));
+        appendFmt(target_buf, target_max, "%s\r\n", dstr);
+    } else if (strcmp(prog, "ntpdate") == 0 || strcmp(prog, "/bin/ntpdate") == 0) {
+        const char* srv = (argc >= 2) ? argv[1] : "pool.ntp.org";
+        state.ntp_sync_requested = true;
+        state.ntp_synced = true;
+        char dstr[64];
+        formatDateStr(state, false, dstr, sizeof(dstr));
+        appendFmt(target_buf, target_max,
+                  "ntpdate[44]: adjust time server %s offset +0.001842 sec (%s)\r\n",
+                  srv, dstr);
+    } else if (strcmp(prog, "ping") == 0 || strcmp(prog, "/bin/ping") == 0) {
+        const char* host = nullptr;
+        int count = 3;
+        for (size_t i = 1; i < argc; ++i) {
+            if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+                count = atoi(argv[i + 1]);
+                if (count < 1) count = 1;
+                if (count > 5) count = 5;
+                ++i;
+            } else if (argv[i][0] != '-') {
+                host = argv[i];
+            }
+        }
+        if (!host) {
+            appendFmt(target_buf, target_max, "Usage: ping [-c <count>] <destination>\r\n");
+        } else {
+            bool local = (strcmp(host, "127.0.0.1") == 0 || strcmp(host, "localhost") == 0 ||
+                          strcmp(host, state.wifi_ip) == 0 || strcmp(host, state.wifi_ap_ip) == 0);
+            appendFmt(target_buf, target_max, "PING %s (%s): 56 data bytes\r\n", host, host);
+            if (!local && !state.wifi_sta_connected) {
+                appendFmt(target_buf, target_max,
+                          "ping: sendto: Network is unreachable (wlan0 disconnected)\r\n");
+            } else {
+                for (int seq = 1; seq <= count; ++seq) {
+                    unsigned rtt_int = local ? 0U : (2U + ((state.uptime_sec + static_cast<unsigned>(seq)) % 4U));
+                    unsigned rtt_dec = (state.uptime_sec * 7U + static_cast<unsigned>(seq) * 13U) % 100U;
+                    appendFmt(target_buf, target_max,
+                              "64 bytes from %s: icmp_seq=%d ttl=64 time=%u.%02u ms\r\n",
+                              host, seq, rtt_int, rtt_dec);
+                }
+                appendFmt(target_buf, target_max,
+                          "--- %s ping statistics ---\r\n"
+                          "%d packets transmitted, %d packets received, 0%% packet loss\r\n",
+                          host, count, count);
+            }
+        }
+    } else if (strcmp(prog, "netstat") == 0 || strcmp(prog, "/bin/netstat") == 0 ||
+               strcmp(prog, "ss") == 0 || strcmp(prog, "/bin/ss") == 0) {
+        const char* local_ip = state.wifi_sta_connected ? state.wifi_ip : state.wifi_ap_ip;
+        appendFmt(target_buf, target_max,
+                  "Active Internet connections (servers and established)\r\n"
+                  "Proto Recv-Q Send-Q Local Address           Foreign Address         State       PID/Program\r\n"
+                  "tcp        0      0 0.0.0.0:%-15u 0.0.0.0:*               LISTEN      18/sshd\r\n"
+                  "tcp        0      0 0.0.0.0:%-15u 0.0.0.0:*               LISTEN      20/httpd\r\n"
+                  "udp        0      0 0.0.0.0:%-15u 0.0.0.0:*                           22/syslogd\r\n",
+                  static_cast<unsigned>(state.ssh_port),
+                  static_cast<unsigned>(state.http_port),
+                  static_cast<unsigned>(state.syslog_port));
+        for (uint8_t s = 0; s < state.ssh_active_sessions; ++s) {
+            appendFmt(target_buf, target_max,
+                      "tcp        0      0 %-15s:%-7u 192.168.18.8:%-10u ESTABLISHED 18/sshd: root@pts/%u\r\n",
+                      local_ip, static_cast<unsigned>(state.ssh_port),
+                      51200U + static_cast<unsigned>(s), static_cast<unsigned>(s));
+        }
+    } else if (strcmp(prog, "edit") == 0 || strcmp(prog, "/bin/edit") == 0 ||
+               strcmp(prog, "nano") == 0 || strcmp(prog, "/bin/nano") == 0) {
+        if (argc < 2) {
+            appendFmt(target_buf, target_max,
+                      "Usage: edit <path> [line1] [line2] ...\r\n"
+                      "  (Omit [line1] in interactive shell to open line editor)\r\n");
+        } else {
+            char norm[64];
+            VirtualFs::normalizePath(cwd_, argv[1], norm, sizeof(norm));
+            if (argc >= 3) {
+                // Inline write mode: edit /root/script.sh "line 1" "line 2"
+                char body[VFS_MAX_FILE_SIZE];
+                body[0] = '\0';
+                size_t pos = 0;
+                for (size_t i = 2; i < argc; ++i) {
+                    int w = snprintf(body + pos, sizeof(body) - pos, "%s\n", argv[i]);
+                    if (w > 0) pos += static_cast<size_t>(w);
+                }
+                if (vfs.writeFile(state, norm, body, false)) {
+                    if (strcmp(norm, "/etc/crontab") == 0) {
+                        syncCronFromVfs(state, vfs);
+                    }
+                    appendFmt(target_buf, target_max, "edit: wrote %u bytes to %s\r\n",
+                              static_cast<unsigned>(strlen(body)), norm);
+                } else {
+                    appendFmt(target_buf, target_max, "edit: cannot write to %s\r\n", norm);
+                }
+            } else {
+                strncpy(edit_path_, norm, sizeof(edit_path_) - 1);
+                edit_path_[sizeof(edit_path_) - 1] = '\0';
+                if (!vfs.readFile(state, edit_path_, edit_buf_, sizeof(edit_buf_))) {
+                    edit_buf_[0] = '\0';
+                }
+                if (mode_ == SessionMode::SHELL_CLI && !redir_path) {
+                    mode_ = SessionMode::EDIT_VIEW;
+                    appendFmt(target_buf, target_max,
+                              "\033[1;36m=== C6-MicroLinux Editor: %s ===\033[0m\r\n"
+                              "Commands: \033[1;33m.show\033[0m (view) | \033[1;33m.clear\033[0m (empty) | \033[1;32m.save\033[0m (save & exit) | \033[1;31m.abort\033[0m (cancel)\r\n"
+                              "--- Current Content ---\r\n",
+                              edit_path_);
+                    appendWithCrLf(target_buf, target_max, edit_buf_);
+                    appendFmt(target_buf, target_max,
+                              "-----------------------\r\n\033[1;36medit>\033[0m ");
+                } else {
+                    appendWithCrLf(target_buf, target_max, edit_buf_);
+                }
+            }
+        }
+    } else if (strcmp(prog, "sh") == 0 || strcmp(prog, "/bin/sh") == 0 ||
+               strcmp(prog, "c6-sh") == 0 || strcmp(prog, "/bin/c6-sh") == 0 ||
+               strcmp(prog, "source") == 0) {
+        if (argc < 2) {
+            appendFmt(target_buf, target_max, "Usage: sh <script.sh> | sh -c \"<commands>\"\r\n");
+        } else if (strcmp(argv[1], "-c") == 0 && argc >= 3) {
+            executeCommandLine(state, vfs, argv[2], target_buf, target_max);
+        } else {
+            char norm[64];
+            VirtualFs::normalizePath(cwd_, argv[1], norm, sizeof(norm));
+            char script[VFS_MAX_FILE_SIZE];
+            if (!vfs.readFile(state, norm, script, sizeof(script))) {
+                appendFmt(target_buf, target_max, "sh: can't open '%s': No such file\r\n", argv[1]);
+            } else {
+                char* saveptr = nullptr;
+                char* sline = strtok_r(script, "\n", &saveptr);
+                while (sline != nullptr) {
+                    trimSpaces(sline);
+                    if (sline[0] != '\0' && sline[0] != '#') {
+                        executeCommandLine(state, vfs, sline, target_buf, target_max);
+                    }
+                    sline = strtok_r(nullptr, "\n", &saveptr);
+                }
+            }
+        }
+    } else if (strcmp(prog, "logger") == 0) {
+        if (argc < 2) {
+            appendFmt(target_buf, target_max, "Usage: logger <message...>\r\n");
+        } else {
+            char msg[88];
+            size_t pos = static_cast<size_t>(snprintf(msg, sizeof(msg), "syslog: "));
+            for (size_t i = 1; i < argc; ++i) {
+                int w = snprintf(msg + pos, sizeof(msg) - pos, "%s%s", argv[i], (i + 1 < argc) ? " " : "");
+                if (w > 0) pos += static_cast<size_t>(w);
+            }
+            state.appendDmesg(state.uptime_sec * 1000U, msg);
+            state.appendFbConsoleLine(msg);
+            state.syslog_packets++;
+            appendFmt(target_buf, target_max, "OK LOGGER \"%s\"\r\n", msg);
+        }
     } else if (strcmp(prog, "dmesg") == 0) {
         for (size_t i = 0; i < state.dmesg_count; ++i) {
             appendFmt(target_buf, target_max, "%s\r\n", state.dmesg[i]);
@@ -1248,21 +1976,72 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         }
     } else if (strcmp(prog, "screen") == 0) {
         if (argc < 2 || strcmp(argv[1], "status") == 0) {
-            char json[512];
+            char json[640];
             formatStatusJson(state, json, sizeof(json));
             appendFmt(target_buf, target_max, "%s", json);
         } else if (strcmp(argv[1], "mode") == 0 && argc >= 3) {
             if (vfs.writeFile(state, "/sys/class/graphics/fb0/mode", argv[2], false)) {
                 appendFmt(target_buf, target_max, "OK MODE %s\r\n", screenModeName(state.screen_mode));
             } else {
-                appendFmt(target_buf, target_max, "ERR invalid mode '%s' (use: dashboard|console|signboard|test)\r\n", argv[2]);
+                appendFmt(target_buf, target_max, "ERR invalid mode '%s' (use: dashboard|console|signboard|test|monitor|image)\r\n", argv[2]);
             }
+        } else if (strcmp(argv[1], "ticker") == 0 && argc >= 3) {
+            char joined[80] = {0};
+            size_t pos = 0;
+            for (size_t i = 2; i < argc; ++i) {
+                int w = snprintf(joined + pos, sizeof(joined) - pos, "%s%s", argv[i], (i + 1 < argc) ? " " : "");
+                if (w > 0) pos += static_cast<size_t>(w);
+            }
+            vfs.writeFile(state, "/sys/class/graphics/fb0/ticker", joined, false);
+            appendFmt(target_buf, target_max, "OK TICKER %s\r\n", state.ticker_enabled ? state.ticker_text : "OFF");
+        } else if (strcmp(argv[1], "alert") == 0 && argc >= 3) {
+            char joined[64] = {0};
+            size_t pos = 0;
+            for (size_t i = 2; i < argc; ++i) {
+                int w = snprintf(joined + pos, sizeof(joined) - pos, "%s%s", argv[i], (i + 1 < argc) ? " " : "");
+                if (w > 0) pos += static_cast<size_t>(w);
+            }
+            vfs.writeFile(state, "/sys/class/graphics/fb0/alert", joined, false);
+            appendFmt(target_buf, target_max, "OK ALERT %s\r\n", state.alert_active ? state.alert_text : "OFF");
         } else if (strcmp(argv[1], "text") == 0 && argc >= 3) {
-            strncpy(state.headline, argv[2], sizeof(state.headline) - 1);
-            state.headline[sizeof(state.headline) - 1] = '\0';
-            if (argc >= 4) {
-                strncpy(state.subtitle, argv[3], sizeof(state.subtitle) - 1);
-                state.subtitle[sizeof(state.subtitle) - 1] = '\0';
+            bool has_pipe = false;
+            for (size_t i = 2; i < argc; ++i) {
+                if (strcmp(argv[i], "|") == 0) {
+                    has_pipe = true;
+                    break;
+                }
+            }
+            if (has_pipe) {
+                char hbuf[48] = {0};
+                char sbuf[64] = {0};
+                size_t hpos = 0, spos = 0;
+                bool in_sub = false;
+                for (size_t i = 2; i < argc; ++i) {
+                    if (strcmp(argv[i], "|") == 0) {
+                        in_sub = true;
+                        continue;
+                    }
+                    if (!in_sub) {
+                        int w = snprintf(hbuf + hpos, sizeof(hbuf) - hpos, "%s%s", hpos > 0 ? " " : "", argv[i]);
+                        if (w > 0) hpos += static_cast<size_t>(w);
+                    } else {
+                        int w = snprintf(sbuf + spos, sizeof(sbuf) - spos, "%s%s", spos > 0 ? " " : "", argv[i]);
+                        if (w > 0) spos += static_cast<size_t>(w);
+                    }
+                }
+                strncpy(state.headline, hbuf, sizeof(state.headline) - 1);
+                state.headline[sizeof(state.headline) - 1] = '\0';
+                if (sbuf[0] != '\0') {
+                    strncpy(state.subtitle, sbuf, sizeof(state.subtitle) - 1);
+                    state.subtitle[sizeof(state.subtitle) - 1] = '\0';
+                }
+            } else {
+                strncpy(state.headline, argv[2], sizeof(state.headline) - 1);
+                state.headline[sizeof(state.headline) - 1] = '\0';
+                if (argc >= 4) {
+                    strncpy(state.subtitle, argv[3], sizeof(state.subtitle) - 1);
+                    state.subtitle[sizeof(state.subtitle) - 1] = '\0';
+                }
             }
             state.ui_dirty = true;
             appendFmt(target_buf, target_max, "OK TEXT \"%s\" \"%s\"\r\n", state.headline, state.subtitle);
@@ -1333,7 +2112,7 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
             }
         } else {
             appendFmt(target_buf, target_max,
-                      "Usage: screen <status | mode <m> | text <h> [s] | theme <t> | bl <0..100> | flip <on|off> | bar <pct> [lbl] | console <str> | clear | led <mode> [r g b]>\r\n");
+                      "Usage: screen <status | mode <m> | text <h> [s] | ticker <msg|off> | alert <msg|off> | theme <t> | bl <0..100> | flip <on|off> | bar <pct> [lbl] | console <str> | clear | led <mode> [r g b]>\r\n");
         }
     } else {
         appendFmt(target_buf, target_max, "c6-sh: %s: command not found (type 'help' or 'menu')\r\n", prog);
@@ -1344,6 +2123,8 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         VirtualFs::normalizePath(cwd_, redir_path, norm, sizeof(norm));
         if (!vfs.writeFile(state, norm, cmd_out, redir_append)) {
             appendFmt(out_buf, max_len, "c6-sh: %s: Permission denied or invalid device value\r\n", redir_path);
+        } else if (strcmp(norm, "/etc/crontab") == 0) {
+            syncCronFromVfs(state, vfs);
         }
     }
 

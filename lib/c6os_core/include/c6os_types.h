@@ -13,7 +13,9 @@ enum class ScreenMode : uint8_t {
     FB_CONSOLE   = 1,  // /dev/tty0 live scrolling kernel & terminal console (53x21 chars)
     SIGNBOARD    = 2,  // Full-screen scaled custom headline & subtitle signboard
     DIAGNOSTICS  = 3,  // RGB565 color bars, geometry grid, and hardware pin/bus test
-    COUNT        = 4
+    MONITOR      = 4,  // On-LCD htop telemetry: CPU sparkline, SRAM bar, temp, process table
+    IMAGE_VIEW   = 5,  // Framebuffer artwork/sprite viewer (fbi)
+    COUNT        = 6
 };
 
 // High-Contrast RGB565 Color Themes
@@ -75,6 +77,8 @@ inline const char* screenModeName(ScreenMode mode) {
         case ScreenMode::FB_CONSOLE:   return "console";
         case ScreenMode::SIGNBOARD:    return "signboard";
         case ScreenMode::DIAGNOSTICS:  return "test";
+        case ScreenMode::MONITOR:      return "monitor";
+        case ScreenMode::IMAGE_VIEW:   return "image";
         default:                       return "dashboard";
     }
 }
@@ -85,6 +89,8 @@ inline const char* screenModeLabel(ScreenMode mode) {
         case ScreenMode::FB_CONSOLE:   return "LCD Console (tty0)";
         case ScreenMode::SIGNBOARD:    return "Custom Signboard";
         case ScreenMode::DIAGNOSTICS:  return "Hardware Test";
+        case ScreenMode::MONITOR:      return "Live htop Monitor";
+        case ScreenMode::IMAGE_VIEW:   return "Framebuffer Image (fbi)";
         default:                       return "OS Dashboard";
     }
 }
@@ -125,6 +131,16 @@ struct WifiScanEntry {
 };
 
 constexpr size_t MAX_WIFI_SCAN_RESULTS = 10;
+constexpr size_t MAX_CRON_JOBS = 4;
+
+struct CronJob {
+    bool active;
+    bool enabled;
+    uint32_t interval_sec;
+    uint32_t last_run_sec;
+    uint32_t run_count;
+    char cmd[64];
+};
 
 struct SystemState {
     // Kernel & SoC Metadata
@@ -140,6 +156,16 @@ struct SystemState {
     bool sd_mounted;
     uint32_t sd_total_mb;
     uint32_t uptime_sec;
+
+    // Thermal, CPU Load Sparkline, and Wall-Clock NTP State
+    int16_t cpu_temp_deci_c;  // e.g., 415 -> 41.5 C
+    uint8_t cpu_load_pct;
+    uint8_t cpu_history[32];
+    uint8_t cpu_history_idx;
+    uint32_t epoch_offset_sec;
+    char tz_name[32];
+    bool ntp_synced;
+    bool ntp_sync_requested;
 
     // Network & SSH Daemon Status
     bool wifi_sta_enabled;
@@ -164,6 +190,13 @@ struct SystemState {
     uint32_t net_rx_bytes;
     uint32_t net_tx_bytes;
 
+    // HTTP REST API, Syslog Receiver, and Hardware Button Daemons
+    uint16_t http_port;
+    uint32_t http_requests;
+    uint16_t syslog_port;
+    uint32_t syslog_packets;
+    uint32_t button_press_count;
+
     // Screen & Peripheral State
     ScreenMode screen_mode;
     ThemeId theme;
@@ -172,6 +205,27 @@ struct SystemState {
     char headline[48];
     char subtitle[64];
     char banner_footer[64];
+
+    // Scrolling Ticker / Marquee & Alert Overlay Engine
+    bool ticker_enabled;
+    char ticker_text[96];
+    uint16_t ticker_offset;
+    bool alert_active;
+    char alert_text[64];
+
+    // Framebuffer Image Viewer (fbi) State
+    uint8_t fbi_pattern;
+    char fbi_caption[48];
+
+    // Cron Periodic Scheduler Table
+    CronJob cron_jobs[MAX_CRON_JOBS];
+
+    // GPIO & PWM Hardware Control State
+    uint32_t gpio_out_mask;
+    uint32_t gpio_in_mask;
+    int8_t gpio_cmd_pin;
+    uint8_t gpio_cmd_action;  // 0=none, 1=in, 2=out_low, 3=out_high, 4=pwm
+    uint8_t gpio_cmd_val;
 
     // Canvas Custom Draw Overlay (optional user-drawn box/bar from CLI)
     bool custom_bar_visible;
@@ -218,6 +272,16 @@ struct SystemState {
         sd_total_mb = 0;
         uptime_sec = 0;
 
+        cpu_temp_deci_c = 385;
+        cpu_load_pct = 8;
+        for (size_t i = 0; i < 32; ++i) {
+            cpu_history[i] = static_cast<uint8_t>(6 + (i % 7));
+        }
+        epoch_offset_sec = 1793518800U;
+        strncpy(tz_name, "UTC", sizeof(tz_name) - 1);
+        ntp_synced = false;
+        ntp_sync_requested = false;
+
         wifi_sta_enabled = true;
         wifi_sta_connected = false;
         strncpy(wifi_ip, "0.0.0.0", sizeof(wifi_ip) - 1);
@@ -235,6 +299,12 @@ struct SystemState {
         strncpy(ssh_client_ip, "none", sizeof(ssh_client_ip) - 1);
         strncpy(ssh_hostkey_fp, "SHA256:Generating...", sizeof(ssh_hostkey_fp) - 1);
 
+        http_port = 80;
+        http_requests = 0;
+        syslog_port = 514;
+        syslog_packets = 0;
+        button_press_count = 0;
+
         screen_mode = ScreenMode::OS_DASHBOARD;
         theme = ThemeId::CYBER_CYAN;
         backlight_pct = 100;
@@ -242,6 +312,11 @@ struct SystemState {
         strncpy(headline, "C6-MicroLinux Ready", sizeof(headline) - 1);
         strncpy(subtitle, "SSH Port 22 | CLI Screen Control", sizeof(subtitle) - 1);
         strncpy(banner_footer, "Use 'menu' over SSH or /dev/ttyACM0", sizeof(banner_footer) - 1);
+        strncpy(fbi_caption, "C6-MicroLinux RISC-V", sizeof(fbi_caption) - 1);
+
+        gpio_cmd_pin = -1;
+        gpio_cmd_action = 0;
+        gpio_cmd_val = 0;
 
         led_mode = LedMode::SSH_ACTIVITY;
         led_r = 0;
@@ -249,6 +324,18 @@ struct SystemState {
         led_b = 255;
 
         ui_dirty = true;
+    }
+
+    size_t activeCronCount() const {
+        size_t count = 0;
+        for (size_t i = 0; i < MAX_CRON_JOBS; ++i) {
+            if (cron_jobs[i].active) ++count;
+        }
+        return count;
+    }
+
+    void appendFbLine(const char* text) {
+        appendFbConsoleLine(text);
     }
 
     void appendFbConsoleLine(const char* text) {

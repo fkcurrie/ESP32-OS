@@ -151,6 +151,102 @@ void test_interactive_menu_and_shell_commands(void) {
     TEST_ASSERT_FALSE(session.isInteractiveMonitor());
 }
 
+void test_new_ten_os_features(void) {
+    SystemState state;
+    state.initDefaults();
+    state.cpu_temp_deci_c = 425;  // 42.5 C
+    VirtualFs vfs;
+    vfs.initDefaultFiles(state);
+
+    ShellSession session;
+    char out[4096];
+    session.begin(state, vfs, /*start_in_menu=*/false, out, sizeof(out));
+
+    // 1. On-LCD htop monitor mode
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "screen mode monitor", out, sizeof(out)));
+    TEST_ASSERT_EQUAL(ScreenMode::MONITOR, state.screen_mode);
+
+    // 2. Hardware thermal sensor CLI & sysfs
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(vfs.readFile(state, "/sys/class/thermal/thermal_zone0/temp", out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("42500\n", out);
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "sensors", out, sizeof(out)));
+    TEST_ASSERT_NOT_NULL(strstr(out, "+42.5"));
+
+    // 3. Cron scheduler & watch
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(
+        state, vfs, "crontab -a 30 screen text Cron OK && crontab -l", out, sizeof(out)));
+    TEST_ASSERT_EQUAL_UINT8(1, state.activeCronCount());
+    TEST_ASSERT_NOT_NULL(strstr(out, "every   30s"));
+
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "watch -b -n 2 sensors", out, sizeof(out)));
+    TEST_ASSERT_NOT_NULL(strstr(out, "Every 2.0s:"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "sensors"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "+42.5"));
+
+    // 4. Framebuffer screenshot (fbgrab) & image viewer (fbi)
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "fbi tux Linux Mascot", out, sizeof(out)));
+    TEST_ASSERT_EQUAL(ScreenMode::IMAGE_VIEW, state.screen_mode);
+    TEST_ASSERT_EQUAL_UINT8(1, state.fbi_pattern);
+    TEST_ASSERT_EQUAL_STRING("Linux Mascot", state.fbi_caption);
+
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "fbgrab /root/snap.ppm", out, sizeof(out)));
+    TEST_ASSERT_NOT_NULL(strstr(out, "captured /dev/fb0"));
+
+    // 5. Scrolling ticker & flashing alert banner
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(
+        state, vfs, "screen ticker Welcome to C6-MicroLinux && screen alert High Load", out, sizeof(out)));
+    TEST_ASSERT_TRUE(state.ticker_enabled);
+    TEST_ASSERT_EQUAL_STRING("Welcome to C6-MicroLinux", state.ticker_text);
+    TEST_ASSERT_TRUE(state.alert_active);
+    TEST_ASSERT_EQUAL_STRING("High Load", state.alert_text);
+
+    // 7. Pinout & GPIO / PWM control (protecting SPI2 LCD pins)
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "pinout", out, sizeof(out)));
+    TEST_ASSERT_NOT_NULL(strstr(out, "Waveshare ESP32-C6-LCD-1.47"));
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "gpio write 14 1", out, sizeof(out)));
+    TEST_ASSERT_NOT_NULL(strstr(out, "reserved for ST7789 SPI2"));
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "gpio pwm 2 128", out, sizeof(out)));
+    TEST_ASSERT_EQUAL_UINT8(128, state.gpio_cmd_val);
+
+    // 8. Network diagnostic suite (date, ping, netstat)
+    state.wifi_sta_connected = true;
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "date && ping -c 2 192.168.18.1 && netstat", out, sizeof(out)));
+    TEST_ASSERT_NOT_NULL(strstr(out, "0% packet loss"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "0.0.0.0:80"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "0.0.0.0:514"));
+
+    // 9. Interactive editor & shell script runner (sh)
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.consumeBytes(state, vfs, "edit /root/hello.sh\n", 20, out, sizeof(out)));
+    TEST_ASSERT_EQUAL(SessionMode::EDIT_VIEW, session.mode());
+    TEST_ASSERT_TRUE(session.consumeBytes(state, vfs, ":clear\n", 7, out, sizeof(out)));
+    TEST_ASSERT_TRUE(session.consumeBytes(state, vfs, "screen text Scripted | Run via sh\n", 34, out, sizeof(out)));
+    TEST_ASSERT_TRUE(session.consumeBytes(state, vfs, ":wq\n", 4, out, sizeof(out)));
+    TEST_ASSERT_EQUAL(SessionMode::SHELL_CLI, session.mode());
+
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "sh /root/hello.sh", out, sizeof(out)));
+    TEST_ASSERT_EQUAL_STRING("Scripted", state.headline);
+    TEST_ASSERT_EQUAL_STRING("Run via sh", state.subtitle);
+
+    // 10. Logger / syslogd integration
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "logger Deployment verified", out, sizeof(out)));
+    TEST_ASSERT_EQUAL_UINT32(1, state.syslog_packets);
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -159,5 +255,6 @@ int main(int argc, char** argv) {
     RUN_TEST(test_vfs_path_normalization_and_user_files);
     RUN_TEST(test_ssh_mpint_and_packet_framing);
     RUN_TEST(test_interactive_menu_and_shell_commands);
+    RUN_TEST(test_new_ten_os_features);
     return UNITY_END();
 }

@@ -20,7 +20,11 @@ enum class SessionMode : uint8_t {
     MENU_WIFI_SSID = 7,    // Prompting for Wi-Fi SSID
     MENU_WIFI_PASS = 8,    // Prompting for Wi-Fi Password
     TOP_VIEW = 9,          // Interactive live-refreshing 'top' process monitor
-    HTOP_VIEW = 10         // Interactive live-refreshing 'htop' color TUI monitor
+    HTOP_VIEW = 10,        // Interactive live-refreshing 'htop' color TUI monitor
+    WATCH_VIEW = 11,       // Interactive live-refreshing 'watch' command view
+    EDIT_VIEW = 12,        // Interactive line-based text editor ('edit' / 'nano')
+    MENU_PROMPT_TICKER = 13, // Prompting for scrolling bottom ticker text
+    MENU_PROMPT_ALERT = 14   // Prompting for flashing alert overlay banner
 };
 
 enum class MonitorSort : uint8_t {
@@ -53,15 +57,30 @@ public:
     void renderTop(const SystemState& state, bool is_htop, bool clear_screen,
                    char* out_buf, size_t max_len) const;
     void renderMonitorTick(const SystemState& state, char* out_buf, size_t max_len) const;
+    void renderMonitorTick(SystemState& state, VirtualFs& vfs, char* out_buf, size_t max_len);
 
     SessionMode mode() const { return mode_; }
     bool isInteractiveMonitor() const {
-        return mode_ == SessionMode::TOP_VIEW || mode_ == SessionMode::HTOP_VIEW;
+        return mode_ == SessionMode::TOP_VIEW ||
+               mode_ == SessionMode::HTOP_VIEW ||
+               mode_ == SessionMode::WATCH_VIEW;
+    }
+    uint16_t monitorIntervalMs() const {
+        return (mode_ == SessionMode::WATCH_VIEW && watch_interval_sec_ > 0)
+                   ? static_cast<uint16_t>(watch_interval_sec_ * 1000U)
+                   : 1500U;
     }
     const char* cwd() const { return cwd_; }
 
     // Format screen & system status as JSON (used by 'screen status' and host tooling)
     static void formatStatusJson(const SystemState& state, char* out_buf, size_t max_len);
+
+    // Format wall-clock date/time string
+    static void formatDateStr(const SystemState& state, bool force_utc, char* out_buf, size_t max_len);
+
+    // Sync /etc/crontab <-> state.cron_jobs
+    static void syncCronFromVfs(SystemState& state, const VirtualFs& vfs);
+    static void syncVfsFromCron(SystemState& state, VirtualFs& vfs);
 
 private:
     bool executeSingleCommand(SystemState& state, VirtualFs& vfs,
@@ -78,6 +97,9 @@ private:
                             const char* line,
                             char* out_buf, size_t max_len);
 
+    void renderWatchFrame(SystemState& state, VirtualFs& vfs, bool clear_screen,
+                          char* out_buf, size_t max_len);
+
     SessionMode mode_;
     SessionMode prev_mode_;
     MonitorSort sort_mode_;
@@ -87,6 +109,10 @@ private:
     size_t line_len_;
     char pending_ssid_[33];
     char menu_notice_[96];
+    char watch_cmd_[96];
+    uint16_t watch_interval_sec_;
+    char edit_path_[64];
+    char edit_buf_[VFS_MAX_FILE_SIZE];
 };
 
 }  // namespace c6os

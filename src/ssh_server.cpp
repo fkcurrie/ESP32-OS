@@ -585,13 +585,13 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
         while (client.connected() && client.available() == 0) {
             if (channel_open && shell.isInteractiveMonitor()) {
                 uint32_t now = millis();
-                if (now - last_mon_tick >= 1500) {
+                if (now - last_mon_tick >= shell.monitorIntervalMs()) {
                     last_mon_tick = now;
                     io_buf[0] = '\0';
                     if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                         state.uptime_sec = millis() / 1000;
                         state.free_sram_bytes = ESP.getFreeHeap();
-                        shell.renderMonitorTick(state, io_buf, sizeof(ws.io_buf));
+                        shell.renderMonitorTick(state, vfs, io_buf, sizeof(ws.io_buf));
                         xSemaphoreGive(mutex);
                     }
                     if (io_buf[0] != '\0') {
