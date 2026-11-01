@@ -17,6 +17,8 @@ const char* viewModeToString(ViewMode mode) {
             return "host";
         case ViewMode::WIRELESS:
             return "wireless";
+        case ViewMode::TRANSIT:
+            return "transit";
         default:
             return "dashboard";
     }
@@ -297,8 +299,10 @@ bool parseSerialCommand(const char* line, ScreenState& state, char* response, si
             state.view_mode = ViewMode::HOST_MONITOR;
         } else if (equalsIgnoreCase(args, "wireless")) {
             state.view_mode = ViewMode::WIRELESS;
+        } else if (equalsIgnoreCase(args, "transit")) {
+            state.view_mode = ViewMode::TRANSIT;
         } else {
-            snprintf(response, resp_len, "ERR VIEW must be dashboard|host|wireless");
+            snprintf(response, resp_len, "ERR VIEW must be dashboard|host|wireless|transit");
             return false;
         }
         state.ui_dirty = true;
@@ -362,10 +366,15 @@ bool parseSerialCommand(const char* line, ScreenState& state, char* response, si
         char* saveptr = nullptr;
         char* tok_cpu = strtok_r(arg_buf, " ", &saveptr);
         char* tok_ram = strtok_r(nullptr, " ", &saveptr);
-        char* tok_ip = strtok_r(nullptr, " ", &saveptr);
+        char* tok_ip = saveptr;
+        if (tok_ip) {
+            while (*tok_ip == ' ') {
+                tok_ip++;
+            }
+        }
 
         int cpu = 0, ram = 0;
-        if (!tok_cpu || !tok_ram || !tok_ip ||
+        if (!tok_cpu || !tok_ram || !tok_ip || *tok_ip == '\0' ||
             !parseIntInRange(tok_cpu, 0, 100, &cpu) ||
             !parseIntInRange(tok_ram, 0, 100, &ram)) {
             snprintf(response, resp_len, "ERR HOST requires <cpu_pct> <ram_pct> <ip>");

@@ -12,16 +12,16 @@ namespace lcd {
 // RGB565 High-Contrast Palette (Pure Black Background + Bright White Foreground)
 constexpr uint16_t COLOR_BLACK     = 0x0000;
 constexpr uint16_t COLOR_BG        = 0x0000;  // Pure black (#000000)
-constexpr uint16_t COLOR_CARD      = 0x0000;  // Pure black (#000000)
+constexpr uint16_t COLOR_CARD      = 0x0000;  // Pure black (#000000) for maximum contrast
 constexpr uint16_t COLOR_NAVY      = 0x0000;  // Pure black (#000000)
 constexpr uint16_t COLOR_WHITE     = 0xFFFF;  // Pure bright white (#FFFFFF)
 constexpr uint16_t COLOR_BORDER    = 0xFFFF;  // Crisp white card border
-constexpr uint16_t COLOR_MUTED     = 0xFFFF;  // Bright white
-constexpr uint16_t COLOR_CYAN      = 0xFFFF;  // Bright white
-constexpr uint16_t COLOR_GREEN     = 0xFFFF;  // Bright white
-constexpr uint16_t COLOR_AMBER     = 0xFFFF;  // Bright white
-constexpr uint16_t COLOR_RED       = 0xFFFF;  // Bright white
-constexpr uint16_t COLOR_PURPLE    = 0xFFFF;  // Bright white
+constexpr uint16_t COLOR_MUTED     = 0xC618;  // Clean silver gray (#C0C0C0)
+constexpr uint16_t COLOR_CYAN      = 0x07FF;  // Vibrant cyan (#00FFFF)
+constexpr uint16_t COLOR_GREEN     = 0x07E0;  // Vibrant green (#00FF00)
+constexpr uint16_t COLOR_AMBER     = 0xFFE0;  // Pure bright yellow (#FFFF00) for maximum contrast
+constexpr uint16_t COLOR_RED       = 0xF800;  // Pure bright red (#FF0000) for maximum contrast
+constexpr uint16_t COLOR_PURPLE    = 0xF81F;  // Pure bright magenta (#FF00FF)
 
 // Weather Icon Vibrant RGB565 Palette
 constexpr uint16_t ICON_SUN_YELLOW = 0xFFE0;  // Bright sun yellow (#FFFF00)

@@ -204,7 +204,7 @@ def main() -> int:
     p_bl.add_argument("percent", type=int, help="Backlight percentage (0..100)")
 
     p_view = sub.add_parser("view", help="Switch active LCD screen")
-    p_view.add_argument("name", choices=["dashboard", "host", "wireless"], help="Target view")
+    p_view.add_argument("name", choices=["dashboard", "host", "wireless", "transit"], help="Target view")
 
     p_mode = sub.add_parser("mode", help="Set onboard WS2812 RGB LED mode")
     p_mode.add_argument("name", choices=["rainbow", "pulse", "solid", "off"], help="RGB LED mode")
@@ -217,6 +217,12 @@ def main() -> int:
     p_host = sub.add_parser("host", help="Send Linux host CPU/RAM/IP metrics to the screen")
     p_host.add_argument("--watch", action="store_true", help="Continuously stream metrics at high FPS")
     p_host.add_argument("--fps", type=float, default=15.0, help="Refresh rate in Hz when --watch is enabled (default: 15)")
+
+    p_transit = sub.add_parser("transit", help="Send transit data to the screen")
+    p_transit.add_argument("subway1", type=int, help="Subway Line 1 mins")
+    p_transit.add_argument("subway2", type=int, help="Subway Line 1 secondary mins")
+    p_transit.add_argument("streetcar", help="Streetcar arrival text (e.g., '501: 5m, 17m')")
+    p_transit.add_argument("alert", nargs="?", default="Transit Nominal", help="Bottom banner alert message")
 
     p_demo = sub.add_parser("demo", help="Run a smooth high-FPS live animation demo on the LCD")
     p_demo.add_argument("--seconds", type=float, default=5.0, help="Duration of the demo in seconds (default: 5.0)")
@@ -300,6 +306,16 @@ def main() -> int:
                 elapsed = time.monotonic() - t_start
                 if elapsed < interval:
                     time.sleep(interval - elapsed)
+        finally:
+            os.close(fd)
+    elif args.subcmd == "transit":
+        fd = os.open(args.port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            configure_tty(fd)
+            send_command_fd(fd, "VIEW transit")
+            r_host = send_command_fd(fd, f"HOST {args.subway1} {args.subway2} {args.streetcar}")
+            r_text = send_command_fd(fd, f"TEXT {args.alert}")
+            print(f"Transit update: {r_host} | {r_text}")
         finally:
             os.close(fd)
     elif args.subcmd == "demo":

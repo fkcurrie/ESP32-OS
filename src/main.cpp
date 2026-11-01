@@ -502,6 +502,106 @@ void renderWirelessView(const screen::ScreenState& st, bool full_redraw) {
     g_lcd.drawString(177, 60, buf, lcd::COLOR_WHITE, lcd::COLOR_CARD, 6, 3);
 }
 
+void renderTransitView(const screen::ScreenState& st, bool full_redraw) {
+    if (full_redraw) {
+        g_lcd.fillScreen(lcd::COLOR_BG);
+        
+        // Horizontal dividing line between Subway and Bus
+        g_lcd.fillRect(0, 72, 320, 2, lcd::COLOR_CYAN);
+    }
+
+    // -------------------------------------------------------------------------
+    // TOP HALF: TTC LINE 1 SUBWAY (Eglinton Southbound)
+    // -------------------------------------------------------------------------
+    // Section Header
+    g_lcd.drawString(8, 4, "TTC LINE 1 SUBWAY", lcd::COLOR_AMBER, lcd::COLOR_BG, 2, 17);
+    
+    // Top Right: Update Time
+    if (st.custom_text[0] != '\0') {
+        const char* ts = strchr(st.custom_text, '@');
+        if (ts) ts += 2; else ts = st.custom_text;
+        g_lcd.drawString(220, 8, ts, lcd::COLOR_CYAN, lcd::COLOR_BG, 1, 8);
+    }
+
+    // Main Subway Arrival (Scale 5 - Huge 30x40 font)
+    char m1_buf[12];
+    if (st.host_cpu_pct == 0xFF || st.host_cpu_pct == 0) {
+        snprintf(m1_buf, sizeof(m1_buf), "-- MIN");
+    } else {
+        snprintf(m1_buf, sizeof(m1_buf), "%2u MIN", static_cast<unsigned>(st.host_cpu_pct));
+    }
+    g_lcd.drawString(8, 26, m1_buf, lcd::COLOR_WHITE, lcd::COLOR_BG, 5, 6);
+
+    // Next Subway Arrival (Scale 3 - Large 18x24 font)
+    char m2_buf[16];
+    if (st.host_ram_pct == 0xFF || st.host_ram_pct == 0) {
+        snprintf(m2_buf, sizeof(m2_buf), "NXT: --m");
+    } else {
+        snprintf(m2_buf, sizeof(m2_buf), "NXT:%2um", static_cast<unsigned>(st.host_ram_pct));
+    }
+    g_lcd.drawString(190, 38, m2_buf, lcd::COLOR_AMBER, lcd::COLOR_BG, 3, 8);
+
+    // -------------------------------------------------------------------------
+    // BOTTOM HALF: DUNFIELD AVE BUSES (Route 34 & 103/74)
+    // -------------------------------------------------------------------------
+    // Section Header
+    g_lcd.drawString(8, 80, "DUNFIELD AVE BUSES", lcd::COLOR_CYAN, lcd::COLOR_BG, 2, 18);
+
+    // Parse incoming bus string: "34:1m,15m | 103:5m,24m" or similar
+    char line1[24] = "34: No Data";
+    char line2[24] = "";
+    
+    if (strcmp(st.host_ip, "0.0.0.0") != 0 && st.host_ip[0] != '\0') {
+        const char* sep = strchr(st.host_ip, '|');
+        if (sep) {
+            size_t len1 = sep - st.host_ip;
+            if (len1 >= sizeof(line1)) len1 = sizeof(line1) - 1;
+            strncpy(line1, st.host_ip, len1);
+            line1[len1] = '\0';
+            
+            const char* p2 = sep + 1;
+            while (*p2 == ' ') p2++;
+            strncpy(line2, p2, sizeof(line2) - 1);
+            line2[sizeof(line2) - 1] = '\0';
+        } else {
+            strncpy(line1, st.host_ip, sizeof(line1) - 1);
+            line1[sizeof(line1) - 1] = '\0';
+        }
+    }
+
+    // Format Route 34 display string
+    char b1_fmt[28];
+    if (strncmp(line1, "34:", 3) == 0) {
+        snprintf(b1_fmt, sizeof(b1_fmt), "34 EGL: %s", line1 + 3);
+    } else {
+        snprintf(b1_fmt, sizeof(b1_fmt), "%s", line1);
+    }
+
+    // Clear and draw Bus Row 1 (Scale 3 - 18x24 font)
+    g_lcd.fillRect(8, 104, 304, 26, lcd::COLOR_BG);
+    g_lcd.drawString(8, 104, b1_fmt, lcd::COLOR_WHITE, lcd::COLOR_BG, 3, 16);
+
+    // Format Route 103/74 display string
+    char b2_fmt[28] = "";
+    if (line2[0] != '\0') {
+        if (strncmp(line2, "103:", 4) == 0) {
+            snprintf(b2_fmt, sizeof(b2_fmt), "103 MT: %s", line2 + 4);
+        } else if (strncmp(line2, "74:", 3) == 0) {
+            snprintf(b2_fmt, sizeof(b2_fmt), "74 MT : %s", line2 + 3);
+        } else {
+            snprintf(b2_fmt, sizeof(b2_fmt), "%s", line2);
+        }
+    }
+
+    // Clear and draw Bus Row 2 (Scale 3 - 18x24 font)
+    g_lcd.fillRect(8, 136, 304, 26, lcd::COLOR_BG);
+    if (b2_fmt[0] != '\0') {
+        g_lcd.drawString(8, 136, b2_fmt, lcd::COLOR_GREEN, lcd::COLOR_BG, 3, 16);
+    } else {
+        g_lcd.drawString(8, 136, "103 MT: No Data", lcd::COLOR_GREEN, lcd::COLOR_BG, 3, 16);
+    }
+}
+
 void renderUiIfNeeded() {
     constexpr uint32_t FRAME_INTERVAL_MS = 50;  // 20 FPS smooth refresh
     static uint32_t last_frame_ms = 0;
@@ -559,6 +659,9 @@ void renderUiIfNeeded() {
             renderHeader(snapshot, now_ms, full_redraw);
             renderWirelessView(snapshot, full_redraw);
             renderFooter(snapshot, now_ms, full_redraw);
+            break;
+        case screen::ViewMode::TRANSIT:
+            renderTransitView(snapshot, full_redraw);
             break;
         case screen::ViewMode::DASHBOARD:
         default:

@@ -10,7 +10,8 @@ enum class ViewMode : uint8_t {
     DASHBOARD = 0,
     HOST_MONITOR = 1,
     WIRELESS = 2,
-    COUNT = 3
+    TRANSIT = 3,
+    COUNT = 4
 };
 
 enum class RgbMode : uint8_t {
