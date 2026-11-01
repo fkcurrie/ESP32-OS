@@ -12,10 +12,11 @@ Users can **SSH directly into the ESP32-C6** over Wi-Fi (`ssh root@<ip>`) or att
 | :--- | :--- |
 | **Target SoC & Display** | `ESP32-C6FH4` (RV32IMAC @ 160 MHz, 320 KB SRAM, 8 MB DIO Flash) + Waveshare 1.47" ST7789 (`320x172` RGB565 @ 80 MHz SPI2) |
 | **SSHv2 Daemon (`sshd`)** | Built from source ([`src/ssh_server.cpp`](src/ssh_server.cpp), [`lib/c6os_core/src/ssh_packet.cpp`](lib/c6os_core/src/ssh_packet.cpp)) on TCP Port `22` using `libsodium` + `mbedtls` (`curve25519-sha256` KEX, `ssh-ed25519` host key in NVS, `aes128-ctr` encryption, `hmac-sha2-256` MAC, RFC 8308 `SSH_MSG_EXT_INFO`). Supports concurrent multi-session SSH, `password` (`root` / `esp32c6`), and `publickey` authentication (including `ProxyJump`). |
-| **Interactive CLI Menu (`c6-menu`)** | Launches automatically upon SSH or Serial login ([`lib/c6os_core/src/c6os_shell.cpp`](lib/c6os_core/src/c6os_shell.cpp)). Single-keystroke control (`[1]`–`[9]`, `[+]`/`[-]`, `[t]`, `[s]`, `[q]`) over LCD modes, custom headline/subtitle text, color themes, PWM backlight, 180° flip, WS2812 RGB LED, live `/dev/tty0` terminal mirroring, `htop`, and Wi-Fi setup. |
-| **POSIX-like Shell (`c6-sh`) & Monitors** | Built-in commands: `top`, `htop`, `lscpu`, `vmstat`, `neofetch`, `menu`, `screen`, `wifi`, `uname`, `uptime`, `free`, `df`, `ps`, `dmesg`, `ls`, `cd`, `pwd`, `cat`, `echo`, `rm`, `ip`/`ifconfig`, `hostname`, `passwd`, `reboot`, with output redirection (`>` / `>>`) and command chaining (`&&` / `;`). |
-| **Virtual Filesystem (`VirtualFs`)** | Synthetic `/proc` (`version`, `cpuinfo`, `meminfo`, `uptime`, `loadavg`, `net/dev`, `net/wireless`), `/sys/class/*` (`backlight/st7789/brightness`, `graphics/fb0/{mode,theme,text}`, `leds/ws2812/{mode,rgb}`), `/dev/tty0` framebuffer console, and persistent `/etc/*` & `/root/*` on LittleFS ([`lib/c6os_core/src/c6os_vfs.cpp`](lib/c6os_core/src/c6os_vfs.cpp)). |
-| **4 LCD Render Modes** | `dashboard` (OS & SSH status cards), `console` (live 52×18 `/dev/tty0` Linux framebuffer terminal), `signboard` (full-screen custom typography banner), and `test` (SMPTE color bars & hardware diagnostics) ([`src/screen_manager.cpp`](src/screen_manager.cpp)). |
+| **Interactive CLI Menu (`c6-menu`)** | Launches automatically upon SSH or Serial login ([`lib/c6os_core/src/c6os_shell.cpp`](lib/c6os_core/src/c6os_shell.cpp)). Single-keystroke control (`[1]`–`[9]`, `[+]`/`[-]`, `[m]`, `[k]`, `[a]`, `[t]`, `[s]`, `[q]`) over LCD modes, on-LCD graphical telemetry monitor, scrolling marquee ticker, flashing alert banner, custom headline/subtitle text, color themes, PWM backlight, 180° flip, WS2812 RGB LED, live `/dev/tty0` terminal mirroring, `htop`, and Wi-Fi setup. |
+| **POSIX-like Shell (`c6-sh`) & System Tools** | Built-in commands: `top`, `htop`, `watch`, `crontab`, `sensors`, `pinout`, `gpio`, `fbgrab`, `fbi`, `edit`/`nano`, `sh`, `logger`, `date`, `ntpdate`, `ping`, `netstat`/`ss`, `lscpu`, `vmstat`, `neofetch`, `menu`, `screen`, `wifi`, `uname`, `uptime`, `free`, `df`, `ps`, `dmesg`, `ls`, `cd`, `pwd`, `cat`, `echo`, `rm`, `ip`/`ifconfig`, `hostname`, `passwd`, `reboot`, with output redirection (`>` / `>>`) and command chaining (`&&` / `;`). |
+| **Virtual Filesystem (`VirtualFs`)** | Synthetic `/proc` (`version`, `cpuinfo`, `meminfo`, `uptime`, `loadavg`, `net/dev`, `net/wireless`), `/sys/class/*` (`thermal/thermal_zone0/temp`, `backlight/st7789/brightness`, `graphics/fb0/{mode,theme,text,ticker,alert}`, `leds/ws2812/{mode,rgb}`, `gpio/status`), `/dev/tty0` framebuffer console, and persistent `/etc/*` (`/etc/rc.local`, `/etc/crontab`) & `/root/*` on LittleFS ([`lib/c6os_core/src/c6os_vfs.cpp`](lib/c6os_core/src/c6os_vfs.cpp)). |
+| **6 LCD Render Modes & Overlays** | `dashboard` (OS & SSH status cards), `console` (live 52×18 `/dev/tty0` Linux framebuffer terminal), `signboard` (full-screen custom typography banner), `test` (SMPTE color bars & hardware diagnostics), `monitor` (graphical on-LCD `htop` with CPU sparkline, SRAM bar, °C temp & process table), and `image` (`fbi` artwork viewer), plus a scrolling bottom marquee ticker and flashing alert banner ([`src/screen_manager.cpp`](src/screen_manager.cpp)). |
+| **Network Daemons & Hardware Daemon** | `sshd` (`TCP :22`), `httpd` REST/Webhook API (`TCP :80` — `GET /api/status`, `GET /api/cmd?q=...`), `syslogd` listener (`UDP :514`), `ntpd` clock sync, and `buttond` (`GPIO 9` BOOT button short-press mode/alert ack, long-press backlight toggle) ([`src/main.cpp`](src/main.cpp)). |
 
 ---
 
@@ -58,28 +59,54 @@ python3 scripts/c6os_ctl.py exec "uname -a && cat /proc/meminfo"
 
 ---
 
-## Controlling the Screen via `/sys` and `/dev`
+## Controlling the Board & Screen via CLI, `/sys`, HTTP, and Syslog
 
-Inside `c6-sh`, you can control hardware using either the `screen` utility or standard Linux device/sysfs redirection:
+Inside `c6-sh`, you can control hardware using built-in utilities or standard Linux device/sysfs redirection:
 
 ```bash
-# Switch LCD rendering mode (dashboard | console | signboard | test)
+# Switch LCD rendering mode (dashboard | console | signboard | test | monitor | image)
+screen mode monitor
 echo signboard > /sys/class/graphics/fb0/mode
 
-# Change color theme (cyan | matrix | amber | red | mono)
-echo matrix > /sys/class/graphics/fb0/theme
+# Set scrolling bottom marquee ticker or flashing alert overlay
+screen ticker "C6-MicroLinux 6.12 | Live Telemetry"
+screen alert "HIGH CPU TEMP"
 
-# Adjust LCD PWM backlight (0 - 100%)
+# Display graphical artwork on the 320x172 LCD or grab an ASCII/PPM screenshot
+fbi tux "Linux on ESP32-C6"
+fbgrab --ascii
+
+# Hardware sensors, board pinout diagram, and GPIO/PWM control
+sensors
+pinout
+gpio status
+gpio pwm 22 128
+
+# Schedule periodic cron jobs or watch a command live
+crontab -a 30 logger "Cron heartbeat"
+watch -n 2 sensors
+
+# Edit startup scripts (/etc/rc.local) and run shell scripts
+edit /etc/rc.local
+sh /etc/rc.local
+
+# Control the onboard WS2812 RGB LED and LCD PWM backlight
 echo 80 > /sys/class/backlight/st7789/brightness
-
-# Write lines directly to the LCD framebuffer terminal (/dev/tty0)
-echo " console > /sys/class/graphics/fb0/mode"
-echo "[OK] Deploying C6-MicroLinux..." > /dev/tty0
-echo "Kernel: $(uname -r)" >> /dev/tty0
-
-# Control the onboard WS2812 RGB LED
 echo "0 255 128" > /sys/class/leds/ws2812/rgb
 echo rainbow > /sys/class/leds/ws2812/mode
+```
+
+### Remote HTTP Webhook API (`:80`) & UDP Syslog (`:514`)
+
+```bash
+# Query full JSON system telemetry over HTTP
+curl -s http://<BOARD_IP>/api/status
+
+# Execute any c6-sh command remotely over HTTP
+curl -s "http://<BOARD_IP>/api/cmd?q=sensors"
+
+# Stream a syslog message to the ESP32-C6 (logged to dmesg and /dev/tty0)
+echo "<14>Server deploy complete" > /dev/udp/<BOARD_IP>/514
 ```
 
 ---
