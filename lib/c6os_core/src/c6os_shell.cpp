@@ -20,6 +20,17 @@ void appendFmt(char* buf, size_t max_len, const char* fmt, ...) {
     va_end(args);
 }
 
+void appendWithCrLf(char* buf, size_t max_len, const char* text) {
+    if (!buf || max_len == 0 || !text) return;
+    for (size_t i = 0; text[i] != '\0'; ++i) {
+        if (text[i] == '\n' && (i == 0 || text[i - 1] != '\r')) {
+            appendFmt(buf, max_len, "\r\n");
+        } else {
+            appendFmt(buf, max_len, "%c", text[i]);
+        }
+    }
+}
+
 void trimSpaces(char* str) {
     if (!str) return;
     char* start = str;
@@ -70,12 +81,16 @@ size_t tokenizeArgs(char* input, char* argv[], size_t max_args) {
 }  // namespace
 
 ShellSession::ShellSession()
-    : mode_(SessionMode::MENU_MAIN), line_len_(0) {
+    : mode_(SessionMode::MENU_MAIN),
+      prev_mode_(SessionMode::SHELL_CLI),
+      sort_mode_(MonitorSort::CPU),
+      tree_view_(false),
+      line_len_(0) {
     strncpy(cwd_, "/root", sizeof(cwd_) - 1);
     cwd_[sizeof(cwd_) - 1] = '\0';
     memset(line_buf_, 0, sizeof(line_buf_));
     memset(pending_ssid_, 0, sizeof(pending_ssid_));
-    strncpy(menu_notice_, "Ready. Press [1-9] to control screen, [s] for Linux shell.", sizeof(menu_notice_) - 1);
+    strncpy(menu_notice_, "Ready. Press [1-9] for screen, [t] for htop, [s] for shell.", sizeof(menu_notice_) - 1);
 }
 
 void ShellSession::begin(SystemState& state, VirtualFs& vfs, bool start_in_menu,
@@ -136,10 +151,11 @@ void ShellSession::renderMenu(const SystemState& state, char* out_buf, size_t ma
               "\033[1;36m|\033[0m  \033[1;33m[7]\033[0m Live LCD Terminal Mirror (Type lines directly onto /dev/tty0) \033[1;36m|\033[0m\r\n"
               "\033[1;36m|\033[0m  \033[1;33m[8]\033[0m Configure Wi-Fi Network (Scan & Join 2.4 GHz SSID)            \033[1;36m|\033[0m\r\n"
               "\033[1;36m|\033[0m  \033[1;33m[9]\033[0m Kernel & Hardware Diagnostics (/proc/cpuinfo, meminfo, dmesg) \033[1;36m|\033[0m\r\n"
+              "\033[1;36m|\033[0m  \033[1;33m[t]\033[0m Launch \033[1;32mhtop\033[0m Live Task & Resource Monitor                      \033[1;36m|\033[0m\r\n"
               "\033[1;36m|\033[0m  \033[1;32m[s]\033[0m Drop to Linux Shell (c6-sh)            \033[1;31m[q]\033[0m Disconnect Session \033[1;36m|\033[0m\r\n"
               "\033[1;36m+--------------------------------------------------------------------+\033[0m\r\n"
               "  \033[1;32mStatus:\033[0m %s\r\n"
-              "  \033[1;36mSelect option [1-9, +/-, s, q]:\033[0m ",
+              "  \033[1;36mSelect option [1-9, +/-, t, s, q]:\033[0m ",
               state.hostname, net_tag, ip_str,
               static_cast<unsigned>(state.free_sram_bytes / 1024U),
               static_cast<unsigned>(state.total_sram_bytes / 1024U),
@@ -154,6 +170,244 @@ void ShellSession::renderMenu(const SystemState& state, char* out_buf, size_t ma
               static_cast<unsigned>(state.led_b),
               state.headline, state.subtitle,
               menu_notice_);
+}
+
+namespace {
+
+struct TaskEntry {
+    unsigned pid;
+    const char* user;
+    int pri;
+    int ni;
+    unsigned virt_kb;
+    unsigned res_kb;
+    unsigned shr_kb;
+    char state_ch;
+    unsigned cpu_tenths;
+    unsigned time_cs;
+    const char* cmd;
+    const char* tree_cmd;
+};
+
+void buildBar(char* out, size_t width, unsigned pct, char fill_ch = '|') {
+    if (pct > 100) pct = 100;
+    size_t filled = (pct * width + 50) / 100;
+    if (filled > width) filled = width;
+    for (size_t i = 0; i < width; ++i) {
+        out[i] = (i < filled) ? fill_ch : ' ';
+    }
+    out[width] = '\0';
+}
+
+}  // namespace
+
+void ShellSession::renderTop(const SystemState& state, bool is_htop, bool clear_screen,
+                             char* out_buf, size_t max_len) const {
+    unsigned up = static_cast<unsigned>(state.uptime_sec);
+    unsigned days = up / 86400U;
+    unsigned hrs  = (up % 86400U) / 3600U;
+    unsigned mins = (up % 3600U) / 60U;
+    unsigned secs = up % 60U;
+
+    unsigned total_kb = static_cast<unsigned>(state.total_sram_bytes / 1024U);
+    if (total_kb == 0) total_kb = 320;
+    unsigned free_kb  = static_cast<unsigned>(state.free_sram_bytes / 1024U);
+    unsigned used_kb  = (total_kb > free_kb) ? (total_kb - free_kb) : 64U;
+    unsigned cache_kb = 16U;
+    unsigned mem_pct  = (used_kb * 100U) / total_kb;
+
+    unsigned wifi_cpu = state.wifi_sta_connected ? (22U + (up % 5U)) : 8U;
+    unsigned ssh_cpu  = (state.ssh_active_sessions > 0) ? (44U + ((up * 3U) % 9U)) : 4U;
+    unsigned lcd_cpu  = 32U + ((up * 2U) % 7U);
+    unsigned mon_cpu  = 12U + (up % 4U);
+
+    TaskEntry tasks[9] = {
+        {  1, "root", 20,  0,   4,   1,  1, 'S',  2, up * 2U + 4U,   "/sbin/init",                           "/sbin/init" },
+        {  2, "root", 20,  0,   0,   0,  0, 'S',  1, up * 1U + 2U,   "[kthreadd]",                           "├─ [kthreadd]" },
+        {  4, "root", -2,  0,   0,   0,  0, 'S',  5, up * 6U + 11U,  "[esp_timer]",                          "│  └─ [esp_timer]" },
+        {  8, "root", 15, -5,  18,  12,  4, 'S', lcd_cpu, up * 34U + 19U, "/sbin/lcdd --driver=st7789 --spi=80M", "├─ /sbin/lcdd --driver=st7789" },
+        { 12, "root", 20,  0,  32,  24,  8, 'S', wifi_cpu, up * 24U + 8U, "/sbin/wpa_supplicant -i wlan0",        "├─ /sbin/wpa_supplicant -i wlan0" },
+        { 15, "root", 20,  0,   4,   2,  1, 'S',  6, up * 7U + 3U,   "/sbin/ws2812d --gpio=8",               "├─ /sbin/ws2812d --gpio=8" },
+        { 18, "root", 20,  0,  40,  28, 10, 'S', ssh_cpu, up * 41U + 27U, "/usr/sbin/sshd -D -p 22",              "├─ /usr/sbin/sshd -D -p 22" },
+        { 24, "root", 20,  0,   8,   4,  2, 'S',  3, up * 4U + 5U,   "/bin/c6-sh",                           "│  └─ /bin/c6-sh" },
+        { 38, "root", 20,  0,   6,   3,  2, 'R', mon_cpu, 15U + (up % 90U), is_htop ? "/bin/htop" : "/bin/top", is_htop ? "│     └─ /bin/htop" : "│     └─ /bin/top" }
+    };
+
+    // Sort tasks if not in tree view
+    if (!tree_view_ || !is_htop) {
+        for (size_t i = 0; i < 9; ++i) {
+            for (size_t j = i + 1; j < 9; ++j) {
+                bool swap_needed = false;
+                if (sort_mode_ == MonitorSort::MEM) {
+                    swap_needed = (tasks[j].res_kb > tasks[i].res_kb);
+                } else if (sort_mode_ == MonitorSort::TIME) {
+                    swap_needed = (tasks[j].time_cs > tasks[i].time_cs);
+                } else {
+                    swap_needed = (tasks[j].cpu_tenths > tasks[i].cpu_tenths);
+                }
+                if (swap_needed) {
+                    TaskEntry tmp = tasks[i];
+                    tasks[i] = tasks[j];
+                    tasks[j] = tmp;
+                }
+            }
+        }
+    }
+
+    unsigned total_cpu_tenths = 0;
+    for (size_t i = 0; i < 9; ++i) {
+        total_cpu_tenths += tasks[i].cpu_tenths;
+    }
+    unsigned us_tenths = (total_cpu_tenths * 55U) / 100U;
+    unsigned sy_tenths = total_cpu_tenths - us_tenths;
+    unsigned id_tenths = (1000U > total_cpu_tenths + 12U) ? (1000U - total_cpu_tenths - 12U) : 0U;
+
+    appendFmt(out_buf, max_len, "%s", clear_screen ? "\033[2J\033[H" : "\033[H");
+
+    if (!is_htop) {
+        appendFmt(out_buf, max_len,
+                  "top - %02u:%02u:%02u up %u day%s, %02u:%02u,  %u user,  load average: 0.%02u, 0.09, 0.04\033[K\r\n"
+                  "Tasks: \033[1m  9\033[0m total, \033[1m  1\033[0m running, \033[1m  8\033[0m sleeping,   0 stopped,   0 zombie\033[K\r\n"
+                  "%%Cpu(s): \033[1m%2u.%u\033[0m us, \033[1m%2u.%u\033[0m sy,  0.0 ni, \033[1m%2u.%u\033[0m id,  0.0 wa,  0.4 hi,  0.8 si\033[K\r\n"
+                  "KiB Mem : \033[1m%6u.0\033[0m total, \033[1m%6u.0\033[0m free, \033[1m%6u.0\033[0m used, \033[1m%6u.0\033[0m buff/cache\033[K\r\n"
+                  "KiB Swap:      0.0 total,      0.0 free,      0.0 used. \033[1m%6u.0\033[0m avail Mem\033[K\r\n"
+                  "\033[K\r\n"
+                  "\033[7m  PID USER      PR  NI    VIRT    RES    SHR S  %%CPU  %%MEM     TIME+ COMMAND                  \033[0m\033[K\r\n",
+                  hrs, mins, secs, days, (days == 1 ? "" : "s"), hrs, mins,
+                  static_cast<unsigned>(state.ssh_active_sessions > 0 ? state.ssh_active_sessions : 1),
+                  10U + (total_cpu_tenths / 15U),
+                  us_tenths / 10U, us_tenths % 10U,
+                  sy_tenths / 10U, sy_tenths % 10U,
+                  id_tenths / 10U, id_tenths % 10U,
+                  total_kb, free_kb, used_kb, cache_kb, free_kb + cache_kb);
+
+        for (size_t i = 0; i < 9; ++i) {
+            const TaskEntry& t = tasks[i];
+            unsigned mem_t = (t.res_kb * 1000U) / total_kb;
+            unsigned t_min = t.time_cs / 6000U;
+            unsigned t_sec = (t.time_cs / 100U) % 60U;
+            unsigned t_hun = t.time_cs % 100U;
+            const char* row_style = (t.state_ch == 'R') ? "\033[1m" : "";
+            const char* row_end   = (t.state_ch == 'R') ? "\033[0m" : "";
+            appendFmt(out_buf, max_len,
+                      "%s%5u %-8s %3d %3d %6uK %5uK %5uK %c %3u.%u %3u.%u %3u:%02u.%02u %-24s%s\033[K\r\n",
+                      row_style, t.pid, t.user, t.pri, t.ni,
+                      t.virt_kb, t.res_kb, t.shr_kb, t.state_ch,
+                      t.cpu_tenths / 10U, t.cpu_tenths % 10U,
+                      mem_t / 10U, mem_t % 10U,
+                      t_min, t_sec, t_hun, t.cmd, row_end);
+        }
+
+        const char* sort_label = (sort_mode_ == MonitorSort::MEM) ? "%MEM" :
+                                 (sort_mode_ == MonitorSort::TIME ? "TIME+" : "%CPU");
+        appendFmt(out_buf, max_len,
+                  "\033[K\r\n"
+                  "\033[7m [q] Quit  [P] Sort:%%CPU  [M] Sort:%%MEM  [T] Sort:TIME+  [h] Switch to htop  (Sort: %-5s) \033[0m\033[K",
+                  sort_label);
+    } else {
+        char cpu_bar[21], mem_bar[21], fsh_bar[21];
+        buildBar(cpu_bar, 20, total_cpu_tenths / 10U + 4U, '|');
+        buildBar(mem_bar, 20, mem_pct, '|');
+        unsigned fsh_pct = (state.rootfs_total_kb > 0)
+                               ? ((state.rootfs_used_kb * 100U) / state.rootfs_total_kb)
+                               : 1U;
+        if (fsh_pct < 5U) fsh_pct = 5U;
+        buildBar(fsh_bar, 20, fsh_pct, '|');
+
+        appendFmt(out_buf, max_len,
+                  "  \033[1;36m0\033[0m  [\033[1;32m%s\033[0m \033[1;37m%2u.%u%%\033[0m]   \033[1;36mTasks:\033[0m \033[1;37m9\033[0m, 2 kthr; \033[1;32m1 running\033[0m\033[K\r\n"
+                  "  \033[1;36mMem\033[0m[\033[1;33m%s\033[0m \033[1;37m%3u/%3uK\033[0m] \033[1;36mLoad average:\033[0m \033[1;37m0.%02u 0.09 0.04\033[0m\033[K\r\n"
+                  "  \033[1;36mFsh\033[0m[\033[1;35m%s\033[0m \033[1;37m%3u/%4uK\033[0m] \033[1;36mUptime:\033[0m \033[1;37m%02u:%02u:%02u\033[0m (rv32imac @ %uMHz)\033[K\r\n"
+                  "  \033[1;36mNet\033[0m[\033[1;32m%-13s %4ddBm\033[0m \033[1;37mwlan0\033[0m]   \033[1;36mLCD:\033[0m \033[1;37m%s\033[0m (%s, BL:%u%%)\033[K\r\n"
+                  "\033[K\r\n"
+                  "\033[30;42m  PID USER      PRI  NI  VIRT   RES   SHR S  CPU%%  MEM%%   TIME+  Command                        \033[0m\033[K\r\n",
+                  cpu_bar, total_cpu_tenths / 10U, total_cpu_tenths % 10U,
+                  mem_bar, used_kb, total_kb,
+                  10U + (total_cpu_tenths / 15U),
+                  fsh_bar, static_cast<unsigned>(state.rootfs_used_kb), static_cast<unsigned>(state.rootfs_total_kb),
+                  hrs, mins, secs, static_cast<unsigned>(state.cpu_freq_mhz),
+                  state.wifi_sta_connected ? state.wifi_ip : state.wifi_ap_ip,
+                  static_cast<int>(state.wifi_rssi),
+                  screenModeName(state.screen_mode), themeName(state.theme),
+                  static_cast<unsigned>(state.backlight_pct));
+
+        for (size_t i = 0; i < 9; ++i) {
+            const TaskEntry& t = tasks[i];
+            unsigned mem_t = (t.res_kb * 1000U) / total_kb;
+            unsigned t_min = t.time_cs / 6000U;
+            unsigned t_sec = (t.time_cs / 100U) % 60U;
+            unsigned t_hun = t.time_cs % 100U;
+            const char* cmd_str = tree_view_ ? t.tree_cmd : t.cmd;
+            const char* state_col = (t.state_ch == 'R') ? "\033[1;32mR\033[0m" : "S";
+            appendFmt(out_buf, max_len,
+                      "%5u \033[1;32m%-8s\033[0m %4d %3d %4uK %4uK %4uK %s %3u.%u %3u.%u %2u:%02u.%02u \033[1;37m%-30s\033[0m\033[K\r\n",
+                      t.pid, t.user, t.pri, t.ni,
+                      t.virt_kb, t.res_kb, t.shr_kb, state_col,
+                      t.cpu_tenths / 10U, t.cpu_tenths % 10U,
+                      mem_t / 10U, mem_t % 10U,
+                      t_min, t_sec, t_hun, cmd_str);
+        }
+
+        appendFmt(out_buf, max_len,
+                  "\033[K\r\n"
+                  "\033[1;37mF1\033[30;46mTop(h)\033[0m \033[1;37mF5\033[30;46mTree(t)\033[0m \033[1;37mF6\033[30;46mSortCPU(P)\033[0m \033[1;37mF7\033[30;46mSortMEM(M)\033[0m \033[1;37mF9\033[30;46mMenu(m)\033[0m \033[1;37mF10\033[30;46mQuit(q)\033[0m\033[K");
+    }
+}
+
+void ShellSession::renderMonitorTick(const SystemState& state, char* out_buf, size_t max_len) const {
+    if (out_buf && max_len > 0) out_buf[0] = '\0';
+    if (mode_ == SessionMode::TOP_VIEW) {
+        renderTop(state, /*is_htop=*/false, /*clear_screen=*/false, out_buf, max_len);
+    } else if (mode_ == SessionMode::HTOP_VIEW) {
+        renderTop(state, /*is_htop=*/true, /*clear_screen=*/false, out_buf, max_len);
+    }
+}
+
+bool ShellSession::handleMonitorKey(SystemState& state, VirtualFs& vfs, char ch,
+                                    char* out_buf, size_t max_len) {
+    (void)vfs;
+    if (ch == 'q' || ch == 'Q' || ch == 0x03) {
+        mode_ = prev_mode_;
+        if (mode_ == SessionMode::MENU_MAIN) {
+            snprintf(menu_notice_, sizeof(menu_notice_), "Exited live monitor.");
+            renderMenu(state, out_buf, max_len);
+        } else {
+            mode_ = SessionMode::SHELL_CLI;
+            appendFmt(out_buf, max_len, "\r\n");
+            renderPrompt(state, out_buf, max_len);
+        }
+        return true;
+    }
+    if (ch == 'p' || ch == 'P') {
+        sort_mode_ = MonitorSort::CPU;
+        tree_view_ = false;
+    } else if (ch == 'M') {
+        sort_mode_ = MonitorSort::MEM;
+        tree_view_ = false;
+    } else if (ch == 'm') {
+        if (mode_ == SessionMode::HTOP_VIEW) {
+            mode_ = SessionMode::MENU_MAIN;
+            snprintf(menu_notice_, sizeof(menu_notice_), "Returned from htop to Screen Control Menu.");
+            renderMenu(state, out_buf, max_len);
+            return true;
+        }
+        sort_mode_ = MonitorSort::MEM;
+    } else if (ch == 'T') {
+        sort_mode_ = MonitorSort::TIME;
+        tree_view_ = false;
+    } else if (ch == 't') {
+        if (mode_ == SessionMode::HTOP_VIEW) {
+            tree_view_ = !tree_view_;
+        } else {
+            sort_mode_ = MonitorSort::TIME;
+        }
+    } else if (ch == 'h' || ch == 'H') {
+        mode_ = (mode_ == SessionMode::HTOP_VIEW) ? SessionMode::TOP_VIEW : SessionMode::HTOP_VIEW;
+        renderTop(state, mode_ == SessionMode::HTOP_VIEW, /*clear_screen=*/true, out_buf, max_len);
+        return true;
+    }
+    renderTop(state, mode_ == SessionMode::HTOP_VIEW, /*clear_screen=*/false, out_buf, max_len);
+    return true;
 }
 
 bool ShellSession::handleMenuKey(SystemState& state, VirtualFs& vfs, char ch,
@@ -279,18 +533,32 @@ bool ShellSession::handleMenuKey(SystemState& state, VirtualFs& vfs, char ch,
             char buf[512];
             appendFmt(out_buf, max_len, "\r\n\033[1;36m=== /proc/version ===\033[0m\r\n");
             if (vfs.readFile(state, "/proc/version", buf, sizeof(buf))) {
-                appendFmt(out_buf, max_len, "%s", buf);
+                appendWithCrLf(out_buf, max_len, buf);
             }
             appendFmt(out_buf, max_len, "\033[1;36m=== /proc/cpuinfo ===\033[0m\r\n");
             if (vfs.readFile(state, "/proc/cpuinfo", buf, sizeof(buf))) {
-                appendFmt(out_buf, max_len, "%s", buf);
+                appendWithCrLf(out_buf, max_len, buf);
             }
             appendFmt(out_buf, max_len, "\033[1;36m=== /proc/meminfo ===\033[0m\r\n");
             if (vfs.readFile(state, "/proc/meminfo", buf, sizeof(buf))) {
-                appendFmt(out_buf, max_len, "%s", buf);
+                appendWithCrLf(out_buf, max_len, buf);
             }
             appendFmt(out_buf, max_len,
                       "\r\n\033[1;33mPress Enter to return to menu...\033[0m");
+            return true;
+        }
+        case '\r':
+        case '\n':
+        case ' ': {
+            snprintf(menu_notice_, sizeof(menu_notice_), "Refreshed menu.");
+            renderMenu(state, out_buf, max_len);
+            return true;
+        }
+        case 't':
+        case 'T': {
+            prev_mode_ = SessionMode::MENU_MAIN;
+            mode_ = SessionMode::HTOP_VIEW;
+            renderTop(state, true, true, out_buf, max_len);
             return true;
         }
         case 's':
@@ -309,7 +577,7 @@ bool ShellSession::handleMenuKey(SystemState& state, VirtualFs& vfs, char ch,
         }
         default:
             snprintf(menu_notice_, sizeof(menu_notice_),
-                     "Unknown key '%c'. Choose [1-9], [+/-], [s] for shell, or [q] to quit.",
+                     "Unknown key '%c'. Choose [1-9], [+/-], [t] htop, [s] shell, or [q] quit.",
                      isprint(static_cast<unsigned char>(ch)) ? ch : '?');
             renderMenu(state, out_buf, max_len);
             return true;
@@ -327,6 +595,30 @@ bool ShellSession::consumeBytes(SystemState& state, VirtualFs& vfs,
 
         // Ignore bare LF if preceded by CR
         if (ch == '\n' && i > 0 && data[i - 1] == '\r') {
+            continue;
+        }
+
+        // In live top / htop view, single keystrokes control sorting/refresh/exit
+        if (isInteractiveMonitor()) {
+            // Skip ANSI escape sequences (e.g. arrow keys or F10 \033[21~)
+            if (ch == '\033') {
+                // F10 sequence \033[21~ quits htop
+                if (i + 4 < len && data[i + 1] == '[' && data[i + 2] == '2' &&
+                    data[i + 3] == '1' && data[i + 4] == '~') {
+                    i += 4;
+                    handleMonitorKey(state, vfs, 'q', out_buf, max_len);
+                    continue;
+                }
+                while (i + 1 < len && !isalpha(static_cast<unsigned char>(data[i + 1])) &&
+                       data[i + 1] != '~') {
+                    ++i;
+                }
+                if (i + 1 < len) ++i;
+                continue;
+            }
+            if (!handleMonitorKey(state, vfs, ch, out_buf, max_len)) {
+                return false;
+            }
             continue;
         }
 
@@ -525,7 +817,7 @@ void ShellSession::formatStatusJson(const SystemState& state, char* out_buf, siz
              "\"wifi_connected\":%s,\"wifi_ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,"
              "\"ap_ssid\":\"%s\",\"ap_ip\":\"%s\","
              "\"ssh_port\":%u,\"ssh_sessions\":%u,"
-             "\"free_sram\":%u,\"total_sram\":%u,\"uptime_s\":%u}\n",
+             "\"free_sram\":%u,\"total_sram\":%u,\"uptime_s\":%u}\r\n",
              state.hostname,
              screenModeName(state.screen_mode),
              themeName(state.theme),
@@ -675,6 +967,9 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
                   "  screen clear                 Clear /dev/tty0 LCD terminal\r\n"
                   "  screen led <mode> [r g b]    Set RGB LED: off | solid | pulse | rainbow | ssh\r\n"
                   "  wifi status|scan|connect     Manage 2.4 GHz Wi-Fi & SoftAP\r\n"
+                  "  top [-b -n 1]                Live Linux process & CPU/SRAM monitor\r\n"
+                  "  htop [-b -n 1]               Interactive color task manager & bar graphs\r\n"
+                  "  lscpu, vmstat, neofetch      CPU architecture, VM stats & system summary\r\n"
                   "  uname, uptime, free, df, ps, dmesg, ls, cd, pwd, cat, echo, rm, ip, passwd, reboot\r\n");
     } else if (strcmp(prog, "uname") == 0) {
         bool all = false, rel = false, mach = false, node = false;
@@ -726,7 +1021,7 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         VirtualFs::normalizePath(cwd_, target, norm, sizeof(norm));
         char listing[384];
         if (vfs.listDirectory(norm, listing, sizeof(listing))) {
-            appendFmt(target_buf, target_max, "%s", listing);
+            appendWithCrLf(target_buf, target_max, listing);
         } else {
             appendFmt(target_buf, target_max, "ls: cannot access '%s': No such file or directory\r\n", target);
         }
@@ -738,14 +1033,7 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
             VirtualFs::normalizePath(cwd_, argv[1], norm, sizeof(norm));
             char content[640];
             if (vfs.readFile(state, norm, content, sizeof(content))) {
-                // Convert bare \n to \r\n for clean terminal display
-                for (size_t i = 0; content[i] != '\0'; ++i) {
-                    if (content[i] == '\n' && (i == 0 || content[i - 1] != '\r')) {
-                        appendFmt(target_buf, target_max, "\r\n");
-                    } else {
-                        appendFmt(target_buf, target_max, "%c", content[i]);
-                    }
-                }
+                appendWithCrLf(target_buf, target_max, content);
             } else {
                 appendFmt(target_buf, target_max, "cat: %s: No such file or directory\r\n", argv[1]);
             }
@@ -764,7 +1052,7 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         for (size_t i = 1; i < argc; ++i) {
             appendFmt(target_buf, target_max, "%s%s", argv[i], (i + 1 < argc) ? " " : "");
         }
-        appendFmt(target_buf, target_max, "\n");
+        appendFmt(target_buf, target_max, redir_path ? "\n" : "\r\n");
     } else if (strcmp(prog, "uptime") == 0) {
         unsigned up = static_cast<unsigned>(state.uptime_sec);
         unsigned days = up / 86400U;
@@ -813,6 +1101,73 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
                   "   24 root      6144 S    /bin/c6-sh (/dev/ttyACM0)\r\n"
                   "   31 root      6144 R    /bin/c6-sh (/dev/pts/0)\r\n",
                   state.ssh_port, state.ssh_active_sessions);
+    } else if (strcmp(prog, "top") == 0 || strcmp(prog, "/bin/top") == 0 ||
+               strcmp(prog, "htop") == 0 || strcmp(prog, "/bin/htop") == 0) {
+        bool is_htop = (strcmp(prog, "htop") == 0 || strcmp(prog, "/bin/htop") == 0);
+        bool batch = (redir_path != nullptr) || (mode_ != SessionMode::SHELL_CLI);
+        for (size_t i = 1; i < argc; ++i) {
+            if (strcmp(argv[i], "-b") == 0 || strncmp(argv[i], "-n", 2) == 0 ||
+                strcmp(argv[i], "--batch") == 0 || strcmp(argv[i], "-1") == 0) {
+                batch = true;
+            }
+        }
+        if (batch) {
+            renderTop(state, is_htop, false, target_buf, target_max);
+            appendFmt(target_buf, target_max, "\r\n");
+        } else {
+            prev_mode_ = mode_;
+            mode_ = is_htop ? SessionMode::HTOP_VIEW : SessionMode::TOP_VIEW;
+            renderTop(state, is_htop, true, target_buf, target_max);
+        }
+    } else if (strcmp(prog, "lscpu") == 0 || strcmp(prog, "/bin/lscpu") == 0) {
+        appendFmt(target_buf, target_max,
+                  "Architecture:          riscv32\r\n"
+                  "  CPU op-mode(s):      32-bit\r\n"
+                  "  Byte Order:          Little Endian\r\n"
+                  "CPU(s):                1\r\n"
+                  "  On-line CPU(s) list: 0\r\n"
+                  "Vendor ID:             Espressif\r\n"
+                  "  Model name:          ESP32-C6FH4 High-Performance RV32IMAC\r\n"
+                  "  CPU max MHz:         %u.0000\r\n"
+                  "  ISA extensions:      rv32imac_zicsr_zifencei\r\n"
+                  "  L1 I-Cache:          32 KiB\r\n"
+                  "  LP Co-Processor:     RV32IMAC @ 20 MHz (LP-SRAM 16 KiB)\r\n",
+                  static_cast<unsigned>(state.cpu_freq_mhz));
+    } else if (strcmp(prog, "vmstat") == 0 || strcmp(prog, "/bin/vmstat") == 0) {
+        unsigned total_kb = static_cast<unsigned>(state.total_sram_bytes / 1024U);
+        unsigned free_kb  = static_cast<unsigned>(state.free_sram_bytes / 1024U);
+        unsigned used_kb  = (total_kb > free_kb) ? (total_kb - free_kb) : 0U;
+        appendFmt(target_buf, target_max,
+                  "procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----\r\n"
+                  " r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st\r\n"
+                  " %u  0      0 %6u     16     24    0    0     4     2  240  185  5  3 92  0  0\r\n",
+                  1U + static_cast<unsigned>(state.ssh_active_sessions),
+                  free_kb);
+        (void)used_kb;
+    } else if (strcmp(prog, "neofetch") == 0 || strcmp(prog, "/bin/neofetch") == 0) {
+        unsigned up = static_cast<unsigned>(state.uptime_sec);
+        unsigned mins = (up % 3600U) / 60U;
+        unsigned secs = up % 60U;
+        unsigned total_kb = static_cast<unsigned>(state.total_sram_bytes / 1024U);
+        unsigned free_kb  = static_cast<unsigned>(state.free_sram_bytes / 1024U);
+        unsigned used_kb  = (total_kb > free_kb) ? (total_kb - free_kb) : 0U;
+        appendFmt(target_buf, target_max,
+                  "\033[1;36m       .---.        \033[1;32mroot\033[0m@\033[1;32m%s\033[0m\r\n"
+                  "\033[1;36m      /     \\       \033[0m-----------------\r\n"
+                  "\033[1;36m     | (\033[1;33mC6\033[1;36m)  |      \033[1;36mOS\033[0m: C6-MicroLinux (c6os) riscv32\r\n"
+                  "\033[1;36m      \\     /       \033[1;36mHost\033[0m: Waveshare ESP32-C6-LCD-1.47\r\n"
+                  "\033[1;36m       '---'        \033[1;36mKernel\033[0m: 6.12.0-c6os-riscv32\r\n"
+                  "\033[1;32m    RISC-V 32-bit   \033[1;36mUptime\033[0m: %um %us\r\n"
+                  "                    \033[1;36mDisplay\033[0m: 172x320 ST7789 (%s, BL %u%%)\r\n"
+                  "                    \033[1;36mCPU\033[0m: ESP32-C6FH4 (1) @ %uMHz\r\n"
+                  "                    \033[1;36mMemory\033[0m: %uKiB / %uKiB (%s)\r\n",
+                  state.hostname,
+                  mins, secs,
+                  screenModeName(state.screen_mode),
+                  static_cast<unsigned>(state.backlight_pct),
+                  static_cast<unsigned>(state.cpu_freq_mhz),
+                  used_kb, total_kb,
+                  state.wifi_ip);
     } else if (strcmp(prog, "dmesg") == 0) {
         for (size_t i = 0; i < state.dmesg_count; ++i) {
             appendFmt(target_buf, target_max, "%s\r\n", state.dmesg[i]);

@@ -161,7 +161,7 @@ bool VirtualFs::listDirectory(const char* abs_path, char* out_buf, size_t max_le
         return true;
     }
     if (strcmp(abs_path, "/bin") == 0) {
-        snprintf(out_buf, max_len, "c6-menu*  c6-sh*  cat*  df*  dmesg*  echo*  free*  ip*  ls*  passwd*  ps*  reboot*  screen*  uname*  uptime*  wifi*\n");
+        snprintf(out_buf, max_len, "c6-menu*  c6-sh*  cat*  df*  dmesg*  echo*  free*  htop*  ip*  ls*  lscpu*  neofetch*  passwd*  ps*  reboot*  screen*  top*  uname*  uptime*  vmstat*  wifi*\n");
         return true;
     }
     if (strcmp(abs_path, "/proc") == 0) {

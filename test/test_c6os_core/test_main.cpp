@@ -128,6 +128,27 @@ void test_interactive_menu_and_shell_commands(void) {
     TEST_ASSERT_NOT_NULL(strstr(out, "6.12.0-c6os-riscv32"));
     TEST_ASSERT_EQUAL_UINT8(45, state.backlight_pct);
     TEST_ASSERT_TRUE(state.landscape_flipped);
+
+    // Test batch top / htop and interactive htop mode transitions
+    char big_out[4096];
+    big_out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "top -b -n 1", big_out, sizeof(big_out)));
+    TEST_ASSERT_NOT_NULL(strstr(big_out, "Tasks:"));
+    TEST_ASSERT_NOT_NULL(strstr(big_out, "/usr/sbin/sshd"));
+
+    // Launch interactive htop from SHELL_CLI
+    big_out[0] = '\0';
+    TEST_ASSERT_TRUE(session.consumeBytes(state, vfs, "htop\n", 5, big_out, sizeof(big_out)));
+    TEST_ASSERT_EQUAL(SessionMode::HTOP_VIEW, session.mode());
+    TEST_ASSERT_TRUE(session.isInteractiveMonitor());
+    TEST_ASSERT_NOT_NULL(strstr(big_out, "F10"));
+
+    // Press 'M' in htop to sort by MEM%, then 'q' to return to SHELL_CLI
+    TEST_ASSERT_TRUE(session.consumeBytes(state, vfs, "M", 1, big_out, sizeof(big_out)));
+    TEST_ASSERT_EQUAL(SessionMode::HTOP_VIEW, session.mode());
+    TEST_ASSERT_TRUE(session.consumeBytes(state, vfs, "q", 1, big_out, sizeof(big_out)));
+    TEST_ASSERT_EQUAL(SessionMode::SHELL_CLI, session.mode());
+    TEST_ASSERT_FALSE(session.isInteractiveMonitor());
 }
 
 int main(int argc, char** argv) {

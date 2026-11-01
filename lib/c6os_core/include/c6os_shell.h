@@ -18,7 +18,15 @@ enum class SessionMode : uint8_t {
     MENU_PROMPT_RGB = 5,   // Prompting for LED mode / RGB values
     MENU_TTY0_MIRROR = 6,  // Live typing directly onto the physical LCD console (/dev/tty0)
     MENU_WIFI_SSID = 7,    // Prompting for Wi-Fi SSID
-    MENU_WIFI_PASS = 8     // Prompting for Wi-Fi Password
+    MENU_WIFI_PASS = 8,    // Prompting for Wi-Fi Password
+    TOP_VIEW = 9,          // Interactive live-refreshing 'top' process monitor
+    HTOP_VIEW = 10         // Interactive live-refreshing 'htop' color TUI monitor
+};
+
+enum class MonitorSort : uint8_t {
+    CPU = 0,
+    MEM = 1,
+    TIME = 2
 };
 
 class ShellSession {
@@ -42,8 +50,14 @@ public:
 
     void renderMenu(const SystemState& state, char* out_buf, size_t max_len) const;
     void renderPrompt(const SystemState& state, char* out_buf, size_t max_len) const;
+    void renderTop(const SystemState& state, bool is_htop, bool clear_screen,
+                   char* out_buf, size_t max_len) const;
+    void renderMonitorTick(const SystemState& state, char* out_buf, size_t max_len) const;
 
     SessionMode mode() const { return mode_; }
+    bool isInteractiveMonitor() const {
+        return mode_ == SessionMode::TOP_VIEW || mode_ == SessionMode::HTOP_VIEW;
+    }
     const char* cwd() const { return cwd_; }
 
     // Format screen & system status as JSON (used by 'screen status' and host tooling)
@@ -57,11 +71,17 @@ private:
     bool handleMenuKey(SystemState& state, VirtualFs& vfs, char ch,
                        char* out_buf, size_t max_len);
 
+    bool handleMonitorKey(SystemState& state, VirtualFs& vfs, char ch,
+                          char* out_buf, size_t max_len);
+
     bool handleLineComplete(SystemState& state, VirtualFs& vfs,
                             const char* line,
                             char* out_buf, size_t max_len);
 
     SessionMode mode_;
+    SessionMode prev_mode_;
+    MonitorSort sort_mode_;
+    bool tree_view_;
     char cwd_[64];
     char line_buf_[192];
     size_t line_len_;

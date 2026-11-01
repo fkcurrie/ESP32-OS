@@ -24,8 +24,10 @@ public:
     // Initializes or loads persistent ssh-ed25519 host key from NVS and starts listening on port 22
     void begin(SystemState& state, SemaphoreHandle_t mutex);
 
-    // Blocking per-client session handler called from the sshd FreeRTOS task loop
+    // Non-blocking accept dispatcher called from the sshd FreeRTOS task loop
     void pollAcceptAndServe(SystemState& state, VirtualFs& vfs, SemaphoreHandle_t mutex);
+
+    void serveAcceptedClient(WiFiClient client, SystemState& state, VirtualFs& vfs, SemaphoreHandle_t mutex);
 
 private:
     void handleClient(WiFiClient& client, SystemState& state, VirtualFs& vfs, SemaphoreHandle_t mutex);

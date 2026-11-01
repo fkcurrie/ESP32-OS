@@ -249,7 +249,7 @@ void sshdTask(void* param) {
 void serialConsoleTask(void* param) {
     (void)param;
     c6os::ShellSession serial_shell;
-    char* out_buf = static_cast<char*>(malloc(3072));
+    char* out_buf = static_cast<char*>(malloc(4096));
     if (!out_buf) {
         vTaskDelete(nullptr);
         return;
@@ -257,10 +257,11 @@ void serialConsoleTask(void* param) {
 
     vTaskDelay(pdMS_TO_TICKS(500));
     if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-        serial_shell.begin(g_state, g_vfs, /*start_in_menu=*/false, out_buf, 3072);
+        serial_shell.begin(g_state, g_vfs, /*start_in_menu=*/false, out_buf, 4096);
         xSemaphoreGive(g_mutex);
     }
     Serial.print(out_buf);
+    uint32_t last_mon_tick = millis();
 
     while (true) {
         int avail = Serial.available();
@@ -271,14 +272,28 @@ void serialConsoleTask(void* param) {
                                  : sizeof(rx);
             size_t got = Serial.readBytes(rx, to_read);
             if (got > 0) {
+                last_mon_tick = millis();
                 out_buf[0] = '\0';
                 bool keep = true;
                 if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-                    keep = serial_shell.consumeBytes(g_state, g_vfs, rx, got, out_buf, 3072);
+                    keep = serial_shell.consumeBytes(g_state, g_vfs, rx, got, out_buf, 4096);
                     if (!keep) {
                         // On serial console, exiting restarts the shell prompt
-                        serial_shell.begin(g_state, g_vfs, /*start_in_menu=*/false, out_buf, 3072);
+                        serial_shell.begin(g_state, g_vfs, /*start_in_menu=*/false, out_buf, 4096);
                     }
+                    xSemaphoreGive(g_mutex);
+                }
+                if (out_buf[0] != '\0') {
+                    Serial.print(out_buf);
+                }
+            }
+        } else if (serial_shell.isInteractiveMonitor()) {
+            uint32_t now = millis();
+            if (now - last_mon_tick >= 1500) {
+                last_mon_tick = now;
+                out_buf[0] = '\0';
+                if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    serial_shell.renderMonitorTick(g_state, out_buf, 4096);
                     xSemaphoreGive(g_mutex);
                 }
                 if (out_buf[0] != '\0') {

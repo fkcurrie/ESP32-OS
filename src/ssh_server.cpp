@@ -152,7 +152,7 @@ struct SshWorkspace {
     uint8_t rx_pkt_buf[3584];
     uint8_t client_kexinit[2560];
     uint8_t rx_buf[2560];
-    char io_buf[3072];
+    char io_buf[4096];
 };
 
 bool sendSshPacket(WiFiClient& client, SshTransportState& ts, SshWorkspace& ws,
@@ -337,12 +337,54 @@ void SshServer::begin(SystemState& state, SemaphoreHandle_t mutex) {
     server_.begin();
 }
 
+struct SshClientTaskCtx {
+    SshServer* server;
+    WiFiClient client;
+    SystemState* state;
+    VirtualFs* vfs;
+    SemaphoreHandle_t mutex;
+};
+
+void sshClientWorkerTask(void* param) {
+    SshClientTaskCtx* ctx = static_cast<SshClientTaskCtx*>(param);
+    if (ctx) {
+        ctx->server->serveAcceptedClient(ctx->client, *ctx->state, *ctx->vfs, ctx->mutex);
+        delete ctx;
+    }
+    vTaskDelete(nullptr);
+}
+
 void SshServer::pollAcceptAndServe(SystemState& state, VirtualFs& vfs, SemaphoreHandle_t mutex) {
     WiFiClient client = server_.accept();
     if (!client) {
         return;
     }
 
+    uint8_t active = 0;
+    if (xSemaphoreTake(mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        active = state.ssh_active_sessions;
+        xSemaphoreGive(mutex);
+    }
+
+    // Allow up to 3 concurrent SSH sessions
+    if (active >= 3 || ESP.getFreeHeap() < 45000) {
+        client.stop();
+        return;
+    }
+
+    SshClientTaskCtx* ctx = new SshClientTaskCtx{this, client, &state, &vfs, mutex};
+    if (!ctx) {
+        client.stop();
+        return;
+    }
+
+    if (xTaskCreate(sshClientWorkerTask, "sshd_priv", 10240, ctx, 2, nullptr) != pdPASS) {
+        client.stop();
+        delete ctx;
+    }
+}
+
+void SshServer::serveAcceptedClient(WiFiClient client, SystemState& state, VirtualFs& vfs, SemaphoreHandle_t mutex) {
     client.setNoDelay(true);
     String remote_ip = client.remoteIP().toString();
 
@@ -535,11 +577,41 @@ void SshServer::handleClient(WiFiClient& client, SystemState& state,
     uint32_t client_chan = 0;
     ShellSession shell;
     char* io_buf = ws.io_buf;
+    uint32_t last_mon_tick = millis();
 
     while (client.connected()) {
+        // Wait for incoming SSH bytes while servicing live top/htop periodic refresh
+        uint32_t wait_start = millis();
+        while (client.connected() && client.available() == 0) {
+            if (channel_open && shell.isInteractiveMonitor()) {
+                uint32_t now = millis();
+                if (now - last_mon_tick >= 1500) {
+                    last_mon_tick = now;
+                    io_buf[0] = '\0';
+                    if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                        state.uptime_sec = millis() / 1000;
+                        state.free_sram_bytes = ESP.getFreeHeap();
+                        shell.renderMonitorTick(state, io_buf, sizeof(ws.io_buf));
+                        xSemaphoreGive(mutex);
+                    }
+                    if (io_buf[0] != '\0') {
+                        sendChannelDataChunked(client, ts, ws, client_chan, io_buf, strlen(io_buf));
+                    }
+                }
+            }
+            if (millis() - wait_start >= 300000) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (!client.connected() && client.available() == 0) {
+            break;
+        }
+
         if (!recvSshPacket(client, ts, ws, ws.rx_buf, sizeof(ws.rx_buf), rx_len, 300000)) {
             break;
         }
+        last_mon_tick = millis();
         if (rx_len == 0) continue;
 
         if (xSemaphoreTake(mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
