@@ -2,66 +2,63 @@
 #define ST7789_LCD_H
 
 #include <Arduino.h>
-#include <SPI.h>
+#include <driver/spi_master.h>
+#include <esp_heap_caps.h>
+#include <esp_lcd_panel_io.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <stdint.h>
 
 #include "board_pins.h"
+#include "c6os_display.h"
 
 namespace lcd {
 
-// RGB565 High-Contrast Palette (Pure Black Background + Bright White Foreground)
-constexpr uint16_t COLOR_BLACK     = 0x0000;
-constexpr uint16_t COLOR_BG        = 0x0000;  // Pure black (#000000)
-constexpr uint16_t COLOR_CARD      = 0x0000;  // Pure black (#000000) for maximum contrast
-constexpr uint16_t COLOR_NAVY      = 0x0000;  // Pure black (#000000)
-constexpr uint16_t COLOR_WHITE     = 0xFFFF;  // Pure bright white (#FFFFFF)
-constexpr uint16_t COLOR_BORDER    = 0xFFFF;  // Crisp white card border
-constexpr uint16_t COLOR_MUTED     = 0xC618;  // Clean silver gray (#C0C0C0)
-constexpr uint16_t COLOR_CYAN      = 0x07FF;  // Vibrant cyan (#00FFFF)
-constexpr uint16_t COLOR_GREEN     = 0x07E0;  // Vibrant green (#00FF00)
-constexpr uint16_t COLOR_AMBER     = 0xFFE0;  // Pure bright yellow (#FFFF00) for maximum contrast
-constexpr uint16_t COLOR_RED       = 0xF800;  // Pure bright red (#FF0000) for maximum contrast
-constexpr uint16_t COLOR_PURPLE    = 0xF81F;  // Pure bright magenta (#FF00FF)
-
-// Weather Icon Vibrant RGB565 Palette
-constexpr uint16_t ICON_SUN_YELLOW = 0xFFE0;  // Bright sun yellow (#FFFF00)
-constexpr uint16_t ICON_SUN_CORE   = 0xFD20;  // Warm solar orange (#FFA500)
-constexpr uint16_t ICON_CLOUD_TOP  = 0xFFFF;  // Bright white cloud (#FFFFFF)
-constexpr uint16_t ICON_CLOUD_MID  = 0xC618;  // Silver cloud (#C0C0C0)
-constexpr uint16_t ICON_CLOUD_DARK = 0x7BEF;  // Storm slate cloud (#787C78)
-constexpr uint16_t ICON_RAIN_BLUE  = 0x05FF;  // Vibrant rain blue (#00BFFF)
-constexpr uint16_t ICON_BOLT_GOLD  = 0xFFE0;  // Electric lightning yellow (#FFFF00)
-constexpr uint16_t ICON_SNOW_ICE   = 0xAFFF;  // Icy crystal cyan (#A8FFFF)
-
-constexpr uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
-    return ((static_cast<uint16_t>(r & 0xF8) << 8) |
-            (static_cast<uint16_t>(g & 0xFC) << 3) |
-            (static_cast<uint16_t>(b) >> 3));
-}
-
 class St7789Lcd {
 public:
+    St7789Lcd();
+    ~St7789Lcd();
+
+    St7789Lcd(const St7789Lcd&) = delete;
+    St7789Lcd& operator=(const St7789Lcd&) = delete;
+
+    // Initializes SPI2_HOST bus, esp_lcd_panel_io_spi @ 80 MHz, ST7789 registers,
+    // LEDC backlight PWM, and 2 x (320 x 16 x 2B) = 20,480 B dual scanline DMA buffers.
     void begin();
+
     void setBacklight(uint8_t pct);
     void setLandscapeFlip(bool flipped);
 
-    void fillScreen(uint16_t color);
-    void fillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color);
-    void drawRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color);
-    void fillCircle(int16_t cx, int16_t cy, int16_t r, uint16_t color);
-    void drawThickLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t r, uint16_t color);
-    void drawCard(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t bg_color, uint16_t border_color);
-    void drawProgressBar(int16_t x, int16_t y, int16_t w, int16_t h, uint8_t pct, uint16_t fill_color, uint16_t track_color);
+    // Opens a contiguous vertical scanline window [y0 .. y1] across full width (0..319).
+    void beginVerticalWindow(uint16_t y0, uint16_t y1);
 
-    void drawChar(int16_t x, int16_t y, char c, uint16_t fg, uint16_t bg, uint8_t scale = 1);
-    void drawString(int16_t x, int16_t y, const char* str, uint16_t fg, uint16_t bg, uint8_t scale = 1, uint8_t max_chars = 0);
-    void drawCharScaled(int16_t x, int16_t y, char c, uint16_t fg, uint16_t bg, uint8_t scale_x, uint8_t scale_y);
-    void drawStringScaled(int16_t x, int16_t y, const char* str, uint16_t fg, uint16_t bg, uint8_t scale_x, uint8_t scale_y, uint8_t max_chars = 0);
+    // Acquires the next available DMA scanline buffer (0 or 1), blocking if still in-flight.
+    uint16_t* acquireStripBuffer(uint8_t& out_slot);
+
+    // Enqueues a rendered scanline strip for asynchronous 80 MHz SPI2 DMA transmission.
+    // Pass first_in_window=true on the first strip after beginVerticalWindow() (sends 0x2C RAMWR),
+    // and first_in_window=false on contiguous follow-up strips (continues RAMWR with cmd=-1).
+    void submitStripBuffer(uint8_t slot, size_t byte_len, bool first_in_window);
+
+    // Waits until all queued DMA color transfers have completed.
+    void waitIdle();
+
+    static bool onColorTransDoneStatic(esp_lcd_panel_io_handle_t panel_io,
+                                       esp_lcd_panel_io_event_data_t* edata,
+                                       void* user_ctx);
 
 private:
-    void writeCommand(uint8_t cmd);
-    void writeData(uint8_t data);
-    void setAddrWindow(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2);
+    void writeCmdParam(int cmd, const void* param = nullptr, size_t param_size = 0);
+
+    esp_lcd_panel_io_handle_t io_;
+    uint16_t* dma_buf_[2];
+    SemaphoreHandle_t buf_sem_[2];
+    portMUX_TYPE fifo_mux_;
+    uint8_t in_flight_fifo_[4];
+    volatile uint8_t fifo_head_;
+    volatile uint8_t fifo_tail_;
+    uint8_t next_slot_;
+    bool bus_ready_;
 };
 
 }  // namespace lcd

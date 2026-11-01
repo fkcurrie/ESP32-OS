@@ -1,9 +1,14 @@
 #include "c6os_vfs.h"
+#include "ssh_auth.h"
 
 #include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace c6os {
 
@@ -17,64 +22,230 @@ void trimTrailingNewline(char* s) {
     }
 }
 
-}  // namespace
-
-VirtualFs::VirtualFs() {
-    memset(user_files_, 0, sizeof(user_files_));
+void removeTreeRecursive(const char* dir_path) {
+    if (!dir_path || dir_path[0] == '\0') return;
+    DIR* d = opendir(dir_path);
+    if (!d) return;
+    struct dirent* ent = nullptr;
+    while ((ent = readdir(d)) != nullptr) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        char child[512];
+        snprintf(child, sizeof(child), "%s/%s", dir_path, ent->d_name);
+        struct stat st;
+        if (stat(child, &st) == 0 && S_ISDIR(st.st_mode)) {
+            removeTreeRecursive(child);
+            rmdir(child);
+        } else {
+            unlink(child);
+        }
+    }
+    closedir(d);
+    rmdir(dir_path);
 }
 
-void VirtualFs::initDefaultFiles(const SystemState& state) {
-    memset(user_files_, 0, sizeof(user_files_));
+bool parseLoginShellFromPasswd(const char* content, char* out_shell, size_t cap) {
+    if (!content || !out_shell || cap == 0) return false;
+    const char* line_end = strchr(content, '\n');
+    size_t line_len = line_end ? static_cast<size_t>(line_end - content) : strlen(content);
+    char line[128];
+    if (line_len >= sizeof(line)) line_len = sizeof(line) - 1;
+    memcpy(line, content, line_len);
+    line[line_len] = '\0';
+    trimTrailingNewline(line);
 
-    auto setFile = [this](const char* path, const char* content) {
-        for (size_t i = 0; i < VFS_MAX_USER_FILES; ++i) {
-            if (!user_files_[i].in_use) {
-                user_files_[i].in_use = true;
-                strncpy(user_files_[i].path, path, VFS_MAX_PATH_LEN - 1);
-                strncpy(user_files_[i].content, content, VFS_MAX_FILE_SIZE - 1);
-                break;
-            }
+    const char* last_colon = strrchr(line, ':');
+    if (!last_colon || last_colon[1] != '/') return false;
+    strncpy(out_shell, last_colon + 1, cap - 1);
+    out_shell[cap - 1] = '\0';
+    return true;
+}
+
+}  // namespace
+
+VirtualFs::VirtualFs() : owns_temp_root_(false) {
+    memset(rootfs_prefix_, 0, sizeof(rootfs_prefix_));
+    memset(sd_prefix_, 0, sizeof(sd_prefix_));
+    memset(temp_base_, 0, sizeof(temp_base_));
+
+#ifdef ESP_PLATFORM
+    strncpy(rootfs_prefix_, "/littlefs", sizeof(rootfs_prefix_) - 1);
+    strncpy(sd_prefix_, "/sd", sizeof(sd_prefix_) - 1);
+#else
+    static unsigned int s_instance_id = 0;
+    ++s_instance_id;
+    snprintf(temp_base_, sizeof(temp_base_), "/tmp/c6os_vfs_%d_%u",
+             static_cast<int>(getpid()), s_instance_id);
+    snprintf(rootfs_prefix_, sizeof(rootfs_prefix_), "%.80s/rootfs", temp_base_);
+    snprintf(sd_prefix_, sizeof(sd_prefix_), "%.80s/sd", temp_base_);
+    mkdir(temp_base_, 0755);
+    mkdir(rootfs_prefix_, 0755);
+    mkdir(sd_prefix_, 0755);
+    owns_temp_root_ = true;
+#endif
+}
+
+VirtualFs::~VirtualFs() {
+#ifndef ESP_PLATFORM
+    if (owns_temp_root_ && temp_base_[0] != '\0') {
+        removeTreeRecursive(temp_base_);
+    }
+#endif
+}
+
+void VirtualFs::setMountRoots(const char* rootfs_prefix, const char* sd_prefix) {
+#ifndef ESP_PLATFORM
+    if (owns_temp_root_ && temp_base_[0] != '\0') {
+        removeTreeRecursive(temp_base_);
+        temp_base_[0] = '\0';
+        owns_temp_root_ = false;
+    }
+#endif
+    if (rootfs_prefix) {
+        strncpy(rootfs_prefix_, rootfs_prefix, sizeof(rootfs_prefix_) - 1);
+        rootfs_prefix_[sizeof(rootfs_prefix_) - 1] = '\0';
+    }
+    if (sd_prefix) {
+        strncpy(sd_prefix_, sd_prefix, sizeof(sd_prefix_) - 1);
+        sd_prefix_[sizeof(sd_prefix_) - 1] = '\0';
+    }
+}
+
+void VirtualFs::ensureParentDirs(const char* real_path) const {
+    if (!real_path) return;
+    char tmp[224];
+    strncpy(tmp, real_path, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+    for (char* p = tmp + 1; *p; ++p) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(tmp, 0755);
+            *p = '/';
+        }
+    }
+}
+
+bool VirtualFs::isVirtualPath(const char* abs_path) const {
+    if (!abs_path) return true;
+    if (strcmp(abs_path, "/") == 0 ||
+        strcmp(abs_path, "/bin") == 0 || strncmp(abs_path, "/bin/", 5) == 0 ||
+        strcmp(abs_path, "/proc") == 0 || strncmp(abs_path, "/proc/", 6) == 0 ||
+        strcmp(abs_path, "/sys") == 0 || strncmp(abs_path, "/sys/", 5) == 0 ||
+        strcmp(abs_path, "/dev") == 0 || strncmp(abs_path, "/dev/", 5) == 0 ||
+        strcmp(abs_path, "/var/log/dmesg") == 0 ||
+        strcmp(abs_path, "/etc/ssh/ssh_host_ed25519_key.pub") == 0 ||
+        strcmp(abs_path, "/etc/ssh/sshd_config") == 0) {
+        return true;
+    }
+    return false;
+}
+
+bool VirtualFs::resolveRealPath(const char* abs_path, char* out_real, size_t max_len) const {
+    if (!abs_path || !out_real || max_len == 0 || abs_path[0] != '/') return false;
+    if (isVirtualPath(abs_path)) return false;
+
+    if (strcmp(abs_path, "/mnt/sd") == 0) {
+        if (sd_prefix_[0] == '\0') return false;
+        strncpy(out_real, sd_prefix_, max_len - 1);
+        out_real[max_len - 1] = '\0';
+        return true;
+    }
+    if (strncmp(abs_path, "/mnt/sd/", 8) == 0) {
+        if (sd_prefix_[0] == '\0') return false;
+        int w = snprintf(out_real, max_len, "%s/%s", sd_prefix_, abs_path + 8);
+        return w > 0 && static_cast<size_t>(w) < max_len;
+    }
+
+    if (rootfs_prefix_[0] == '\0') return false;
+    int w = snprintf(out_real, max_len, "%s%s", rootfs_prefix_, abs_path);
+    return w > 0 && static_cast<size_t>(w) < max_len;
+}
+
+void VirtualFs::initDefaultFiles(SystemState& state) {
+    mkdirPath("/etc");
+    mkdirPath("/etc/ssh");
+    mkdirPath("/root");
+    mkdirPath("/apps");
+    mkdirPath("/var");
+    mkdirPath("/var/log");
+    mkdirPath("/var/pkg");
+    mkdirPath("/mnt");
+    mkdirPath("/tmp");
+
+    auto ensureFile = [this](const char* abs_path, const char* content) {
+        char real_path[224];
+        if (!resolveRealPath(abs_path, real_path, sizeof(real_path))) return;
+        struct stat st;
+        if (stat(real_path, &st) == 0) return;  // Preserve persisted user edits
+        ensureParentDirs(real_path);
+        FILE* f = fopen(real_path, "wb");
+        if (f) {
+            size_t len = strlen(content);
+            if (len > 0) fwrite(content, 1, len, f);
+            fclose(f);
         }
     };
 
-    setFile("/etc/hostname", "c6-linux\n");
-    setFile("/etc/os-release",
-            "NAME=\"C6-MicroLinux\"\n"
-            "VERSION=\"6.12.0-riscv32 (Waveshare ESP32-C6-LCD-1.47)\"\n"
-            "ID=c6os\n"
-            "PRETTY_NAME=\"C6-MicroLinux 6.12.0-c6os-riscv32\"\n"
-            "HOME_URL=\"https://espressif.com/\"\n");
-    setFile("/etc/motd",
-            "Welcome to C6-MicroLinux 6.12.0-c6os-riscv32 (rv32imac)\n"
-            " * Board:   Waveshare ESP32-C6-LCD-1.47 (ST7789 320x172 RGB565)\n"
-            " * Menu:    Type 'menu' to launch the interactive Screen Control TUI\n"
-            " * Control: Type 'screen help' or write to /dev/tty0 & /sys/class/*\n");
-    setFile("/etc/passwd", "root:x:0:0:root:/root:/bin/c6-sh\n");
+    ensureFile("/etc/hostname", "c6-linux\n");
+    ensureFile("/etc/os-release",
+               "NAME=\"C6-MicroLinux\"\n"
+               "VERSION=\"6.12.0-riscv32 (Waveshare ESP32-C6-LCD-1.47 QIO)\"\n"
+               "ID=c6os\n"
+               "PRETTY_NAME=\"C6-MicroLinux 6.12.0-c6os-riscv32\"\n"
+               "HOME_URL=\"https://espressif.com/\"\n");
+    ensureFile("/etc/motd",
+               "Welcome to C6-MicroLinux 6.12.0-c6os-riscv32 (rv32imac)\n"
+               " * Board:   Waveshare ESP32-C6-LCD-1.47 (ST7789 320x172 RGB565 DMA)\n"
+               " * Apps:    SFTP v3 | epkg | Lua 5.4 (32-bit) | RV32IMAC ELF\n"
+               " * Shell:   Type 'menu' for TUI, 'chsh' for default login shell\n");
+    ensureFile("/etc/passwd", "root:x:0:0:root:/root:/bin/c6-menu\n");
+    ensureFile("/etc/timezone", "America/Toronto\n");
 
     char wpa_buf[192];
     snprintf(wpa_buf, sizeof(wpa_buf),
              "ctrl_interface=/var/run/wpa_supplicant\nnetwork={\n  ssid=\"%s\"\n  psk=\"***\"\n}\n",
              state.wifi_cfg_ssid[0] ? state.wifi_cfg_ssid : "unconfigured");
-    setFile("/etc/wpa_supplicant.conf", wpa_buf);
-    setFile("/etc/rc.local",
-            "#!/bin/c6-sh\n"
-            "# /etc/rc.local - executed by init at boot\n"
-            "echo \"rc.local: boot services initialized\" > /dev/tty0\n");
-    setFile("/etc/crontab",
-            "# /etc/crontab: <interval_sec> <command>\n"
-            "# Use 'crontab -l' or 'crontab -a <sec> <cmd>'\n");
+    ensureFile("/etc/wpa_supplicant.conf", wpa_buf);
+    ensureFile("/etc/rc.local",
+               "#!/bin/c6-sh\n"
+               "# /etc/rc.local - executed by init at boot\n"
+               "echo \"rc.local: boot services initialized\" > /dev/tty0\n");
+    ensureFile("/etc/crontab",
+               "# /etc/crontab: <interval_sec> <command>\n"
+               "# Use 'crontab -l' or 'crontab -a <sec> <cmd>'\n");
 
-    setFile("/root/README.txt",
-            "C6-MicroLinux Screen & Board Quick Reference:\n"
-            "  menu                         - Open interactive ANSI TUI menu\n"
-            "  screen mode monitor          - On-LCD graphical htop & sparkline\n"
-            "  screen ticker \"Hello\"        - Scrolling bottom marquee on LCD\n"
-            "  screen alert \"ALERT!\"        - Flashing high-priority alert banner\n"
-            "  fbi <logo|tux|matrix|grid>   - Display graphical artwork on LCD\n"
-            "  fbgrab --ascii               - Render color ASCII LCD preview in SSH\n"
-            "  sensors, pinout, gpio        - Die temperature, board pinout & GPIO/PWM\n"
-            "  crontab, watch, edit, sh     - Periodic cron jobs, editor & shell scripts\n"
-            "  date, ntpdate, ping, netstat - Wall-clock NTP, network probe & sockets\n");
+    char auth_keys_buf[1024];
+    crypto::formatDefaultAuthorizedKeys(auth_keys_buf, sizeof(auth_keys_buf));
+    ensureFile("/etc/ssh/authorized_keys", auth_keys_buf);
+
+    ensureFile("/root/README.txt",
+               "C6-MicroLinux Quick Reference:\n"
+               "  menu / chsh                  - Open ANSI TUI or switch login shell\n"
+               "  epkg install <pkg.epkg>      - Install Lua/ELF/shell app into /apps\n"
+               "  lua -e 'print(sys.heap())'   - Run 32-bit Lua 5.4 with hardware APIs\n"
+               "  elf /apps/hello.elf          - Execute RV32IMAC ELF32 binary\n"
+               "  ble on | ble scan | i2c scan - On-demand BLE 5, I2C, ADC, PWM, GPIO\n"
+               "  fbgrab /root/snap.bmp        - Save pixel-accurate 320x172 screenshot\n"
+               "  tz America/Toronto | apitoken- Set POSIX timezone or rotate REST token\n");
+
+    // Synchronize persisted /etc config into SystemState
+    char cfg_buf[256];
+    if (readFile(state, "/etc/hostname", cfg_buf, sizeof(cfg_buf))) {
+        trimTrailingNewline(cfg_buf);
+        if (cfg_buf[0] != '\0') {
+            strncpy(state.hostname, cfg_buf, sizeof(state.hostname) - 1);
+            state.hostname[sizeof(state.hostname) - 1] = '\0';
+        }
+    }
+    if (readFile(state, "/etc/timezone", cfg_buf, sizeof(cfg_buf))) {
+        trimTrailingNewline(cfg_buf);
+        if (cfg_buf[0] != '\0') {
+            resolvePosixTz(cfg_buf, state.tz_name, sizeof(state.tz_name),
+                           state.tz_posix, sizeof(state.tz_posix));
+        }
+    }
+    if (readFile(state, "/etc/passwd", cfg_buf, sizeof(cfg_buf))) {
+        parseLoginShellFromPasswd(cfg_buf, state.login_shell, sizeof(state.login_shell));
+    }
 }
 
 void VirtualFs::normalizePath(const char* cwd, const char* input_path, char* out_path, size_t max_len) {
@@ -85,7 +256,7 @@ void VirtualFs::normalizePath(const char* cwd, const char* input_path, char* out
         return;
     }
 
-    char combined[160];
+    char combined[192];
     if (input_path[0] == '/') {
         strncpy(combined, input_path, sizeof(combined) - 1);
         combined[sizeof(combined) - 1] = '\0';
@@ -100,7 +271,7 @@ void VirtualFs::normalizePath(const char* cwd, const char* input_path, char* out
         }
     }
 
-    const char* segments[16];
+    const char* segments[20];
     size_t seg_count = 0;
 
     char* saveptr = nullptr;
@@ -110,7 +281,7 @@ void VirtualFs::normalizePath(const char* cwd, const char* input_path, char* out
             // Ignore
         } else if (strcmp(token, "..") == 0) {
             if (seg_count > 0) --seg_count;
-        } else if (seg_count < 16) {
+        } else if (seg_count < 20) {
             segments[seg_count++] = token;
         }
         token = strtok_r(nullptr, "/", &saveptr);
@@ -122,14 +293,9 @@ void VirtualFs::normalizePath(const char* cwd, const char* input_path, char* out
         return;
     }
 
-    out_path[0] = '\0';
-    size_t pos = 0;
+    BufWriter w(out_path, max_len);
     for (size_t i = 0; i < seg_count; ++i) {
-        int written = snprintf(out_path + pos, max_len - pos, "/%s", segments[i]);
-        if (written < 0 || static_cast<size_t>(written) >= max_len - pos) {
-            break;
-        }
-        pos += static_cast<size_t>(written);
+        w.fmt("/%s", segments[i]);
     }
 }
 
@@ -137,10 +303,13 @@ bool VirtualFs::isDirectory(const char* abs_path) const {
     if (!abs_path) return false;
     static const char* const DIRS[] = {
         "/",
+        "/apps",
         "/bin",
         "/dev",
         "/etc",
         "/etc/ssh",
+        "/mnt",
+        "/mnt/sd",
         "/proc",
         "/proc/net",
         "/root",
@@ -155,121 +324,216 @@ bool VirtualFs::isDirectory(const char* abs_path) const {
         "/sys/class/leds/ws2812",
         "/sys/class/thermal",
         "/sys/class/thermal/thermal_zone0",
+        "/tmp",
         "/var",
-        "/var/log"
+        "/var/log",
+        "/var/pkg"
     };
     for (const char* d : DIRS) {
         if (strcmp(abs_path, d) == 0) return true;
     }
+
+    char real_path[224];
+    if (resolveRealPath(abs_path, real_path, sizeof(real_path))) {
+        struct stat st;
+        if (stat(real_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            return true;
+        }
+    }
     return false;
+}
+
+size_t VirtualFs::readDirEntries(const char* abs_path, VfsDirEntry* out_entries, size_t max_entries) const {
+    if (!abs_path || !out_entries || max_entries == 0) return 0;
+    size_t count = 0;
+
+    auto addEntry = [&](const char* name, bool is_dir, uint64_t sz = 0, uint32_t mtime = 0) {
+        if (count >= max_entries) return;
+        for (size_t i = 0; i < count; ++i) {
+            if (strcmp(out_entries[i].name, name) == 0) return;
+        }
+        strncpy(out_entries[count].name, name, sizeof(out_entries[count].name) - 1);
+        out_entries[count].name[sizeof(out_entries[count].name) - 1] = '\0';
+        out_entries[count].is_dir = is_dir;
+        out_entries[count].size = sz;
+        out_entries[count].mode = is_dir ? 0040755U : 0100644U;
+        out_entries[count].mtime = mtime;
+        ++count;
+    };
+
+    if (strcmp(abs_path, "/") == 0) {
+        addEntry("apps", true);
+        addEntry("bin", true);
+        addEntry("dev", true);
+        addEntry("etc", true);
+        addEntry("mnt", true);
+        addEntry("proc", true);
+        addEntry("root", true);
+        addEntry("sys", true);
+        addEntry("tmp", true);
+        addEntry("var", true);
+        return count;
+    }
+    if (strcmp(abs_path, "/mnt") == 0) {
+        addEntry("sd", true);
+    } else if (strcmp(abs_path, "/etc") == 0) {
+        addEntry("ssh", true);
+    } else if (strcmp(abs_path, "/etc/ssh") == 0) {
+        addEntry("ssh_host_ed25519_key.pub", false, 96);
+        addEntry("sshd_config", false, 160);
+    } else if (strcmp(abs_path, "/var") == 0) {
+        addEntry("log", true);
+        addEntry("pkg", true);
+    } else if (strcmp(abs_path, "/var/log") == 0) {
+        addEntry("dmesg", false, 1024);
+    }
+
+    char real_path[224];
+    if (resolveRealPath(abs_path, real_path, sizeof(real_path))) {
+        DIR* d = opendir(real_path);
+        if (d) {
+            struct dirent* ent = nullptr;
+            while ((ent = readdir(d)) != nullptr && count < max_entries) {
+                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+                char child[512];
+                snprintf(child, sizeof(child), "%s/%s", real_path, ent->d_name);
+                struct stat st;
+                bool is_dir = false;
+                uint64_t sz = 0;
+                uint32_t mt = 0;
+                if (stat(child, &st) == 0) {
+                    is_dir = S_ISDIR(st.st_mode);
+                    sz = is_dir ? 0ULL : static_cast<uint64_t>(st.st_size);
+                    mt = static_cast<uint32_t>(st.st_mtime);
+                }
+                addEntry(ent->d_name, is_dir, sz, mt);
+            }
+            closedir(d);
+        }
+    }
+
+    return count;
 }
 
 bool VirtualFs::listDirectory(const char* abs_path, char* out_buf, size_t max_len) const {
     if (!abs_path || !out_buf || max_len == 0) return false;
-    out_buf[0] = '\0';
+    BufWriter w(out_buf, max_len);
 
     if (strcmp(abs_path, "/") == 0) {
-        snprintf(out_buf, max_len, "bin/  dev/  etc/  proc/  root/  sys/  var/\n");
+        w.putStr("apps/  bin/  dev/  etc/  mnt/  proc/  root/  sys/  tmp/  var/\n");
         return true;
     }
     if (strcmp(abs_path, "/bin") == 0) {
-        snprintf(out_buf, max_len,
-                 "c6-menu*  c6-sh*  cat*  crontab*  date*  df*  dmesg*  echo*  edit*  fbgrab*  "
-                 "fbi*  free*  gpio*  htop*  ip*  ls*  lscpu*  nano*  neofetch*  netstat*  "
-                 "ntpdate*  passwd*  ping*  pinout*  ps*  reboot*  screen*  sensors*  sh*  "
-                 "ss*  top*  uname*  uptime*  vmstat*  watch*  wifi*\n");
+        w.putStr("adc*  apitoken*  ble*  c6-menu*  c6-sh*  cat*  chsh*  crontab*  date*  df*  "
+                 "dmesg*  echo*  edit*  elf*  epkg*  fbgrab*  fbi*  free*  gpio*  htop*  i2c*  "
+                 "ip*  lua*  ls*  lscpu*  nano*  neofetch*  netstat*  ntpdate*  passwd*  ping*  "
+                 "pinout*  ps*  reboot*  rm*  screen*  sensors*  sh*  ss*  top*  tz*  uname*  "
+                 "uptime*  vmstat*  watch*  wifi*\n");
         return true;
     }
     if (strcmp(abs_path, "/proc") == 0) {
-        snprintf(out_buf, max_len, "cpuinfo  loadavg  meminfo  net/  uptime  version\n");
+        w.putStr("cpuinfo  loadavg  meminfo  net/  uptime  version\n");
         return true;
     }
     if (strcmp(abs_path, "/proc/net") == 0) {
-        snprintf(out_buf, max_len, "dev  wireless\n");
+        w.putStr("dev  wireless\n");
         return true;
     }
     if (strcmp(abs_path, "/dev") == 0) {
-        snprintf(out_buf, max_len, "fb0  input0  led0  null  pts/  tty0  ttyACM0  ttyS0  zero\n");
+        w.putStr("fb0  i2c-0  input0  led0  null  pts/  tty0  ttyACM0  ttyS0  zero\n");
         return true;
     }
     if (strcmp(abs_path, "/sys") == 0) {
-        snprintf(out_buf, max_len, "class/\n");
+        w.putStr("class/\n");
         return true;
     }
     if (strcmp(abs_path, "/sys/class") == 0) {
-        snprintf(out_buf, max_len, "backlight/  gpio/  graphics/  leds/  thermal/\n");
+        w.putStr("backlight/  gpio/  graphics/  leds/  thermal/\n");
         return true;
     }
     if (strcmp(abs_path, "/sys/class/backlight") == 0) {
-        snprintf(out_buf, max_len, "st7789/\n");
+        w.putStr("st7789/\n");
         return true;
     }
     if (strcmp(abs_path, "/sys/class/backlight/st7789") == 0) {
-        snprintf(out_buf, max_len, "brightness  max_brightness\n");
+        w.putStr("brightness  max_brightness\n");
         return true;
     }
     if (strcmp(abs_path, "/sys/class/gpio") == 0) {
-        snprintf(out_buf, max_len, "status\n");
+        w.putStr("status\n");
         return true;
     }
     if (strcmp(abs_path, "/sys/class/graphics") == 0) {
-        snprintf(out_buf, max_len, "fb0/\n");
+        w.putStr("fb0/\n");
         return true;
     }
     if (strcmp(abs_path, "/sys/class/graphics/fb0") == 0) {
-        snprintf(out_buf, max_len, "alert  mode  name  stride  text  theme  ticker  virtual_size\n");
+        w.putStr("alert  mode  name  stride  text  theme  ticker  virtual_size\n");
         return true;
     }
     if (strcmp(abs_path, "/sys/class/leds") == 0) {
-        snprintf(out_buf, max_len, "ws2812/\n");
+        w.putStr("ws2812/\n");
         return true;
     }
     if (strcmp(abs_path, "/sys/class/leds/ws2812") == 0) {
-        snprintf(out_buf, max_len, "mode  rgb\n");
+        w.putStr("mode  rgb\n");
         return true;
     }
     if (strcmp(abs_path, "/sys/class/thermal") == 0) {
-        snprintf(out_buf, max_len, "thermal_zone0/\n");
+        w.putStr("thermal_zone0/\n");
         return true;
     }
     if (strcmp(abs_path, "/sys/class/thermal/thermal_zone0") == 0) {
-        snprintf(out_buf, max_len, "temp  type\n");
-        return true;
-    }
-    if (strcmp(abs_path, "/var") == 0) {
-        snprintf(out_buf, max_len, "log/\n");
-        return true;
-    }
-    if (strcmp(abs_path, "/var/log") == 0) {
-        snprintf(out_buf, max_len, "dmesg  sshd.log\n");
-        return true;
-    }
-    if (strcmp(abs_path, "/etc/ssh") == 0) {
-        snprintf(out_buf, max_len, "ssh_host_ed25519_key  ssh_host_ed25519_key.pub  sshd_config\n");
+        w.putStr("temp  type\n");
         return true;
     }
 
-    if (strcmp(abs_path, "/etc") == 0 || strcmp(abs_path, "/root") == 0) {
-        size_t prefix_len = strlen(abs_path);
-        size_t pos = 0;
-        if (strcmp(abs_path, "/etc") == 0) {
-            pos += static_cast<size_t>(snprintf(out_buf + pos, max_len - pos, "ssh/  "));
+    if (!isDirectory(abs_path)) return false;
+
+    VfsDirEntry entries[32];
+    size_t count = readDirEntries(abs_path, entries, 32);
+    for (size_t i = 0; i < count; ++i) {
+        if (entries[i].is_dir) {
+            w.fmt("%s/  ", entries[i].name);
+        } else {
+            w.fmt("%s  ", entries[i].name);
         }
-        for (size_t i = 0; i < VFS_MAX_USER_FILES; ++i) {
-            if (!user_files_[i].in_use) continue;
-            if (strncmp(user_files_[i].path, abs_path, prefix_len) == 0 &&
-                user_files_[i].path[prefix_len] == '/') {
-                const char* sub = user_files_[i].path + prefix_len + 1;
-                if (strchr(sub, '/') == nullptr) {
-                    int w = snprintf(out_buf + pos, max_len - pos, "%s  ", sub);
-                    if (w > 0) pos += static_cast<size_t>(w);
-                }
-            }
-        }
-        snprintf(out_buf + pos, max_len - pos, "\n");
+    }
+    w.putChar('\n');
+    return true;
+}
+
+bool VirtualFs::statPath(const char* abs_path, uint64_t* out_size, uint32_t* out_mode, uint32_t* out_mtime) const {
+    if (!abs_path) return false;
+    if (isDirectory(abs_path)) {
+        if (out_size) *out_size = 0;
+        if (out_mode) *out_mode = 0040755U;
+        if (out_mtime) *out_mtime = 0;
         return true;
     }
 
+    char real_path[224];
+    if (resolveRealPath(abs_path, real_path, sizeof(real_path))) {
+        struct stat st;
+        if (stat(real_path, &st) == 0) {
+            if (out_size) *out_size = static_cast<uint64_t>(st.st_size);
+            if (out_mode) *out_mode = S_ISDIR(st.st_mode) ? 0040755U : 0100644U;
+            if (out_mtime) *out_mtime = static_cast<uint32_t>(st.st_mtime);
+            return true;
+        }
+        return false;
+    }
+
+    // Synthetic /proc, /sys, /dev files
+    SystemState dummy;
+    dummy.initDefaults();
+    char probe[256];
+    if (readFile(dummy, abs_path, probe, sizeof(probe))) {
+        if (out_size) *out_size = strlen(probe);
+        if (out_mode) *out_mode = 0100444U;
+        if (out_mtime) *out_mtime = 0;
+        return true;
+    }
     return false;
 }
 
@@ -295,8 +559,8 @@ bool VirtualFs::readFile(const SystemState& state, const char* abs_path, char* o
                  "uarch\t\t: espressif,esp32-c6fh4\n"
                  "model name\t: Espressif ESP32-C6FH4 RISC-V @ %u MHz\n"
                  "cpu MHz\t\t: %u.000\n"
-                 "flash size\t: %u MB (XMC DIO)\n"
-                 "display\t\t: Waveshare 1.47\" ST7789 (320x172 RGB565 @ 80MHz SPI2)\n",
+                 "flash size\t: %u MB (XMC QIO)\n"
+                 "display\t\t: Waveshare 1.47\" ST7789 (320x172 RGB565 @ 80MHz SPI2 DMA)\n",
                  static_cast<unsigned>(state.cpu_freq_mhz),
                  static_cast<unsigned>(state.cpu_freq_mhz),
                  static_cast<unsigned>(state.flash_size_mb));
@@ -325,7 +589,10 @@ bool VirtualFs::readFile(const SystemState& state, const char* abs_path, char* o
         return true;
     }
     if (strcmp(abs_path, "/proc/loadavg") == 0) {
-        snprintf(out_buf, max_len, "0.08 0.05 0.01 1/6 42\n");
+        unsigned load_int = state.cpu_load_pct / 100U;
+        unsigned load_frac = state.cpu_load_pct % 100U;
+        snprintf(out_buf, max_len, "%u.%02u %u.%02u 0.05 1/6 42\n",
+                 load_int, load_frac, load_int, load_frac);
         return true;
     }
     if (strcmp(abs_path, "/proc/net/dev") == 0) {
@@ -363,6 +630,10 @@ bool VirtualFs::readFile(const SystemState& state, const char* abs_path, char* o
     }
     if (strcmp(abs_path, "/sys/class/graphics/fb0/virtual_size") == 0) {
         snprintf(out_buf, max_len, "320,172\n");
+        return true;
+    }
+    if (strcmp(abs_path, "/sys/class/graphics/fb0/stride") == 0) {
+        snprintf(out_buf, max_len, "640\n");
         return true;
     }
     if (strcmp(abs_path, "/sys/class/graphics/fb0/mode") == 0) {
@@ -408,8 +679,7 @@ bool VirtualFs::readFile(const SystemState& state, const char* abs_path, char* o
         snprintf(out_buf, max_len, "%u %u %u\n", state.led_r, state.led_g, state.led_b);
         return true;
     }
-    if (strcmp(abs_path, "/etc/ssh/ ssh_host_ed25519_key.pub") == 0 ||
-        strcmp(abs_path, "/etc/ssh/ssh_host_ed25519_key.pub") == 0) {
+    if (strcmp(abs_path, "/etc/ssh/ssh_host_ed25519_key.pub") == 0) {
         snprintf(out_buf, max_len, "ssh-ed25519 (%s) root@%s\n", state.ssh_hostkey_fp, state.hostname);
         return true;
     }
@@ -417,28 +687,27 @@ bool VirtualFs::readFile(const SystemState& state, const char* abs_path, char* o
         snprintf(out_buf, max_len,
                  "Port %u\n"
                  "HostKey /etc/ssh/ssh_host_ed25519_key\n"
+                 "AuthorizedKeysFile /etc/ssh/authorized_keys\n"
                  "KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org\n"
-                 "Ciphers aes128-ctr,aes256-ctr\n"
+                 "PubkeyAcceptedAlgorithms ssh-ed25519,rsa-sha2-256,rsa-sha2-512\n"
+                 "Ciphers aes128-ctr\n"
                  "MACs hmac-sha2-256\n"
+                 "Subsystem sftp internal-sftp\n"
                  "PermitRootLogin yes\n",
                  state.ssh_port);
         return true;
     }
     if (strcmp(abs_path, "/var/log/dmesg") == 0) {
-        size_t pos = 0;
+        BufWriter w(out_buf, max_len);
         for (size_t i = 0; i < state.dmesg_count; ++i) {
-            int w = snprintf(out_buf + pos, max_len - pos, "%s\n", state.dmesg[i]);
-            if (w < 0 || static_cast<size_t>(w) >= max_len - pos) break;
-            pos += static_cast<size_t>(w);
+            w.fmt("%s\n", state.dmesgLineAt(i));
         }
         return true;
     }
     if (strcmp(abs_path, "/dev/tty0") == 0 || strcmp(abs_path, "/dev/fb0") == 0) {
-        size_t pos = 0;
+        BufWriter w(out_buf, max_len);
         for (size_t i = 0; i < state.fb_line_count; ++i) {
-            int w = snprintf(out_buf + pos, max_len - pos, "%s\n", state.fb_lines[i]);
-            if (w < 0 || static_cast<size_t>(w) >= max_len - pos) break;
-            pos += static_cast<size_t>(w);
+            w.fmt("%s\n", state.fbLineAt(i));
         }
         return true;
     }
@@ -447,16 +716,17 @@ bool VirtualFs::readFile(const SystemState& state, const char* abs_path, char* o
         return true;
     }
 
-    // Check user files (/etc/*, /root/*)
-    for (size_t i = 0; i < VFS_MAX_USER_FILES; ++i) {
-        if (user_files_[i].in_use && strcmp(user_files_[i].path, abs_path) == 0) {
-            strncpy(out_buf, user_files_[i].content, max_len - 1);
-            out_buf[max_len - 1] = '\0';
-            return true;
-        }
+    char real_path[224];
+    if (!resolveRealPath(abs_path, real_path, sizeof(real_path))) {
+        return false;
     }
 
-    return false;
+    FILE* f = fopen(real_path, "rb");
+    if (!f) return false;
+    size_t n = fread(out_buf, 1, max_len - 1, f);
+    out_buf[n] = '\0';
+    fclose(f);
+    return true;
 }
 
 bool VirtualFs::writeFile(SystemState& state, const char* abs_path, const char* data, bool append) {
@@ -483,7 +753,7 @@ bool VirtualFs::writeFile(SystemState& state, const char* abs_path, const char* 
         if (val < 0) val = 0;
         if (val > 100) val = 100;
         state.backlight_pct = static_cast<uint8_t>(val);
-        state.ui_dirty = true;
+        state.markDirty(DIRTY_HEADER);
         return true;
     }
     if (strcmp(abs_path, "/sys/class/graphics/fb0/mode") == 0) {
@@ -502,7 +772,7 @@ bool VirtualFs::writeFile(SystemState& state, const char* abs_path, const char* 
         } else {
             return false;
         }
-        state.ui_dirty = true;
+        state.markDirty(DIRTY_FULL);
         return true;
     }
     if (strcmp(abs_path, "/sys/class/graphics/fb0/ticker") == 0) {
@@ -514,7 +784,7 @@ bool VirtualFs::writeFile(SystemState& state, const char* abs_path, const char* 
             state.ticker_text[sizeof(state.ticker_text) - 1] = '\0';
             state.ticker_offset = 0;
         }
-        state.ui_dirty = true;
+        state.markDirty(DIRTY_TICKER | DIRTY_CARDS);
         return true;
     }
     if (strcmp(abs_path, "/sys/class/graphics/fb0/alert") == 0) {
@@ -525,7 +795,7 @@ bool VirtualFs::writeFile(SystemState& state, const char* abs_path, const char* 
             strncpy(state.alert_text, clean, sizeof(state.alert_text) - 1);
             state.alert_text[sizeof(state.alert_text) - 1] = '\0';
         }
-        state.ui_dirty = true;
+        state.markDirty(DIRTY_FULL);
         return true;
     }
     if (strcmp(abs_path, "/sys/class/graphics/fb0/theme") == 0) {
@@ -535,13 +805,13 @@ bool VirtualFs::writeFile(SystemState& state, const char* abs_path, const char* 
         else if (strcmp(clean, "red") == 0) state.theme = ThemeId::RED_ALERT;
         else if (strcmp(clean, "mono") == 0 || strcmp(clean, "white") == 0) state.theme = ThemeId::MONO_WHITE;
         else return false;
-        state.ui_dirty = true;
+        state.markDirty(DIRTY_FULL);
         return true;
     }
     if (strcmp(abs_path, "/sys/class/graphics/fb0/text") == 0) {
         strncpy(state.headline, clean, sizeof(state.headline) - 1);
         state.headline[sizeof(state.headline) - 1] = '\0';
-        state.ui_dirty = true;
+        state.markDirty(DIRTY_CARDS | DIRTY_FULL);
         return true;
     }
     if (strcmp(abs_path, "/sys/class/leds/ws2812/mode") == 0) {
@@ -551,7 +821,7 @@ bool VirtualFs::writeFile(SystemState& state, const char* abs_path, const char* 
         else if (strcmp(clean, "rainbow") == 0) state.led_mode = LedMode::RAINBOW;
         else if (strcmp(clean, "ssh") == 0) state.led_mode = LedMode::SSH_ACTIVITY;
         else return false;
-        state.ui_dirty = true;
+        state.markDirty(DIRTY_HEADER);
         return true;
     }
     if (strcmp(abs_path, "/sys/class/leds/ws2812/rgb") == 0) {
@@ -561,62 +831,107 @@ bool VirtualFs::writeFile(SystemState& state, const char* abs_path, const char* 
             state.led_g = static_cast<uint8_t>(g & 0xFF);
             state.led_b = static_cast<uint8_t>(b & 0xFF);
             state.led_mode = LedMode::SOLID;
-            state.ui_dirty = true;
+            state.markDirty(DIRTY_HEADER);
             return true;
         }
         return false;
     }
 
-    if (strncmp(abs_path, "/proc/", 6) == 0 || strncmp(abs_path, "/sys/", 5) == 0) {
-        return false;  // Read-only kernel pseudo-files
+    if (isVirtualPath(abs_path)) {
+        return false;
     }
 
     if (strcmp(abs_path, "/etc/hostname") == 0 && clean[0] != '\0') {
         strncpy(state.hostname, clean, sizeof(state.hostname) - 1);
         state.hostname[sizeof(state.hostname) - 1] = '\0';
-        state.ui_dirty = true;
+        state.markDirty(DIRTY_HEADER);
+    } else if (strcmp(abs_path, "/etc/timezone") == 0 && clean[0] != '\0') {
+        resolvePosixTz(clean, state.tz_name, sizeof(state.tz_name),
+                       state.tz_posix, sizeof(state.tz_posix));
+    } else if (strcmp(abs_path, "/etc/passwd") == 0) {
+        parseLoginShellFromPasswd(data, state.login_shell, sizeof(state.login_shell));
     }
 
-    // Find existing or free user file entry
-    for (size_t i = 0; i < VFS_MAX_USER_FILES; ++i) {
-        if (user_files_[i].in_use && strcmp(user_files_[i].path, abs_path) == 0) {
-            if (append) {
-                size_t cur = strlen(user_files_[i].content);
-                snprintf(user_files_[i].content + cur, VFS_MAX_FILE_SIZE - cur, "%s", data);
-            } else {
-                strncpy(user_files_[i].content, data, VFS_MAX_FILE_SIZE - 1);
-                user_files_[i].content[VFS_MAX_FILE_SIZE - 1] = '\0';
-            }
-            state.fs_sync_requested = true;
-            return true;
-        }
-    }
+    return writeBinary(state, abs_path, reinterpret_cast<const uint8_t*>(data), strlen(data), append);
+}
 
-    for (size_t i = 0; i < VFS_MAX_USER_FILES; ++i) {
-        if (!user_files_[i].in_use) {
-            user_files_[i].in_use = true;
-            strncpy(user_files_[i].path, abs_path, VFS_MAX_PATH_LEN - 1);
-            user_files_[i].path[VFS_MAX_PATH_LEN - 1] = '\0';
-            strncpy(user_files_[i].content, data, VFS_MAX_FILE_SIZE - 1);
-            user_files_[i].content[VFS_MAX_FILE_SIZE - 1] = '\0';
-            state.fs_sync_requested = true;
-            return true;
-        }
+FILE* VirtualFs::openPosix(const char* abs_path, const char* mode) const {
+    char real_path[224];
+    if (!resolveRealPath(abs_path, real_path, sizeof(real_path))) return nullptr;
+    if (mode && (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+'))) {
+        ensureParentDirs(real_path);
     }
+    return fopen(real_path, mode);
+}
 
-    return false;
+bool VirtualFs::fileSize(const char* abs_path, size_t* out_size) const {
+    uint64_t sz = 0;
+    if (!statPath(abs_path, &sz, nullptr, nullptr)) return false;
+    if (out_size) *out_size = static_cast<size_t>(sz);
+    return true;
+}
+
+bool VirtualFs::readBinary(const char* abs_path, size_t offset, uint8_t* out_buf,
+                           size_t max_len, size_t* out_read) const {
+    if (out_read) *out_read = 0;
+    if (!abs_path || !out_buf) return false;
+    FILE* f = openPosix(abs_path, "rb");
+    if (!f) return false;
+    if (offset > 0 && fseek(f, static_cast<long>(offset), SEEK_SET) != 0) {
+        fclose(f);
+        return false;
+    }
+    size_t n = fread(out_buf, 1, max_len, f);
+    fclose(f);
+    if (out_read) *out_read = n;
+    return true;
+}
+
+bool VirtualFs::writeBinary(SystemState& state, const char* abs_path,
+                            const uint8_t* data, size_t len, bool append) {
+    if (!abs_path || (!data && len > 0)) return false;
+    FILE* f = openPosix(abs_path, append ? "ab" : "wb");
+    if (!f) return false;
+    size_t written = (len > 0) ? fwrite(data, 1, len, f) : 0;
+    fclose(f);
+    if (written != len) return false;
+    state.fs_sync_requested = true;
+    return true;
 }
 
 bool VirtualFs::removeFile(SystemState& state, const char* abs_path) {
-    if (!abs_path) return false;
-    for (size_t i = 0; i < VFS_MAX_USER_FILES; ++i) {
-        if (user_files_[i].in_use && strcmp(user_files_[i].path, abs_path) == 0) {
-            memset(&user_files_[i], 0, sizeof(user_files_[i]));
-            state.fs_sync_requested = true;
-            return true;
-        }
+    char real_path[224];
+    if (!resolveRealPath(abs_path, real_path, sizeof(real_path))) return false;
+    if (unlink(real_path) == 0) {
+        state.fs_sync_requested = true;
+        return true;
     }
     return false;
+}
+
+bool VirtualFs::mkdirPath(const char* abs_path) const {
+    char real_path[224];
+    if (!resolveRealPath(abs_path, real_path, sizeof(real_path))) return false;
+    ensureParentDirs(real_path);
+    struct stat st;
+    if (stat(real_path, &st) == 0 && S_ISDIR(st.st_mode)) return true;
+    return mkdir(real_path, 0755) == 0;
+}
+
+bool VirtualFs::rmdirPath(const char* abs_path) const {
+    char real_path[224];
+    if (!resolveRealPath(abs_path, real_path, sizeof(real_path))) return false;
+    return rmdir(real_path) == 0;
+}
+
+bool VirtualFs::renamePath(const char* old_abs, const char* new_abs) const {
+    char old_real[224];
+    char new_real[224];
+    if (!resolveRealPath(old_abs, old_real, sizeof(old_real))) return false;
+    if (!resolveRealPath(new_abs, new_real, sizeof(new_real))) return false;
+    ensureParentDirs(new_real);
+    unlink(new_real);
+    return rename(old_real, new_real) == 0;
 }
 
 }  // namespace c6os

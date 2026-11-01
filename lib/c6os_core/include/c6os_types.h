@@ -1,8 +1,10 @@
 #ifndef C6OS_TYPES_H
 #define C6OS_TYPES_H
 
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 namespace c6os {
@@ -10,7 +12,7 @@ namespace c6os {
 // Display Modes for the 1.47" ST7789 (320x172) LCD
 enum class ScreenMode : uint8_t {
     OS_DASHBOARD = 0,  // Hostname, SSH IP, CPU/SRAM telemetry, custom banner
-    FB_CONSOLE   = 1,  // /dev/tty0 live scrolling kernel & terminal console (53x21 chars)
+    FB_CONSOLE   = 1,  // /dev/tty0 live scrolling kernel & terminal console
     SIGNBOARD    = 2,  // Full-screen scaled custom headline & subtitle signboard
     DIAGNOSTICS  = 3,  // RGB565 color bars, geometry grid, and hardware pin/bus test
     MONITOR      = 4,  // On-LCD htop telemetry: CPU sparkline, SRAM bar, temp, process table
@@ -34,9 +36,18 @@ enum class LedMode : uint8_t {
     SOLID        = 1,
     PULSE        = 2,
     RAINBOW      = 3,
-    SSH_ACTIVITY = 4,  // Green when SSH active, Cyan idle pulse, Amber on auth
+    SSH_ACTIVITY = 4,  // Green when SSH active, Cyan idle pulse
     COUNT        = 5
 };
+
+// Dirty-region bitmask for scanline DMA partial screen updates
+constexpr uint8_t DIRTY_NONE    = 0x00;
+constexpr uint8_t DIRTY_HEADER  = 0x01;  // y: 0..24
+constexpr uint8_t DIRTY_CARDS   = 0x02;  // y: 24..152
+constexpr uint8_t DIRTY_TICKER  = 0x04;  // y: 152..172
+constexpr uint8_t DIRTY_ALERT   = 0x08;  // y: 44..126
+constexpr uint8_t DIRTY_CONSOLE = 0x10;  // y: 14..172
+constexpr uint8_t DIRTY_FULL    = 0xFF;  // y: 0..172
 
 struct ThemePalette {
     uint16_t bg;
@@ -117,7 +128,109 @@ inline const char* ledModeName(LedMode mode) {
     }
 }
 
-// Constants for LCD Framebuffer Console (320x172 with 6x8 char cell -> 53 cols x 18 body rows)
+// Reserved board pins on Waveshare ESP32-C6-LCD-1.47:
+// GPIO 4 (SD_CS), 5 (MISO), 6 (MOSI), 7 (SCLK), 8 (WS2812), 9 (BOOT_BTN),
+// 12/13 (USB D-/D+), 14 (LCD_CS), 15 (LCD_DC), 21 (LCD_RST), 22 (LCD_BL)
+inline bool isReservedBoardPin(int pin) {
+    switch (pin) {
+        case 4:
+        case 5:
+        case 6:
+        case 7:
+        case 8:
+        case 9:
+        case 12:
+        case 13:
+        case 14:
+        case 15:
+        case 21:
+        case 22:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Linear O(1) cursor string writer replacing O(N^2) strlen() scans
+class BufWriter {
+public:
+    BufWriter(char* buf, size_t cap, bool resume_existing = false)
+        : buf_(buf), cap_(cap), pos_(0) {
+        if (buf_ && cap_ > 0) {
+            if (resume_existing) {
+                pos_ = strnlen(buf_, cap_ - 1);
+            } else {
+                buf_[0] = '\0';
+            }
+        }
+    }
+
+    size_t length() const { return pos_; }
+    size_t remaining() const { return (buf_ && pos_ + 1 < cap_) ? (cap_ - 1 - pos_) : 0; }
+    char* data() const { return buf_; }
+
+    void reset() {
+        pos_ = 0;
+        if (buf_ && cap_ > 0) buf_[0] = '\0';
+    }
+
+    void putChar(char c) {
+        if (!buf_ || pos_ + 1 >= cap_) return;
+        buf_[pos_++] = c;
+        buf_[pos_] = '\0';
+    }
+
+    void putRaw(const char* data, size_t len) {
+        if (!buf_ || !data || len == 0 || pos_ + 1 >= cap_) return;
+        size_t avail = cap_ - 1 - pos_;
+        if (len > avail) len = avail;
+        memcpy(buf_ + pos_, data, len);
+        pos_ += len;
+        buf_[pos_] = '\0';
+    }
+
+    void putStr(const char* s) {
+        if (s) putRaw(s, strlen(s));
+    }
+
+    void putWithCrLf(const char* text) {
+        if (!buf_ || !text || pos_ + 1 >= cap_) return;
+        for (size_t i = 0; text[i] != '\0' && pos_ + 1 < cap_; ++i) {
+            if (text[i] == '\n' && (i == 0 || text[i - 1] != '\r')) {
+                if (pos_ + 2 >= cap_) break;
+                buf_[pos_++] = '\r';
+                buf_[pos_++] = '\n';
+            } else {
+                buf_[pos_++] = text[i];
+            }
+        }
+        buf_[pos_] = '\0';
+    }
+
+    void fmt(const char* format, ...) {
+        if (!buf_ || !format || pos_ + 1 >= cap_) return;
+        va_list args;
+        va_start(args, format);
+        int w = vsnprintf(buf_ + pos_, cap_ - pos_, format, args);
+        va_end(args);
+        if (w > 0) {
+            size_t added = static_cast<size_t>(w);
+            if (pos_ + added >= cap_) {
+                pos_ = cap_ - 1;
+            } else {
+                pos_ += added;
+            }
+            buf_[pos_] = '\0';
+        }
+    }
+
+private:
+    char* buf_;
+    size_t cap_;
+    size_t pos_;
+};
+
+// Constants for LCD Framebuffer Console (320x172 with 6x8 char cell -> 52 cols x 18 body rows)
 constexpr size_t FB_CONSOLE_ROWS = 18;
 constexpr size_t FB_CONSOLE_COLS = 52;
 constexpr size_t DMESG_MAX_LINES = 32;
@@ -142,10 +255,68 @@ struct CronJob {
     char cmd[64];
 };
 
+// Hardware driver callback types (wired to ESP32-C6 peripherals on device, deterministic mocks on host)
+struct BleScanResult {
+    char addr[18];
+    char name[24];
+    int16_t rssi;
+};
+
+struct TaskInfoEntry {
+    uint32_t pid;
+    char name[20];
+    char state_ch;
+    int prio;
+    uint32_t stack_free_bytes;
+    uint32_t cpu_permille;
+    uint32_t runtime_cs;
+};
+
+struct PingStats {
+    bool reachable;
+    uint16_t sent;
+    uint16_t received;
+    uint32_t min_us;
+    uint32_t max_us;
+    uint32_t avg_us;
+    uint32_t rtts_us[5];
+};
+
+struct HardwareOps {
+    int (*gpio_mode)(int pin, uint8_t mode);  // 1=out, 2=in, 3=pullup, 4=pulldown
+    int (*gpio_write)(int pin, int val);
+    int (*gpio_read)(int pin);
+    int (*gpio_pwm)(int pin, uint8_t duty, uint32_t freq_hz);
+    int (*adc_read_mv)(int pin);
+    int (*i2c_init)(uint8_t sda, uint8_t scl, uint32_t hz);
+    int (*i2c_scan)(uint8_t* out_addrs, size_t max_addrs);
+    int (*i2c_write_reg)(uint8_t addr, uint8_t reg, const uint8_t* data, size_t len);
+    int (*i2c_read_reg)(uint8_t addr, uint8_t reg, uint8_t* data, size_t len);
+    int (*ble_enable)(bool enable);
+    int (*ble_scan)(uint32_t duration_ms, BleScanResult* out_results, size_t max_results);
+    int (*ble_advertise)(bool enable, const char* name);
+    int (*icmp_ping)(const char* host, uint16_t count, uint32_t timeout_ms, PingStats* out_stats);
+    size_t (*get_tasks)(TaskInfoEntry* out_tasks, size_t max_tasks, uint32_t* out_total_cpu_permille);
+    void (*rotate_api_token)(char out_token[33]);
+    uint32_t (*uptime_ms)();
+    uint32_t (*free_heap)();
+};
+
+void setHardwareOps(const HardwareOps* ops);
+const HardwareOps* getHardwareOps();
+
+// Maps IANA timezone name (e.g. "America/Toronto", "UTC") or raw POSIX TZ string to POSIX TZ rule
+bool resolvePosixTz(const char* tz_input, char* out_name, size_t name_cap, char* out_posix, size_t posix_cap);
+
 struct SystemState {
     // Kernel & SoC Metadata
     char hostname[32];
-    char root_password[48];
+    uint8_t pass_salt[16];
+    uint8_t pass_hash[32];
+    bool pass_configured;
+    char api_token[33];
+    char login_shell[24];
+
     uint32_t cpu_freq_mhz;
     uint32_t total_sram_bytes;
     uint32_t free_sram_bytes;
@@ -164,10 +335,11 @@ struct SystemState {
     uint8_t cpu_history_idx;
     uint32_t epoch_offset_sec;
     char tz_name[32];
+    char tz_posix[48];
     bool ntp_synced;
     bool ntp_sync_requested;
 
-    // Network & SSH Daemon Status
+    // Network, BLE & SSH Daemon Status
     bool wifi_sta_enabled;
     bool wifi_sta_connected;
     char wifi_cfg_ssid[33];
@@ -179,8 +351,17 @@ struct SystemState {
     int32_t wifi_rssi;
 
     bool wifi_ap_enabled;
+    bool wifi_ap_pinned;
     char wifi_ap_ssid[33];
     char wifi_ap_ip[20];
+
+    bool ble_enabled;
+    bool ble_advertising;
+    char ble_adv_name[24];
+
+    uint8_t i2c_sda;
+    uint8_t i2c_scl;
+    uint32_t i2c_hz;
 
     uint16_t ssh_port;
     uint8_t ssh_active_sessions;
@@ -224,7 +405,7 @@ struct SystemState {
     uint32_t gpio_out_mask;
     uint32_t gpio_in_mask;
     int8_t gpio_cmd_pin;
-    uint8_t gpio_cmd_action;  // 0=none, 1=in, 2=out_low, 3=out_high, 4=pwm
+    uint8_t gpio_cmd_action;
     uint8_t gpio_cmd_val;
 
     // Canvas Custom Draw Overlay (optional user-drawn box/bar from CLI)
@@ -238,8 +419,9 @@ struct SystemState {
     uint8_t led_g;
     uint8_t led_b;
 
-    // Hardware Action Flags (set by shell/menu, consumed by hardware tasks)
+    // Hardware Action & Dirty Flags
     bool ui_dirty;
+    uint8_t dirty_regions;
     bool wifi_reconnect_requested;
     bool wifi_scan_requested;
     bool reboot_requested;
@@ -249,82 +431,34 @@ struct SystemState {
     size_t wifi_scan_count;
     WifiScanEntry wifi_scan[MAX_WIFI_SCAN_RESULTS];
 
-    // Framebuffer Console (/dev/tty0 on physical LCD)
+    // O(1) Ring-Indexed Framebuffer Console (/dev/tty0 on physical LCD)
     char fb_lines[FB_CONSOLE_ROWS][FB_CONSOLE_COLS + 1];
+    size_t fb_head;
     size_t fb_line_count;
 
-    // Kernel Ring Buffer (dmesg)
+    // O(1) Ring-Indexed Kernel Ring Buffer (dmesg)
     char dmesg[DMESG_MAX_LINES][DMESG_LINE_LEN];
+    size_t dmesg_head;
     size_t dmesg_count;
 
-    void initDefaults() {
-        memset(this, 0, sizeof(*this));
-        strncpy(hostname, "c6-linux", sizeof(hostname) - 1);
-        strncpy(root_password, "esp32c6", sizeof(root_password) - 1);
-        cpu_freq_mhz = 160;
-        total_sram_bytes = 327680;
-        free_sram_bytes = 256000;
-        min_free_sram_bytes = 240000;
-        flash_size_mb = 8;
-        rootfs_total_kb = 1536;
-        rootfs_used_kb = 24;
-        sd_mounted = false;
-        sd_total_mb = 0;
-        uptime_sec = 0;
-
-        cpu_temp_deci_c = 385;
-        cpu_load_pct = 8;
-        for (size_t i = 0; i < 32; ++i) {
-            cpu_history[i] = static_cast<uint8_t>(6 + (i % 7));
-        }
-        epoch_offset_sec = 1793518800U;
-        strncpy(tz_name, "UTC", sizeof(tz_name) - 1);
-        ntp_synced = false;
-        ntp_sync_requested = false;
-
-        wifi_sta_enabled = true;
-        wifi_sta_connected = false;
-        strncpy(wifi_ip, "0.0.0.0", sizeof(wifi_ip) - 1);
-        strncpy(wifi_gateway, "0.0.0.0", sizeof(wifi_gateway) - 1);
-        strncpy(wifi_mac, "14:c1:9f:05:7d:10", sizeof(wifi_mac) - 1);
-        wifi_rssi = -100;
-
-        wifi_ap_enabled = true;
-        strncpy(wifi_ap_ssid, "C6-Linux-OS", sizeof(wifi_ap_ssid) - 1);
-        strncpy(wifi_ap_ip, "192.168.4.1", sizeof(wifi_ap_ip) - 1);
-
-        ssh_port = 22;
-        ssh_active_sessions = 0;
-        ssh_total_logins = 0;
-        strncpy(ssh_client_ip, "none", sizeof(ssh_client_ip) - 1);
-        strncpy(ssh_hostkey_fp, "SHA256:Generating...", sizeof(ssh_hostkey_fp) - 1);
-
-        http_port = 80;
-        http_requests = 0;
-        syslog_port = 514;
-        syslog_packets = 0;
-        button_press_count = 0;
-
-        screen_mode = ScreenMode::OS_DASHBOARD;
-        theme = ThemeId::CYBER_CYAN;
-        backlight_pct = 100;
-        landscape_flipped = false;
-        strncpy(headline, "C6-MicroLinux Ready", sizeof(headline) - 1);
-        strncpy(subtitle, "SSH Port 22 | CLI Screen Control", sizeof(subtitle) - 1);
-        strncpy(banner_footer, "Use 'menu' over SSH or /dev/ttyACM0", sizeof(banner_footer) - 1);
-        strncpy(fbi_caption, "C6-MicroLinux RISC-V", sizeof(fbi_caption) - 1);
-
-        gpio_cmd_pin = -1;
-        gpio_cmd_action = 0;
-        gpio_cmd_val = 0;
-
-        led_mode = LedMode::SSH_ACTIVITY;
-        led_r = 0;
-        led_g = 200;
-        led_b = 255;
-
+    void markDirty(uint8_t regions = DIRTY_FULL) {
         ui_dirty = true;
+        dirty_regions |= regions;
     }
+
+    const char* fbLineAt(size_t logical_idx) const {
+        if (logical_idx >= fb_line_count) return "";
+        size_t phys = (fb_head + logical_idx) % FB_CONSOLE_ROWS;
+        return fb_lines[phys];
+    }
+
+    const char* dmesgLineAt(size_t logical_idx) const {
+        if (logical_idx >= dmesg_count) return "";
+        size_t phys = (dmesg_head + logical_idx) % DMESG_MAX_LINES;
+        return dmesg[phys];
+    }
+
+    void initDefaults();
 
     size_t activeCronCount() const {
         size_t count = 0;
@@ -350,26 +484,25 @@ struct SystemState {
             if (*text == '\r') ++text;
             if (*text == '\n') ++text;
 
+            size_t slot = 0;
             if (fb_line_count < FB_CONSOLE_ROWS) {
-                strncpy(fb_lines[fb_line_count], line, FB_CONSOLE_COLS);
-                fb_lines[fb_line_count][FB_CONSOLE_COLS] = '\0';
+                slot = (fb_head + fb_line_count) % FB_CONSOLE_ROWS;
                 ++fb_line_count;
             } else {
-                for (size_t i = 1; i < FB_CONSOLE_ROWS; ++i) {
-                    memcpy(fb_lines[i - 1], fb_lines[i], FB_CONSOLE_COLS + 1);
-                }
-                strncpy(fb_lines[FB_CONSOLE_ROWS - 1], line, FB_CONSOLE_COLS);
-                fb_lines[FB_CONSOLE_ROWS - 1][FB_CONSOLE_COLS] = '\0';
+                slot = fb_head;
+                fb_head = (fb_head + 1) % FB_CONSOLE_ROWS;
             }
+            memcpy(fb_lines[slot], line, len + 1);
             if (len == 0 && *text == '\0') break;
         }
-        ui_dirty = true;
+        markDirty(DIRTY_CONSOLE);
     }
 
     void clearFbConsole() {
         memset(fb_lines, 0, sizeof(fb_lines));
+        fb_head = 0;
         fb_line_count = 0;
-        ui_dirty = true;
+        markDirty(DIRTY_CONSOLE | DIRTY_FULL);
     }
 
     void appendDmesg(uint32_t ms, const char* msg) {
@@ -377,10 +510,8 @@ struct SystemState {
         char formatted[DMESG_LINE_LEN];
         uint32_t sec = ms / 1000U;
         uint32_t rem_ms = ms % 1000U;
-        // Format: [    0.123] msg
         int pos = 0;
         formatted[pos++] = '[';
-        // Pad seconds to 5 chars
         char sec_buf[12];
         int s_idx = 0;
         uint32_t tmp = sec;
@@ -409,19 +540,73 @@ struct SystemState {
         }
         formatted[pos] = '\0';
 
+        size_t slot = 0;
         if (dmesg_count < DMESG_MAX_LINES) {
-            strncpy(dmesg[dmesg_count], formatted, DMESG_LINE_LEN - 1);
-            dmesg[dmesg_count][DMESG_LINE_LEN - 1] = '\0';
+            slot = (dmesg_head + dmesg_count) % DMESG_MAX_LINES;
             ++dmesg_count;
         } else {
-            for (size_t i = 1; i < DMESG_MAX_LINES; ++i) {
-                memcpy(dmesg[i - 1], dmesg[i], DMESG_LINE_LEN);
-            }
-            strncpy(dmesg[DMESG_MAX_LINES - 1], formatted, DMESG_LINE_LEN - 1);
-            dmesg[DMESG_MAX_LINES - 1][DMESG_LINE_LEN - 1] = '\0';
+            slot = dmesg_head;
+            dmesg_head = (dmesg_head + 1) % DMESG_MAX_LINES;
         }
+        memcpy(dmesg[slot], formatted, static_cast<size_t>(pos) + 1);
         appendFbConsoleLine(formatted);
     }
+};
+
+// Compact UI render snapshot so loop() never copies 3.5 KB of dmesg/scan/cron buffers
+struct RenderSnapshot {
+    char hostname[32];
+    uint32_t cpu_freq_mhz;
+    uint32_t total_sram_bytes;
+    uint32_t free_sram_bytes;
+    uint32_t flash_size_mb;
+    uint32_t rootfs_total_kb;
+    uint32_t rootfs_used_kb;
+    bool sd_mounted;
+    uint32_t uptime_sec;
+    int16_t cpu_temp_deci_c;
+    uint8_t cpu_load_pct;
+    uint8_t cpu_history[32];
+    uint8_t cpu_history_idx;
+    bool wifi_sta_connected;
+    char wifi_ssid[33];
+    char wifi_ip[20];
+    int32_t wifi_rssi;
+    bool wifi_ap_enabled;
+    char wifi_ap_ssid[33];
+    char wifi_ap_ip[20];
+    uint8_t ssh_active_sessions;
+    uint32_t ssh_total_logins;
+    char ssh_hostkey_fp[64];
+    uint32_t net_rx_bytes;
+    uint32_t net_tx_bytes;
+    uint32_t button_press_count;
+    uint8_t active_cron_count;
+    ScreenMode screen_mode;
+    ThemeId theme;
+    uint8_t backlight_pct;
+    bool landscape_flipped;
+    char headline[48];
+    char subtitle[64];
+    bool ticker_enabled;
+    char ticker_text[96];
+    uint16_t ticker_offset;
+    bool alert_active;
+    char alert_text[64];
+    uint8_t fbi_pattern;
+    char fbi_caption[48];
+    bool custom_bar_visible;
+    uint8_t custom_bar_pct;
+    char custom_bar_label[32];
+    LedMode led_mode;
+    uint8_t led_r;
+    uint8_t led_g;
+    uint8_t led_b;
+    uint8_t dirty_regions;
+    size_t fb_line_count;
+    char fb_lines[FB_CONSOLE_ROWS][FB_CONSOLE_COLS + 1];
+
+    void captureFrom(const SystemState& s, uint8_t dirty_mask);
 };
 
 }  // namespace c6os
