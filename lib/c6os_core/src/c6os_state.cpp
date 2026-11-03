@@ -209,8 +209,10 @@ void RenderSnapshot::captureFrom(const SystemState& s, uint8_t dirty_mask) {
     uptime_sec = s.uptime_sec;
     cpu_temp_deci_c = s.cpu_temp_deci_c;
     cpu_load_pct = s.cpu_load_pct;
-    memcpy(cpu_history, s.cpu_history, sizeof(cpu_history));
     cpu_history_idx = s.cpu_history_idx;
+    if (s.screen_mode == ScreenMode::MONITOR) {
+        memcpy(cpu_history, s.cpu_history, sizeof(cpu_history));
+    }
     wifi_sta_connected = s.wifi_sta_connected;
     memcpy(wifi_ssid, s.wifi_ssid, sizeof(wifi_ssid));
     memcpy(wifi_ip, s.wifi_ip, sizeof(wifi_ip));
@@ -220,7 +222,9 @@ void RenderSnapshot::captureFrom(const SystemState& s, uint8_t dirty_mask) {
     memcpy(wifi_ap_ip, s.wifi_ap_ip, sizeof(wifi_ap_ip));
     ssh_active_sessions = s.ssh_active_sessions;
     ssh_total_logins = s.ssh_total_logins;
-    memcpy(ssh_hostkey_fp, s.ssh_hostkey_fp, sizeof(ssh_hostkey_fp));
+    if (s.screen_mode == ScreenMode::DIAGNOSTICS) {
+        memcpy(ssh_hostkey_fp, s.ssh_hostkey_fp, sizeof(ssh_hostkey_fp));
+    }
     net_rx_bytes = s.net_rx_bytes;
     net_tx_bytes = s.net_tx_bytes;
     button_press_count = s.button_press_count;
@@ -229,26 +233,38 @@ void RenderSnapshot::captureFrom(const SystemState& s, uint8_t dirty_mask) {
     theme = s.theme;
     backlight_pct = s.backlight_pct;
     landscape_flipped = s.landscape_flipped;
-    memcpy(headline, s.headline, sizeof(headline));
-    memcpy(subtitle, s.subtitle, sizeof(subtitle));
+    if (s.screen_mode == ScreenMode::OS_DASHBOARD || s.screen_mode == ScreenMode::SIGNBOARD) {
+        memcpy(headline, s.headline, sizeof(headline));
+        memcpy(subtitle, s.subtitle, sizeof(subtitle));
+    }
     ticker_enabled = s.ticker_enabled;
-    memcpy(ticker_text, s.ticker_text, sizeof(ticker_text));
+    if (s.ticker_enabled) {
+        memcpy(ticker_text, s.ticker_text, sizeof(ticker_text));
+    }
     ticker_offset = s.ticker_offset;
     alert_active = s.alert_active;
-    memcpy(alert_text, s.alert_text, sizeof(alert_text));
+    if (s.alert_active) {
+        memcpy(alert_text, s.alert_text, sizeof(alert_text));
+    }
     fbi_pattern = s.fbi_pattern;
-    memcpy(fbi_caption, s.fbi_caption, sizeof(fbi_caption));
+    if (s.screen_mode == ScreenMode::IMAGE_VIEW) {
+        memcpy(fbi_caption, s.fbi_caption, sizeof(fbi_caption));
+    }
     custom_bar_visible = s.custom_bar_visible;
     custom_bar_pct = s.custom_bar_pct;
-    memcpy(custom_bar_label, s.custom_bar_label, sizeof(custom_bar_label));
+    if (s.custom_bar_visible) {
+        memcpy(custom_bar_label, s.custom_bar_label, sizeof(custom_bar_label));
+    }
     led_mode = s.led_mode;
     led_r = s.led_r;
     led_g = s.led_g;
     led_b = s.led_b;
     dirty_regions = dirty_mask;
     fb_line_count = s.fb_line_count;
-    for (size_t i = 0; i < fb_line_count && i < FB_CONSOLE_ROWS; ++i) {
-        memcpy(fb_lines[i], s.fbLineAt(i), FB_CONSOLE_COLS + 1);
+    if (s.screen_mode == ScreenMode::FB_CONSOLE) {
+        for (size_t i = 0; i < fb_line_count && i < FB_CONSOLE_ROWS; ++i) {
+            memcpy(fb_lines[i], s.fbLineAt(i), FB_CONSOLE_COLS + 1);
+        }
     }
 }
 

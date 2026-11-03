@@ -41,7 +41,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cppcheck
-          cppcheck --error-exitcode=1 --inline-suppr \
+          cppcheck -j"$(nproc)" --error-exitcode=1 --inline-suppr \
             --suppress=missingIncludeSystem \
             --suppress=unusedFunction \
             --suppress=unmatchedSuppression \
@@ -130,7 +130,7 @@ jobs:
           static_sram = sram_bss + sram_data
           flash_bytes = fw_bin.stat().st_size
 
-          sram_cap = 61440       # 60.0 KB hard ceiling (out of 320 KB total SRAM)
+          sram_cap = 57344       # 56.0 KB hard ceiling (out of 320 KB total SRAM)
           flash_cap = 2673868    # 80.0% of 3,342,336 B app partition
 
           summary = (

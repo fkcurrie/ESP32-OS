@@ -60,15 +60,20 @@ bool parseLoginShellFromPasswd(const char* content, char* out_shell, size_t cap)
 
 }  // namespace
 
-VirtualFs::VirtualFs() : owns_temp_root_(false) {
+VirtualFs::VirtualFs()
+#ifndef ESP_PLATFORM
+    : owns_temp_root_(false), usage_dirty_(true)
+#else
+    : usage_dirty_(true)
+#endif
+{
     memset(rootfs_prefix_, 0, sizeof(rootfs_prefix_));
     memset(sd_prefix_, 0, sizeof(sd_prefix_));
-    memset(temp_base_, 0, sizeof(temp_base_));
-
 #ifdef ESP_PLATFORM
     strncpy(rootfs_prefix_, "/littlefs", sizeof(rootfs_prefix_) - 1);
     strncpy(sd_prefix_, "/sd", sizeof(sd_prefix_) - 1);
 #else
+    memset(temp_base_, 0, sizeof(temp_base_));
     static unsigned int s_instance_id = 0;
     ++s_instance_id;
     snprintf(temp_base_, sizeof(temp_base_), "/tmp/c6os_vfs_%d_%u",
@@ -863,6 +868,7 @@ FILE* VirtualFs::openPosix(const char* abs_path, const char* mode) const {
     if (!resolveRealPath(abs_path, real_path, sizeof(real_path))) return nullptr;
     if (mode && (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+'))) {
         ensureParentDirs(real_path);
+        usage_dirty_ = true;
     }
     return fopen(real_path, mode);
 }
@@ -898,6 +904,7 @@ bool VirtualFs::writeBinary(SystemState& state, const char* abs_path,
     size_t written = (len > 0) ? fwrite(data, 1, len, f) : 0;
     fclose(f);
     if (written != len) return false;
+    usage_dirty_ = true;
     state.fs_sync_requested = true;
     return true;
 }
@@ -906,6 +913,7 @@ bool VirtualFs::removeFile(SystemState& state, const char* abs_path) {
     char real_path[224];
     if (!resolveRealPath(abs_path, real_path, sizeof(real_path))) return false;
     if (unlink(real_path) == 0) {
+        usage_dirty_ = true;
         state.fs_sync_requested = true;
         return true;
     }
@@ -916,14 +924,21 @@ bool VirtualFs::mkdirPath(const char* abs_path) const {
     char real_path[224];
     if (!resolveRealPath(abs_path, real_path, sizeof(real_path))) return false;
     ensureParentDirs(real_path);
-    if (mkdir(real_path, 0755) == 0) return true;
+    if (mkdir(real_path, 0755) == 0) {
+        usage_dirty_ = true;
+        return true;
+    }
     return errno == EEXIST;
 }
 
 bool VirtualFs::rmdirPath(const char* abs_path) const {
     char real_path[224];
     if (!resolveRealPath(abs_path, real_path, sizeof(real_path))) return false;
-    return rmdir(real_path) == 0;
+    if (rmdir(real_path) == 0) {
+        usage_dirty_ = true;
+        return true;
+    }
+    return false;
 }
 
 bool VirtualFs::renamePath(const char* old_abs, const char* new_abs) const {
@@ -933,7 +948,11 @@ bool VirtualFs::renamePath(const char* old_abs, const char* new_abs) const {
     if (!resolveRealPath(new_abs, new_real, sizeof(new_real))) return false;
     ensureParentDirs(new_real);
     unlink(new_real);
-    return rename(old_real, new_real) == 0;
+    if (rename(old_real, new_real) == 0) {
+        usage_dirty_ = true;
+        return true;
+    }
+    return false;
 }
 
 }  // namespace c6os

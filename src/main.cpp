@@ -2,16 +2,18 @@
 #include <LittleFS.h>
 #include <Preferences.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
 #include <Wire.h>
 #include <driver/sdspi_host.h>
 #include <esp_bt.h>
 #include <esp_random.h>
+#include <esp_timer.h>
 #include <esp_vfs_fat.h>
+#include <fcntl.h>
 #include <host/ble_gap.h>
 #include <host/ble_hs.h>
 #include <host/util/util.h>
 #include <lwip/ip_addr.h>
+#include <lwip/sockets.h>
 #include <nimble/nimble_port.h>
 #include <nimble/nimble_port_freertos.h>
 #include <ping/ping_sock.h>
@@ -31,7 +33,7 @@
 
 extern "C" void ble_store_config_init(void);
 
-SET_LOOP_TASK_STACK_SIZE(12 * 1024);
+SET_LOOP_TASK_STACK_SIZE(8 * 1024);
 
 namespace {
 
@@ -43,19 +45,23 @@ c6os::VirtualFs g_vfs;
 c6os::ScreenManager g_screen;
 c6os::SshServer g_sshd(22);
 c6os::ShellSession g_bg_shell;
-c6os::ShellSession g_http_shell;
-WiFiServer g_httpd(80);
-WiFiUDP g_syslog_udp;
+int g_httpd_fd = -1;
+int g_syslog_fd = -1;
 SemaphoreHandle_t g_mutex = nullptr;
 
 bool g_littlefs_mounted = false;
 sdmmc_card_t* g_sd_card = nullptr;
 
 // Button debounce & press timing
+volatile bool g_btn_irq = false;
 bool g_btn_pressed = false;
 uint32_t g_btn_press_start_ms = 0;
 constexpr uint32_t BTN_DEBOUNCE_MS   = 40;
 constexpr uint32_t BTN_LONG_PRESS_MS = 700;
+
+void IRAM_ATTR onBootButtonIsr() {
+    g_btn_irq = true;
+}
 
 uint8_t g_led_phase = 0;
 
@@ -499,16 +505,40 @@ int hwIcmpPing(const char* host, uint16_t count, uint32_t timeout_ms, c6os::Ping
 }
 
 size_t hwGetTasks(c6os::TaskInfoEntry* out_tasks, size_t max_tasks, uint32_t* out_total_cpu_permille) {
+    if (!out_tasks || max_tasks == 0) {
+        // Fast O(1) path for 1 Hz dashboard CPU sampling: avoids heap allocation
+        // and scheduler-wide vTaskSuspendAll() inside uxTaskGetSystemState().
+        uint32_t total_runtime = static_cast<uint32_t>(esp_timer_get_time());
+        uint32_t idle_runtime  = ulTaskGetIdleRunTimeCounter();
+        uint32_t dt_total = total_runtime - g_prev_total_runtime;
+        uint32_t dt_idle  = idle_runtime - g_prev_idle_runtime;
+        if (dt_total > 0) {
+            g_prev_total_runtime = total_runtime;
+            g_prev_idle_runtime  = idle_runtime;
+        }
+        uint32_t active_permille = 10U;
+        if (dt_total > 0 && dt_idle <= dt_total) {
+            active_permille = static_cast<uint32_t>(
+                (static_cast<uint64_t>(dt_total - dt_idle) * 1000ULL) / dt_total);
+        } else if (dt_total > 0) {
+            active_permille = 0U;
+        }
+        if (out_total_cpu_permille) {
+            *out_total_cpu_permille = active_permille;
+        }
+        return static_cast<size_t>(uxTaskGetNumberOfTasks());
+    }
+
     UBaseType_t num = uxTaskGetNumberOfTasks();
     size_t alloc_n = static_cast<size_t>(num) + 4U;
-    TaskStatus_t* sys_tasks = static_cast<TaskStatus_t*>(malloc(alloc_n * sizeof(TaskStatus_t)));
+    c6os::HeapArray<TaskStatus_t> sys_tasks(alloc_n);
     if (!sys_tasks) {
         if (out_total_cpu_permille) *out_total_cpu_permille = 0;
         return 0;
     }
 
     uint32_t total_runtime = 0;
-    UBaseType_t got = uxTaskGetSystemState(sys_tasks, alloc_n, &total_runtime);
+    UBaseType_t got = uxTaskGetSystemState(sys_tasks.get(), alloc_n, &total_runtime);
 
     uint32_t idle_runtime = 0;
     for (UBaseType_t i = 0; i < got; ++i) {
@@ -524,40 +554,38 @@ size_t hwGetTasks(c6os::TaskInfoEntry* out_tasks, size_t max_tasks, uint32_t* ou
         g_prev_idle_runtime = idle_runtime;
     }
 
-    uint32_t active_permille = 30U;
+    uint32_t active_permille = 10U;
     if (dt_total > 0 && dt_idle <= dt_total) {
-        active_permille = static_cast<uint32_t>(((uint64_t)(dt_total - dt_idle) * 1000ULL) / dt_total);
+        active_permille = static_cast<uint32_t>(
+            (static_cast<uint64_t>(dt_total - dt_idle) * 1000ULL) / dt_total);
     }
     if (out_total_cpu_permille) {
         *out_total_cpu_permille = active_permille;
     }
 
     size_t count = 0;
-    if (out_tasks && max_tasks > 0) {
-        uint32_t denom = (total_runtime > 0) ? total_runtime : 1U;
-        for (UBaseType_t i = 0; i < got && count < max_tasks; ++i) {
-            auto& dst = out_tasks[count++];
-            dst.pid = static_cast<uint32_t>(sys_tasks[i].xTaskNumber);
-            strncpy(dst.name, sys_tasks[i].pcTaskName, sizeof(dst.name) - 1);
-            dst.name[sizeof(dst.name) - 1] = '\0';
-            switch (sys_tasks[i].eCurrentState) {
-                case eRunning:
-                case eReady:     dst.state_ch = 'R'; break;
-                case eBlocked:   dst.state_ch = 'S'; break;
-                case eSuspended: dst.state_ch = 'T'; break;
-                case eDeleted:   dst.state_ch = 'Z'; break;
-                default:         dst.state_ch = 'S'; break;
-            }
-            dst.prio = static_cast<int>(sys_tasks[i].uxCurrentPriority);
-            dst.stack_free_bytes =
-                static_cast<uint32_t>(sys_tasks[i].usStackHighWaterMark) * sizeof(StackType_t);
-            dst.cpu_permille =
-                static_cast<uint32_t>(((uint64_t)sys_tasks[i].ulRunTimeCounter * 1000ULL) / denom);
-            dst.runtime_cs = sys_tasks[i].ulRunTimeCounter / 10000U;
+    uint32_t denom = (total_runtime > 0) ? total_runtime : 1U;
+    for (UBaseType_t i = 0; i < got && count < max_tasks; ++i) {
+        auto& dst = out_tasks[count++];
+        dst.pid = static_cast<uint32_t>(sys_tasks[i].xTaskNumber);
+        strncpy(dst.name, sys_tasks[i].pcTaskName, sizeof(dst.name) - 1);
+        dst.name[sizeof(dst.name) - 1] = '\0';
+        switch (sys_tasks[i].eCurrentState) {
+            case eRunning:
+            case eReady:     dst.state_ch = 'R'; break;
+            case eBlocked:   dst.state_ch = 'S'; break;
+            case eSuspended: dst.state_ch = 'T'; break;
+            case eDeleted:   dst.state_ch = 'Z'; break;
+            default:         dst.state_ch = 'S'; break;
         }
+        dst.prio = static_cast<int>(sys_tasks[i].uxCurrentPriority);
+        dst.stack_free_bytes =
+            static_cast<uint32_t>(sys_tasks[i].usStackHighWaterMark) * sizeof(StackType_t);
+        dst.cpu_permille =
+            static_cast<uint32_t>((static_cast<uint64_t>(sys_tasks[i].ulRunTimeCounter) * 1000ULL) / denom);
+        dst.runtime_cs = sys_tasks[i].ulRunTimeCounter / 10000U;
     }
 
-    free(sys_tasks);
     return count;
 }
 
@@ -707,6 +735,7 @@ void initStorage() {
     if (g_littlefs_mounted) {
         g_state.rootfs_total_kb = static_cast<uint32_t>(LittleFS.totalBytes() / 1024ULL);
         g_state.rootfs_used_kb  = static_cast<uint32_t>(LittleFS.usedBytes() / 1024ULL);
+        g_vfs.consumeUsageDirty();
     }
     setenv("TZ", g_state.tz_posix, 1);
     tzset();
@@ -791,7 +820,10 @@ void harvestAsyncWifiScan(int16_t found_count) {
             auto& entry = g_state.wifi_scan[g_state.wifi_scan_count++];
             strncpy(entry.ssid, s.c_str(), sizeof(entry.ssid) - 1);
             entry.ssid[sizeof(entry.ssid) - 1] = '\0';
-            entry.rssi = WiFi.RSSI(i);
+            int32_t r = WiFi.RSSI(i);
+            if (r < -127) r = -127;
+            if (r > 0) r = 0;
+            entry.rssi = static_cast<int8_t>(r);
             entry.channel = static_cast<uint8_t>(WiFi.channel(i));
             entry.open = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
         }
@@ -805,8 +837,94 @@ void harvestAsyncWifiScan(int16_t found_count) {
 }
 
 // ============================================================================
-// Authenticated HTTP Port 80 REST API & UDP 514 Syslog Listener
+// Event-Driven lwIP HTTP Port 80 REST API & UDP 514 Syslog Listener
 // ============================================================================
+
+void initNetworkListeners() {
+    if (g_httpd_fd < 0) {
+        int fd = lwip_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (fd >= 0) {
+            int reuse = 1;
+            lwip_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+            struct sockaddr_in addr = {};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(80);
+            addr.sin_addr.s_addr = htonl(INADDR_ANY);
+            if (lwip_bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0 &&
+                lwip_listen(fd, 2) == 0) {
+                int flags = lwip_fcntl(fd, F_GETFL, 0);
+                lwip_fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+                g_httpd_fd = fd;
+            } else {
+                lwip_close(fd);
+            }
+        }
+    }
+
+    if (g_syslog_fd < 0) {
+        int fd = lwip_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (fd >= 0) {
+            int reuse = 1;
+            lwip_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+            struct sockaddr_in addr = {};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(514);
+            addr.sin_addr.s_addr = htonl(INADDR_ANY);
+            if (lwip_bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0) {
+                int flags = lwip_fcntl(fd, F_GETFL, 0);
+                lwip_fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+                g_syslog_fd = fd;
+            } else {
+                lwip_close(fd);
+            }
+        }
+    }
+}
+
+void waitNetworkSocketsOrTimeout(uint32_t timeout_ms) {
+    if (g_httpd_fd < 0 && g_syslog_fd < 0) {
+        vTaskDelay(pdMS_TO_TICKS(timeout_ms));
+        return;
+    }
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    int max_fd = -1;
+    if (g_httpd_fd >= 0) {
+        FD_SET(g_httpd_fd, &rfds);
+        if (g_httpd_fd > max_fd) max_fd = g_httpd_fd;
+    }
+    if (g_syslog_fd >= 0) {
+        FD_SET(g_syslog_fd, &rfds);
+        if (g_syslog_fd > max_fd) max_fd = g_syslog_fd;
+    }
+    struct timeval tv = {};
+    tv.tv_sec = static_cast<long>(timeout_ms / 1000U);
+    tv.tv_usec = static_cast<long>((timeout_ms % 1000U) * 1000U);
+    lwip_select(max_fd + 1, &rfds, nullptr, nullptr, &tv);
+}
+
+void sendHttpStr(int cfd, const char* text) {
+    if (!text) return;
+    size_t len = strlen(text);
+    size_t sent = 0;
+    uint32_t t0 = millis();
+    while (sent < len && (millis() - t0 < 500U)) {
+        int n = lwip_send(cfd, text + sent, len - sent, 0);
+        if (n > 0) {
+            sent += static_cast<size_t>(n);
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(cfd, &wfds);
+            struct timeval tv = {0, 50000};
+            lwip_select(cfd + 1, nullptr, &wfds, nullptr, &tv);
+            continue;
+        }
+        break;
+    }
+}
 
 void urlDecodeInPlace(char* str) {
     char* src = str;
@@ -856,12 +974,12 @@ void parseQueryParams(const char* query, char* out_cmd, size_t cmd_cap,
 }
 
 void pollHttpAndSyslog() {
-    // 1. Poll UDP 514 Syslog Listener (appendDmesg already writes once to fb_lines)
-    int pkt_size = g_syslog_udp.parsePacket();
-    if (pkt_size > 0) {
-        char sbuf[96];
-        int len = g_syslog_udp.read(sbuf, sizeof(sbuf) - 1);
-        if (len > 0) {
+    // 1. Drain UDP 514 Syslog socket with zero heap allocations
+    if (g_syslog_fd >= 0) {
+        for (int burst = 0; burst < 4; ++burst) {
+            char sbuf[96] = {0};
+            int len = lwip_recvfrom(g_syslog_fd, sbuf, sizeof(sbuf) - 1U, MSG_DONTWAIT, nullptr, nullptr);
+            if (len <= 0) break;
             sbuf[len] = '\0';
             for (int i = 0; i < len; ++i) {
                 if (sbuf[i] == '\r' || sbuf[i] == '\n') sbuf[i] = ' ';
@@ -877,59 +995,104 @@ void pollHttpAndSyslog() {
         }
     }
 
-    // 2. Poll TCP 80 HTTP REST API Server
-    WiFiClient client = g_httpd.accept();
-    if (!client) return;
+    // 2. Poll TCP 80 HTTP REST API socket
+    if (g_httpd_fd < 0) return;
+    struct sockaddr_in peer = {};
+    socklen_t peer_len = sizeof(peer);
+    int cfd = lwip_accept(g_httpd_fd, reinterpret_cast<struct sockaddr*>(&peer), &peer_len);
+    if (cfd < 0) return;
 
+    int nodelay = 1;
+    lwip_setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+    char req_buf[640] = {0};
+    size_t used = 0;
     uint32_t t0 = millis();
-    while (client.connected() && !client.available() && (millis() - t0 < 250U)) {
-        vTaskDelay(pdMS_TO_TICKS(5));
+    while (used + 1U < sizeof(req_buf) && (millis() - t0 < 250U)) {
+        int n = lwip_recv(cfd, req_buf + used, sizeof(req_buf) - 1U - used, MSG_DONTWAIT);
+        if (n > 0) {
+            used += static_cast<size_t>(n);
+            req_buf[used] = '\0';
+            if (strstr(req_buf, "\r\n\r\n") != nullptr || strstr(req_buf, "\n\n") != nullptr) {
+                break;
+            }
+            continue;
+        }
+        if (n == 0) break;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(cfd, &rfds);
+        struct timeval tv = {0, 50000};
+        lwip_select(cfd + 1, &rfds, nullptr, nullptr, &tv);
     }
-    if (!client.available()) {
-        client.stop();
+
+    if (used == 0) {
+        lwip_close(cfd);
         return;
     }
 
-    String req_line = client.readStringUntil('\n');
-    req_line.trim();
+    char* line_end = strpbrk(req_buf, "\r\n");
+    const char* hdr_cursor = nullptr;
+    if (line_end) {
+        hdr_cursor = line_end + 1;
+        if (*line_end == '\r' && *hdr_cursor == '\n') {
+            ++hdr_cursor;
+        }
+        *line_end = '\0';
+    }
 
     char hdr_token[48] = {0};
-    while (client.available()) {
-        String hdr = client.readStringUntil('\n');
-        hdr.trim();
-        if (hdr.length() == 0) break;
-        if (strncasecmp(hdr.c_str(), "Authorization:", 14) == 0) {
-            const char* val = hdr.c_str() + 14;
-            while (*val == ' ' || *val == '\t') ++val;
-            if (strncasecmp(val, "Bearer ", 7) == 0) {
+    while (hdr_cursor && *hdr_cursor) {
+        const char* next_eol = strpbrk(hdr_cursor, "\r\n");
+        size_t hlen = next_eol ? static_cast<size_t>(next_eol - hdr_cursor) : strlen(hdr_cursor);
+        if (hlen == 0) break;
+        if (hlen > 14U && strncasecmp(hdr_cursor, "Authorization:", 14) == 0) {
+            const char* val = hdr_cursor + 14;
+            const char* vend = hdr_cursor + hlen;
+            while (val < vend && (*val == ' ' || *val == '\t')) ++val;
+            if (static_cast<size_t>(vend - val) > 7U && strncasecmp(val, "Bearer ", 7) == 0) {
                 val += 7;
-                while (*val == ' ') ++val;
-                strncpy(hdr_token, val, sizeof(hdr_token) - 1);
-                hdr_token[sizeof(hdr_token) - 1] = '\0';
+                while (val < vend && *val == ' ') ++val;
+                while (vend > val && (vend[-1] == ' ' || vend[-1] == '\t')) --vend;
+                size_t tlen = static_cast<size_t>(vend - val);
+                if (tlen >= sizeof(hdr_token)) tlen = sizeof(hdr_token) - 1U;
+                memcpy(hdr_token, val, tlen);
+                hdr_token[tlen] = '\0';
             }
+        }
+        if (!next_eol) break;
+        hdr_cursor = next_eol + 1;
+        if (*next_eol == '\r' && *hdr_cursor == '\n') {
+            ++hdr_cursor;
         }
     }
 
-    if (req_line.startsWith("GET /api/status")) {
+    if (strncmp(req_buf, "GET /api/status", 15) == 0 &&
+        (req_buf[15] == ' ' || req_buf[15] == '?' || req_buf[15] == '\0')) {
         c6os::HeapArray<char> json(1024);
         if (json) {
+            json[0] = '\0';
             if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                 g_state.http_requests++;
                 c6os::ShellSession::formatStatusJson(g_state, json.get(), json.bytes());
                 xSemaphoreGive(g_mutex);
             }
-            client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n");
-            client.print(json.get());
+            sendHttpStr(cfd, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n");
+            sendHttpStr(cfd, json.get());
         }
-    } else if (req_line.startsWith("GET /api/cmd")) {
-        int sp2 = req_line.indexOf(' ', 4);
-        String uri = (sp2 > 4) ? req_line.substring(4, sp2) : req_line.substring(4);
-        int qmark = uri.indexOf('?');
+    } else if (strncmp(req_buf, "GET /api/cmd", 12) == 0 &&
+               (req_buf[12] == ' ' || req_buf[12] == '?' || req_buf[12] == '/' || req_buf[12] == '\0')) {
+        char* uri = req_buf + 4;
+        char* sp2 = strchr(uri, ' ');
+        if (sp2) *sp2 = '\0';
+        const char* qmark = strchr(uri, '?');
 
         char cmd_buf[192] = {0};
         char query_token[48] = {0};
-        if (qmark >= 0) {
-            parseQueryParams(uri.c_str() + qmark + 1, cmd_buf, sizeof(cmd_buf),
+        if (qmark) {
+            parseQueryParams(qmark + 1, cmd_buf, sizeof(cmd_buf),
                              query_token, sizeof(query_token));
         }
 
@@ -946,47 +1109,50 @@ void pollHttpAndSyslog() {
                            c6os::crypto::constantTimeEqual(candidate_tok, expected_tok, 32));
 
         if (!authorized) {
-            client.print("HTTP/1.1 401 Unauthorized\r\n"
-                         "WWW-Authenticate: Bearer realm=\"c6os\"\r\n"
-                         "Content-Type: application/json\r\n"
-                         "Connection: close\r\n\r\n"
-                         "{\"error\":\"unauthorized\",\"hint\":\"run 'apitoken' over SSH\"}\n");
-            client.stop();
+            sendHttpStr(cfd,
+                        "HTTP/1.1 401 Unauthorized\r\n"
+                        "WWW-Authenticate: Bearer realm=\"c6os\"\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"error\":\"unauthorized\",\"hint\":\"run 'apitoken' over SSH\"}\n");
+            lwip_close(cfd);
             return;
         }
 
         if (cmd_buf[0] == '\0') {
-            client.print("HTTP/1.1 400 Bad Request\r\n"
-                         "Content-Type: application/json\r\n"
-                         "Connection: close\r\n\r\n"
-                         "{\"error\":\"missing_command_param_c_or_q\"}\n");
-            client.stop();
+            sendHttpStr(cfd,
+                        "HTTP/1.1 400 Bad Request\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"error\":\"missing_command_param_c_or_q\"}\n");
+            lwip_close(cfd);
             return;
         }
 
-        char* out = static_cast<char*>(malloc(2048));
+        c6os::HeapArray<char> out(2048);
         if (out) {
             out[0] = '\0';
             if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(300)) == pdTRUE) {
-                g_http_shell.executeCommandLine(g_state, g_vfs, cmd_buf, out, 2048);
+                g_bg_shell.executeCommandLine(g_state, g_vfs, cmd_buf, out.get(), out.bytes());
                 xSemaphoreGive(g_mutex);
             }
-            client.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n");
-            client.print(out);
-            free(out);
+            sendHttpStr(cfd,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n");
+            sendHttpStr(cfd, out.get());
         }
     } else {
         if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             g_state.http_requests++;
             xSemaphoreGive(g_mutex);
         }
-        client.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"
-                     "C6-MicroLinux HTTP REST API (port 80)\n"
-                     "Endpoints:\n"
-                     "  GET /api/status  (read-only telemetry JSON)\n"
-                     "  GET /api/cmd?c=<url-encoded-command>  (requires Authorization: Bearer <token>)\n");
+        sendHttpStr(cfd,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"
+                    "C6-MicroLinux HTTP REST API (port 80)\n"
+                    "Endpoints:\n"
+                    "  GET /api/status  (read-only telemetry JSON)\n"
+                    "  GET /api/cmd?c=<url-encoded-command>  (requires Authorization: Bearer <token>)\n");
     }
-    client.stop();
+    lwip_close(cfd);
 }
 
 void networkTask(void* param) {
@@ -994,6 +1160,7 @@ void networkTask(void* param) {
     bool scan_in_progress = false;
     uint32_t lost_since_ms = 0;
     uint32_t last_rssi_poll_ms = 0;
+    int8_t active_wifi_ps = -1;  // -1 = unknown, 0 = WIFI_PS_NONE, 1 = WIFI_PS_MIN_MODEM
 
     while (true) {
         bool do_reconnect = false;
@@ -1001,6 +1168,8 @@ void networkTask(void* param) {
         bool do_sync = false;
         bool do_reboot = false;
         bool do_ntp = false;
+        bool ap_enabled = false;
+        uint8_t ssh_sessions = 0;
         char tz_posix[48] = {0};
 
         if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -1024,7 +1193,11 @@ void networkTask(void* param) {
                 do_ntp = true;
                 g_state.ntp_sync_requested = false;
             }
-            strncpy(tz_posix, g_state.tz_posix, sizeof(tz_posix) - 1);
+            ap_enabled = g_state.wifi_ap_enabled;
+            ssh_sessions = g_state.ssh_active_sessions;
+            if (do_ntp || g_wifi_got_ip_evt) {
+                strncpy(tz_posix, g_state.tz_posix, sizeof(tz_posix) - 1);
+            }
             xSemaphoreGive(g_mutex);
         }
 
@@ -1036,6 +1209,7 @@ void networkTask(void* param) {
             ESP.restart();
         }
         if (do_reconnect) {
+            active_wifi_ps = -1;
             applyWifiConfig();
         }
         if (do_scan && !scan_in_progress) {
@@ -1060,6 +1234,7 @@ void networkTask(void* param) {
         if (g_wifi_got_ip_evt) {
             g_wifi_got_ip_evt = false;
             lost_since_ms = 0;
+            active_wifi_ps = -1;
 
             String ip = WiFi.localIP().toString();
             String gw = WiFi.gatewayIP().toString();
@@ -1073,6 +1248,9 @@ void networkTask(void* param) {
                 strncpy(g_state.wifi_gateway, gw.c_str(), sizeof(g_state.wifi_gateway) - 1);
                 strncpy(g_state.wifi_ssid, ssid.c_str(), sizeof(g_state.wifi_ssid) - 1);
                 g_state.wifi_rssi = rssi;
+                if (tz_posix[0] == '\0') {
+                    strncpy(tz_posix, g_state.tz_posix, sizeof(tz_posix) - 1);
+                }
 
                 char msg[96];
                 snprintf(msg, sizeof(msg), "wlan0: Bound to %s (SSID: %s)",
@@ -1081,6 +1259,7 @@ void networkTask(void* param) {
 
                 if (g_state.wifi_ap_enabled && !g_state.wifi_ap_pinned) {
                     g_state.wifi_ap_enabled = false;
+                    ap_enabled = false;
                     disable_ap_now = true;
                     g_state.appendDmesg(millis(), "wlan0: Auto-disabled SoftAP on LAN join");
                 }
@@ -1099,6 +1278,7 @@ void networkTask(void* param) {
             g_wifi_lost_evt = false;
             if (WiFi.status() != WL_CONNECTED) {
                 lost_since_ms = millis();
+                active_wifi_ps = -1;
                 if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                     if (g_state.wifi_sta_connected) {
                         g_state.wifi_sta_connected = false;
@@ -1120,11 +1300,13 @@ void networkTask(void* param) {
             if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                 if (!g_state.wifi_ap_enabled) {
                     g_state.wifi_ap_enabled = true;
+                    ap_enabled = true;
                     need_ap = true;
                 }
                 xSemaphoreGive(g_mutex);
             }
             if (need_ap) {
+                active_wifi_ps = -1;
                 applyWifiConfig();
             }
         }
@@ -1132,6 +1314,17 @@ void networkTask(void* param) {
         if (do_ntp && WiFi.status() == WL_CONNECTED) {
             configTzTime(tz_posix[0] ? tz_posix : "EST5EDT,M3.2.0,M11.1.0",
                          "pool.ntp.org", "time.nist.gov");
+        }
+
+        // Dynamic Wi-Fi modem sleep: disable sleep for zero keystroke latency while
+        // SSH/SFTP or SoftAP is active; enable MIN_MODEM sleep when idle on STA.
+        if (WiFi.status() == WL_CONNECTED) {
+            bool want_modem_sleep = (!ap_enabled && ssh_sessions == 0 && !scan_in_progress);
+            int8_t target_ps = want_modem_sleep ? 1 : 0;
+            if (target_ps != active_wifi_ps) {
+                WiFi.setSleep(want_modem_sleep ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE);
+                active_wifi_ps = target_ps;
+            }
         }
 
         // Refresh RSSI & NTP epoch once every 2 seconds while connected
@@ -1151,34 +1344,40 @@ void networkTask(void* param) {
         }
 
         pollHttpAndSyslog();
-        vTaskDelay(pdMS_TO_TICKS(50));
+        waitNetworkSocketsOrTimeout(scan_in_progress ? 80U : 250U);
     }
 }
 
 void sshdTask(void* param) {
     (void)param;
     while (true) {
+        // pollAcceptAndServe blocks up to 1000 ms in lwip_select() when idle
         g_sshd.pollAcceptAndServe(g_state, g_vfs, g_mutex);
-        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
 void serialConsoleTask(void* param) {
     (void)param;
     c6os::ShellSession serial_shell;
-    char* out_buf = static_cast<char*>(malloc(4096));
-    if (!out_buf) {
-        vTaskDelete(nullptr);
-        return;
-    }
 
     vTaskDelay(pdMS_TO_TICKS(500));
-    if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-        serial_shell.begin(g_state, g_vfs, /*start_in_menu=*/false, out_buf, 4096);
-        xSemaphoreGive(g_mutex);
+    {
+        c6os::HeapArray<char> boot_buf(4096);
+        if (boot_buf) {
+            boot_buf[0] = '\0';
+            if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+                serial_shell.begin(g_state, g_vfs, /*start_in_menu=*/false,
+                                   boot_buf.get(), boot_buf.bytes());
+                xSemaphoreGive(g_mutex);
+            }
+            if (boot_buf[0] != '\0') {
+                Serial.print(boot_buf.get());
+            }
+        }
     }
-    Serial.print(out_buf);
+
     uint32_t last_mon_tick = millis();
+    uint32_t last_rx_ms = 0;
 
     while (true) {
         int avail = Serial.available();
@@ -1189,58 +1388,78 @@ void serialConsoleTask(void* param) {
                                  : sizeof(rx);
             size_t got = Serial.readBytes(rx, to_read);
             if (got > 0) {
-                last_mon_tick = millis();
-                out_buf[0] = '\0';
-                bool keep = true;
-                if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-                    keep = serial_shell.consumeBytes(g_state, g_vfs, rx, got, out_buf, 4096);
-                    if (!keep) {
-                        serial_shell.begin(g_state, g_vfs, /*start_in_menu=*/false, out_buf, 4096);
+                uint32_t now = millis();
+                last_mon_tick = now;
+                last_rx_ms = now;
+                c6os::HeapArray<char> out_buf(4096);
+                if (out_buf) {
+                    out_buf[0] = '\0';
+                    if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+                        bool keep = serial_shell.consumeBytes(g_state, g_vfs, rx, got,
+                                                              out_buf.get(), out_buf.bytes());
+                        if (!keep) {
+                            serial_shell.begin(g_state, g_vfs, /*start_in_menu=*/false,
+                                               out_buf.get(), out_buf.bytes());
+                        }
+                        xSemaphoreGive(g_mutex);
                     }
-                    xSemaphoreGive(g_mutex);
-                }
-                if (out_buf[0] != '\0') {
-                    Serial.print(out_buf);
+                    if (out_buf[0] != '\0') {
+                        Serial.print(out_buf.get());
+                    }
                 }
             }
         } else if (serial_shell.isInteractiveMonitor()) {
             uint32_t now = millis();
             if (now - last_mon_tick >= serial_shell.monitorIntervalMs()) {
                 last_mon_tick = now;
-                out_buf[0] = '\0';
-                if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    serial_shell.renderMonitorTick(g_state, g_vfs, out_buf, 4096);
-                    xSemaphoreGive(g_mutex);
-                }
-                if (out_buf[0] != '\0') {
-                    Serial.print(out_buf);
+                c6os::HeapArray<char> out_buf(4096);
+                if (out_buf) {
+                    out_buf[0] = '\0';
+                    if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                        serial_shell.renderMonitorTick(g_state, g_vfs,
+                                                       out_buf.get(), out_buf.bytes());
+                        xSemaphoreGive(g_mutex);
+                    }
+                    if (out_buf[0] != '\0') {
+                        Serial.print(out_buf.get());
+                    }
                 }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(15));
+
+        uint32_t sleep_ms = (serial_shell.isInteractiveMonitor() ||
+                             (last_rx_ms != 0 && (millis() - last_rx_ms < 5000U)))
+                                ? 15U
+                                : 50U;
+        vTaskDelay(pdMS_TO_TICKS(sleep_ms));
     }
 }
 
 void updateRgbLed(const c6os::RenderSnapshot& snap) {
+    static uint32_t s_last_rgb = 0xFFFFFFFFU;
     ++g_led_phase;
+
+    uint8_t r = 0;
+    uint8_t g = 0;
+    uint8_t b = 0;
+
     switch (snap.led_mode) {
         case c6os::LedMode::OFF:
-            rgbLedWrite(board::PIN_RGB_LED, 0, 0, 0);
             break;
         case c6os::LedMode::SOLID:
-            rgbLedWrite(board::PIN_RGB_LED, snap.led_r, snap.led_g, snap.led_b);
+            r = snap.led_r;
+            g = snap.led_g;
+            b = snap.led_b;
             break;
         case c6os::LedMode::PULSE: {
             uint8_t level = (g_led_phase < 128) ? (g_led_phase * 2) : ((255 - g_led_phase) * 2);
-            uint8_t r = static_cast<uint8_t>((static_cast<uint16_t>(snap.led_r) * level) / 255U);
-            uint8_t g = static_cast<uint8_t>((static_cast<uint16_t>(snap.led_g) * level) / 255U);
-            uint8_t b = static_cast<uint8_t>((static_cast<uint16_t>(snap.led_b) * level) / 255U);
-            rgbLedWrite(board::PIN_RGB_LED, r, g, b);
+            r = static_cast<uint8_t>((static_cast<uint16_t>(snap.led_r) * level) / 255U);
+            g = static_cast<uint8_t>((static_cast<uint16_t>(snap.led_g) * level) / 255U);
+            b = static_cast<uint8_t>((static_cast<uint16_t>(snap.led_b) * level) / 255U);
             break;
         }
         case c6os::LedMode::RAINBOW: {
             uint8_t p = g_led_phase;
-            uint8_t r = 0, g = 0, b = 0;
             if (p < 85) {
                 r = static_cast<uint8_t>(255 - p * 3);
                 g = static_cast<uint8_t>(p * 3);
@@ -1253,23 +1472,40 @@ void updateRgbLed(const c6os::RenderSnapshot& snap) {
                 b = static_cast<uint8_t>(255 - p * 3);
                 r = static_cast<uint8_t>(p * 3);
             }
-            rgbLedWrite(board::PIN_RGB_LED, r / 4, g / 4, b / 4);
+            r /= 4U;
+            g /= 4U;
+            b /= 4U;
             break;
         }
         case c6os::LedMode::SSH_ACTIVITY:
         default: {
             if (snap.ssh_active_sessions > 0) {
-                rgbLedWrite(board::PIN_RGB_LED, 0, 64, 16);
+                g = 64;
+                b = 16;
             } else {
                 uint8_t level = (g_led_phase < 128) ? (g_led_phase / 4) : ((255 - g_led_phase) / 4);
-                rgbLedWrite(board::PIN_RGB_LED, 0, level / 2, level);
+                g = level / 2;
+                b = level;
             }
             break;
         }
     }
+
+    uint32_t packed = (static_cast<uint32_t>(r) << 16) |
+                      (static_cast<uint32_t>(g) << 8) |
+                      static_cast<uint32_t>(b);
+    if (packed != s_last_rgb) {
+        s_last_rgb = packed;
+        rgbLedWrite(board::PIN_RGB_LED, r, g, b);
+    }
 }
 
 void pollBootButton() {
+    if (!g_btn_irq && !g_btn_pressed) {
+        return;
+    }
+    g_btn_irq = false;
+
     bool is_down = (digitalRead(board::PIN_BTN_BOOT) == LOW);
     uint32_t now = millis();
 
@@ -1335,6 +1571,7 @@ void setup() {
     pinMode(board::PIN_SD_CS, OUTPUT);
     digitalWrite(board::PIN_SD_CS, HIGH);
     pinMode(board::PIN_BTN_BOOT, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(board::PIN_BTN_BOOT), onBootButtonIsr, CHANGE);
     rgbLedWrite(board::PIN_RGB_LED, 0, 16, 32);
 
     g_mutex = xSemaphoreCreateMutex();
@@ -1365,8 +1602,7 @@ void setup() {
     g_screen.renderState(g_state, false);
 
     g_sshd.begin(g_state, g_mutex);
-    g_httpd.begin();
-    g_syslog_udp.begin(514);
+    initNetworkListeners();
     g_state.appendDmesg(millis(), "httpd: Bearer-gated REST API on 0.0.0.0:80");
     g_state.appendDmesg(millis(), "syslogd: UDP listener ready on 0.0.0.0:514");
     g_state.appendDmesg(millis(), "init: Executing /etc/rc.local & starting services");
@@ -1385,8 +1621,8 @@ void setup() {
     g_state.ui_dirty = false;
     g_state.dirty_regions = c6os::DIRTY_NONE;
 
-    xTaskCreate(networkTask, "net_mgr", 6144, nullptr, 1, nullptr);
-    xTaskCreate(sshdTask, "sshd", 10240, nullptr, 2, nullptr);
+    xTaskCreate(networkTask, "net_mgr", 5120, nullptr, 1, nullptr);
+    xTaskCreate(sshdTask, "sshd", 3072, nullptr, 2, nullptr);
     xTaskCreate(serialConsoleTask, "ttyACM0", 6144, nullptr, 1, nullptr);
 }
 
@@ -1394,8 +1630,8 @@ void loop() {
     static uint32_t last_sec_tick = 0;
     static uint32_t last_led_tick = 0;
     static uint32_t last_ticker_tick = 0;
-    static c6os::RenderSnapshot render_snap = {};
-    static bool snap_initialized = false;
+
+    c6os::RenderSnapshot& render_snap = g_screen.snapshot();
 
     pollBootButton();
 
@@ -1422,7 +1658,7 @@ void loop() {
             g_state.uptime_sec = now / 1000U;
             g_state.free_sram_bytes = ESP.getFreeHeap();
             g_state.min_free_sram_bytes = ESP.getMinFreeHeap();
-            if (g_littlefs_mounted) {
+            if (g_littlefs_mounted && g_vfs.consumeUsageDirty()) {
                 g_state.rootfs_used_kb = static_cast<uint32_t>(LittleFS.usedBytes() / 1024ULL);
             }
             if (raw_deci_c > -200 && raw_deci_c < 1200) {
@@ -1464,13 +1700,12 @@ void loop() {
 
     bool should_render = false;
     if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(30)) == pdTRUE) {
-        if (g_state.ui_dirty || !snap_initialized) {
+        if (g_state.ui_dirty) {
             uint8_t dmask = g_state.dirty_regions ? g_state.dirty_regions : c6os::DIRTY_FULL;
             render_snap.captureFrom(g_state, dmask);
             g_state.ui_dirty = false;
             g_state.dirty_regions = c6os::DIRTY_NONE;
-            should_render = snap_initialized ? true : false;
-            snap_initialized = true;
+            should_render = true;
         } else {
             render_snap.ssh_active_sessions = g_state.ssh_active_sessions;
             render_snap.led_mode = g_state.led_mode;
@@ -1490,5 +1725,8 @@ void loop() {
         updateRgbLed(render_snap);
     }
 
-    delay(15);
+    bool fast_poll = g_btn_pressed ||
+                     render_snap.led_mode == c6os::LedMode::PULSE ||
+                     render_snap.led_mode == c6os::LedMode::RAINBOW;
+    delay(fast_poll ? 20 : 30);
 }

@@ -126,9 +126,20 @@ public:
         return be_ ? static_cast<uint16_t>((c >> 8) | (c << 8)) : c;
     }
 
+    bool overlapsY(int16_t y, int16_t h) const {
+        return (y + h > y0_) && (y < y1_);
+    }
+
+    int16_t y0() const { return y0_; }
+    int16_t y1() const { return y1_; }
+
     void clear(uint16_t color) {
         const uint16_t px = encode(color);
         const size_t total = static_cast<size_t>(FB_WIDTH) * static_cast<size_t>(strip_h_);
+        if (px == 0x0000) {
+            memset(buf_, 0, total * sizeof(uint16_t));
+            return;
+        }
         for (size_t i = 0; i < total; ++i) {
             buf_[i] = px;
         }
@@ -143,10 +154,15 @@ public:
         if (rx0 >= rx1 || ry0 >= ry1) return;
 
         const uint16_t px = encode(color);
+        const size_t span = static_cast<size_t>(rx1 - rx0);
         for (int16_t py = ry0; py < ry1; ++py) {
             uint16_t* row = buf_ + static_cast<size_t>(py - y0_) * FB_WIDTH;
-            for (int16_t px_x = rx0; px_x < rx1; ++px_x) {
-                row[px_x] = px;
+            if (px == 0x0000) {
+                memset(row + rx0, 0, span * sizeof(uint16_t));
+            } else {
+                for (int16_t px_x = rx0; px_x < rx1; ++px_x) {
+                    row[px_x] = px;
+                }
             }
         }
     }
@@ -249,96 +265,116 @@ private:
 };
 
 void renderDashboard(StripCanvas& c, const RenderSnapshot& s, const ThemePalette& pal) {
-    c.fillRect(0, 0, FB_WIDTH, 22, pal.bg);
-    c.fillRect(0, 21, FB_WIDTH, 1, pal.border);
+    if (c.overlapsY(0, 22)) {
+        c.fillRect(0, 0, FB_WIDTH, 22, pal.bg);
+        c.fillRect(0, 21, FB_WIDTH, 1, pal.border);
 
-    char hdr_left[48];
-    snprintf(hdr_left, sizeof(hdr_left), "root@%s", s.hostname);
-    c.drawStringScaled(4, 3, hdr_left, pal.accent, pal.bg, 1, 2, 22);
+        char hdr_left[48];
+        snprintf(hdr_left, sizeof(hdr_left), "root@%s", s.hostname);
+        c.drawStringScaled(4, 3, hdr_left, pal.accent, pal.bg, 1, 2, 22);
 
-    char hdr_right[32];
-    if (s.wifi_sta_connected) {
-        snprintf(hdr_right, sizeof(hdr_right), "WLAN %ddBm", static_cast<int>(s.wifi_rssi));
-        c.drawStringScaled(224, 3, hdr_right, pal.ok, pal.bg, 1, 2, 15);
-    } else if (s.wifi_ap_enabled) {
-        snprintf(hdr_right, sizeof(hdr_right), "AP:%s", s.wifi_ap_ip);
-        c.drawStringScaled(224, 3, hdr_right, pal.warn, pal.bg, 1, 2, 15);
-    } else {
-        c.drawStringScaled(224, 3, "WLAN DOWN", pal.alert, pal.bg, 1, 2, 15);
+        char hdr_right[32];
+        if (s.wifi_sta_connected) {
+            snprintf(hdr_right, sizeof(hdr_right), "WLAN %ddBm", static_cast<int>(s.wifi_rssi));
+            c.drawStringScaled(224, 3, hdr_right, pal.ok, pal.bg, 1, 2, 15);
+        } else if (s.wifi_ap_enabled) {
+            snprintf(hdr_right, sizeof(hdr_right), "AP:%s", s.wifi_ap_ip);
+            c.drawStringScaled(224, 3, hdr_right, pal.warn, pal.bg, 1, 2, 15);
+        } else {
+            c.drawStringScaled(224, 3, "WLAN DOWN", pal.alert, pal.bg, 1, 2, 15);
+        }
     }
 
-    c.drawCard(2, 25, 316, 52, pal.bg, pal.border);
-    char ssh_cmd[48];
-    const char* active_ip = s.wifi_sta_connected ? s.wifi_ip : s.wifi_ap_ip;
-    snprintf(ssh_cmd, sizeof(ssh_cmd), "ssh root@%s", active_ip);
-    c.drawStringScaled(8, 30, ssh_cmd, pal.accent, pal.bg, 1, 2, 26);
+    if (c.overlapsY(25, 52)) {
+        c.drawCard(2, 25, 316, 52, pal.bg, pal.border);
+        if (c.overlapsY(30, 16)) {
+            char ssh_cmd[48];
+            const char* active_ip = s.wifi_sta_connected ? s.wifi_ip : s.wifi_ap_ip;
+            snprintf(ssh_cmd, sizeof(ssh_cmd), "ssh root@%s", active_ip);
+            c.drawStringScaled(8, 30, ssh_cmd, pal.accent, pal.bg, 1, 2, 26);
 
-    if (s.ssh_active_sessions > 0) {
-        c.drawStringScaled(242, 30, "[SSH LIVE]", pal.ok, pal.bg, 1, 2, 11);
-    } else {
-        c.drawStringScaled(242, 30, "[PORT :22]", pal.muted, pal.bg, 1, 2, 11);
+            if (s.ssh_active_sessions > 0) {
+                c.drawStringScaled(242, 30, "[SSH LIVE]", pal.ok, pal.bg, 1, 2, 11);
+            } else {
+                c.drawStringScaled(242, 30, "[PORT :22]", pal.muted, pal.bg, 1, 2, 11);
+            }
+        }
+        if (c.overlapsY(56, 8)) {
+            char net_sub[80];
+            if (s.wifi_sta_connected) {
+                snprintf(net_sub, sizeof(net_sub), "SSID: %-16.16s  AP: %-3s  Logins: %u",
+                         s.wifi_ssid, s.wifi_ap_enabled ? "ON" : "OFF",
+                         static_cast<unsigned>(s.ssh_total_logins));
+            } else {
+                snprintf(net_sub, sizeof(net_sub), "Join AP '%s' or USB /dev/ttyACM0 ('menu')",
+                         s.wifi_ap_ssid);
+            }
+            c.drawString(8, 56, net_sub, pal.fg, pal.bg, 1, 50);
+        }
     }
 
-    char net_sub[80];
-    if (s.wifi_sta_connected) {
-        snprintf(net_sub, sizeof(net_sub), "SSID: %-16.16s  AP: %-3s  Logins: %u",
-                 s.wifi_ssid, s.wifi_ap_enabled ? "ON" : "OFF",
-                 static_cast<unsigned>(s.ssh_total_logins));
-    } else {
-        snprintf(net_sub, sizeof(net_sub), "Join AP '%s' or USB /dev/ttyACM0 ('menu')",
-                 s.wifi_ap_ssid);
+    if (c.overlapsY(80, 41)) {
+        c.drawCard(2, 80, 316, 41, pal.bg, pal.border);
+        unsigned total_kb = static_cast<unsigned>(s.total_sram_bytes / 1024U);
+        unsigned free_kb  = static_cast<unsigned>(s.free_sram_bytes / 1024U);
+        unsigned used_kb  = (total_kb > free_kb) ? (total_kb - free_kb) : 0U;
+        uint8_t ram_pct   = (total_kb > 0) ? static_cast<uint8_t>((used_kb * 100U) / total_kb) : 0U;
+
+        if (c.overlapsY(86, 8)) {
+            char ram_line[80];
+            unsigned hrs  = static_cast<unsigned>(s.uptime_sec / 3600U);
+            unsigned mins = static_cast<unsigned>((s.uptime_sec % 3600U) / 60U);
+            unsigned secs = static_cast<unsigned>(s.uptime_sec % 60U);
+            int temp_int  = static_cast<int>(s.cpu_temp_deci_c / 10);
+            int temp_frac = abs(static_cast<int>(s.cpu_temp_deci_c % 10));
+            snprintf(ram_line, sizeof(ram_line), "SRAM:%u/%uK(%u%%) %d.%dC BL:%u%% UP %02u:%02u:%02u",
+                     free_kb, total_kb, static_cast<unsigned>(100U - ram_pct),
+                     temp_int, temp_frac,
+                     static_cast<unsigned>(s.backlight_pct), hrs, mins, secs);
+            c.drawString(8, 86, ram_line, pal.fg, pal.bg, 1, 50);
+        }
+        c.drawProgressBar(8, 100, 304, 14, ram_pct, pal.accent, pal.bg);
     }
-    c.drawString(8, 56, net_sub, pal.fg, pal.bg, 1, 50);
 
-    c.drawCard(2, 80, 316, 41, pal.bg, pal.border);
-    unsigned total_kb = static_cast<unsigned>(s.total_sram_bytes / 1024U);
-    unsigned free_kb  = static_cast<unsigned>(s.free_sram_bytes / 1024U);
-    unsigned used_kb  = (total_kb > free_kb) ? (total_kb - free_kb) : 0U;
-    uint8_t ram_pct   = (total_kb > 0) ? static_cast<uint8_t>((used_kb * 100U) / total_kb) : 0U;
-
-    char ram_line[80];
-    unsigned hrs  = static_cast<unsigned>(s.uptime_sec / 3600U);
-    unsigned mins = static_cast<unsigned>((s.uptime_sec % 3600U) / 60U);
-    unsigned secs = static_cast<unsigned>(s.uptime_sec % 60U);
-    int temp_int  = static_cast<int>(s.cpu_temp_deci_c / 10);
-    int temp_frac = abs(static_cast<int>(s.cpu_temp_deci_c % 10));
-    snprintf(ram_line, sizeof(ram_line), "SRAM:%u/%uK(%u%%) %d.%dC BL:%u%% UP %02u:%02u:%02u",
-             free_kb, total_kb, static_cast<unsigned>(100U - ram_pct),
-             temp_int, temp_frac,
-             static_cast<unsigned>(s.backlight_pct), hrs, mins, secs);
-    c.drawString(8, 86, ram_line, pal.fg, pal.bg, 1, 50);
-    c.drawProgressBar(8, 100, 304, 14, ram_pct, pal.accent, pal.bg);
-
-    c.drawCard(2, 124, 316, 46, pal.bg, pal.accent);
-    if (s.custom_bar_visible) {
-        c.drawString(8, 130, s.custom_bar_label, pal.accent, pal.bg, 1, 50);
-        c.drawProgressBar(8, 144, 304, 18, s.custom_bar_pct, pal.ok, pal.bg);
-    } else {
-        c.drawStringScaled(8, 129, s.headline, pal.fg, pal.bg, 1, 2, 50);
-        c.drawString(8, 152, s.subtitle, pal.accent, pal.bg, 1, 50);
+    if (c.overlapsY(124, 46)) {
+        c.drawCard(2, 124, 316, 46, pal.bg, pal.accent);
+        if (s.custom_bar_visible) {
+            c.drawString(8, 130, s.custom_bar_label, pal.accent, pal.bg, 1, 50);
+            c.drawProgressBar(8, 144, 304, 18, s.custom_bar_pct, pal.ok, pal.bg);
+        } else {
+            c.drawStringScaled(8, 129, s.headline, pal.fg, pal.bg, 1, 2, 50);
+            c.drawString(8, 152, s.subtitle, pal.accent, pal.bg, 1, 50);
+        }
     }
 }
 
 void renderFbConsole(StripCanvas& c, const RenderSnapshot& s, const ThemePalette& pal) {
-    c.fillRect(0, 0, FB_WIDTH, 14, pal.accent);
-    char top_bar[80];
-    const char* ip = s.wifi_sta_connected ? s.wifi_ip : s.wifi_ap_ip;
-    snprintf(top_bar, sizeof(top_bar), " /dev/tty0 | root@%s | %s ", s.hostname, ip);
-    c.drawString(2, 3, top_bar, pal.bg, pal.accent, 1, 52);
-
-    for (size_t i = 0; i < FB_CONSOLE_ROWS; ++i) {
-        int16_t y = static_cast<int16_t>(17 + i * 8);
-        const char* line = (i < s.fb_line_count) ? s.fb_lines[i] : "";
-        uint16_t line_color = pal.fg;
-        if (line[0] == '[') {
-            line_color = pal.ok;
-        } else if (strncmp(line, "root@", 5) == 0 || strncmp(line, "tty0>", 5) == 0) {
-            line_color = pal.accent;
-        }
-        c.drawString(4, y, line, line_color, pal.bg, 1, FB_CONSOLE_COLS);
+    if (c.overlapsY(0, 14)) {
+        c.fillRect(0, 0, FB_WIDTH, 14, pal.accent);
+        char top_bar[80];
+        const char* ip = s.wifi_sta_connected ? s.wifi_ip : s.wifi_ap_ip;
+        snprintf(top_bar, sizeof(top_bar), " /dev/tty0 | root@%s | %s ", s.hostname, ip);
+        c.drawString(2, 3, top_bar, pal.bg, pal.accent, 1, 52);
     }
 
-    c.drawString(4, 162, "root@c6-linux:/dev/tty0# _", pal.accent, pal.bg, 1, 52);
+    if (c.overlapsY(17, static_cast<int16_t>(FB_CONSOLE_ROWS * 8))) {
+        for (size_t i = 0; i < FB_CONSOLE_ROWS; ++i) {
+            int16_t y = static_cast<int16_t>(17 + i * 8);
+            if (!c.overlapsY(y, 8)) continue;
+            const char* line = (i < s.fb_line_count) ? s.fb_lines[i] : "";
+            uint16_t line_color = pal.fg;
+            if (line[0] == '[') {
+                line_color = pal.ok;
+            } else if (strncmp(line, "root@", 5) == 0 || strncmp(line, "tty0>", 5) == 0) {
+                line_color = pal.accent;
+            }
+            c.drawString(4, y, line, line_color, pal.bg, 1, FB_CONSOLE_COLS);
+        }
+    }
+
+    if (c.overlapsY(162, 8)) {
+        c.drawString(4, 162, "root@c6-linux:/dev/tty0# _", pal.accent, pal.bg, 1, 52);
+    }
 }
 
 void renderSignboard(StripCanvas& c, const RenderSnapshot& s, const ThemePalette& pal) {
@@ -408,73 +444,94 @@ void renderDiagnostics(StripCanvas& c, const RenderSnapshot& s, const ThemePalet
 }
 
 void renderMonitor(StripCanvas& c, const RenderSnapshot& s, const ThemePalette& pal) {
-    c.fillRect(0, 0, FB_WIDTH, 16, pal.accent);
-    char hdr[58];
     int t_int = static_cast<int>(s.cpu_temp_deci_c / 10);
     int t_frc = abs(static_cast<int>(s.cpu_temp_deci_c % 10));
-    snprintf(hdr, sizeof(hdr), " HTOP TELEMETRY | CPU:%2u%% | %d.%dC | %ddBm ",
-             static_cast<unsigned>(s.cpu_load_pct), t_int, t_frc,
-             static_cast<int>(s.wifi_rssi));
-    c.drawString(2, 4, hdr, pal.bg, pal.accent, 1, 52);
 
-    c.drawCard(2, 19, 156, 64, pal.bg, pal.border);
-    c.drawString(6, 23, "CPU Load Sparkline", pal.accent, pal.bg, 1, 24);
-    for (int i = 0; i < 32; ++i) {
-        size_t idx = (s.cpu_history_idx + i) % 32;
-        uint8_t val = s.cpu_history[idx];
-        if (val > 100) val = 100;
-        int16_t bar_h = static_cast<int16_t>((val * 44) / 100);
-        if (bar_h < 2) bar_h = 2;
-        int16_t bx = static_cast<int16_t>(6 + i * 4);
-        int16_t by = static_cast<int16_t>(78 - bar_h);
-        c.fillRect(bx, 34, 3, 44 - bar_h, pal.bg);
-        uint16_t col = (val > 75) ? pal.warn : pal.ok;
-        c.fillRect(bx, by, 3, bar_h, col);
+    if (c.overlapsY(0, 16)) {
+        c.fillRect(0, 0, FB_WIDTH, 16, pal.accent);
+        char hdr[58];
+        snprintf(hdr, sizeof(hdr), " HTOP TELEMETRY | CPU:%2u%% | %d.%dC | %ddBm ",
+                 static_cast<unsigned>(s.cpu_load_pct), t_int, t_frc,
+                 static_cast<int>(s.wifi_rssi));
+        c.drawString(2, 4, hdr, pal.bg, pal.accent, 1, 52);
     }
 
-    c.drawCard(162, 19, 156, 64, pal.bg, pal.border);
-    unsigned tot_kb = static_cast<unsigned>(s.total_sram_bytes / 1024U);
-    unsigned fre_kb = static_cast<unsigned>(s.free_sram_bytes / 1024U);
-    unsigned usd_kb = (tot_kb > fre_kb) ? (tot_kb - fre_kb) : 0U;
-    uint8_t ram_pct = (tot_kb > 0) ? static_cast<uint8_t>((usd_kb * 100U) / tot_kb) : 0U;
+    if (c.overlapsY(19, 64)) {
+        c.drawCard(2, 19, 156, 64, pal.bg, pal.border);
+        c.drawString(6, 23, "CPU Load Sparkline", pal.accent, pal.bg, 1, 24);
+        if (c.overlapsY(34, 44)) {
+            for (int i = 0; i < 32; ++i) {
+                size_t idx = (s.cpu_history_idx + i) % 32;
+                uint8_t val = s.cpu_history[idx];
+                if (val > 100) val = 100;
+                int16_t bar_h = static_cast<int16_t>((val * 44) / 100);
+                if (bar_h < 2) bar_h = 2;
+                int16_t bx = static_cast<int16_t>(6 + i * 4);
+                int16_t by = static_cast<int16_t>(78 - bar_h);
+                c.fillRect(bx, 34, 3, 44 - bar_h, pal.bg);
+                uint16_t col = (val > 75) ? pal.warn : pal.ok;
+                c.fillRect(bx, by, 3, bar_h, col);
+            }
+        }
 
-    char mline[32];
-    snprintf(mline, sizeof(mline), "MEM: %u/%uK (%u%%)", usd_kb, tot_kb, ram_pct);
-    c.drawString(166, 23, mline, pal.fg, pal.bg, 1, 24);
-    c.drawProgressBar(166, 33, 146, 10, ram_pct, pal.accent, pal.bg);
+        c.drawCard(162, 19, 156, 64, pal.bg, pal.border);
+        unsigned tot_kb = static_cast<unsigned>(s.total_sram_bytes / 1024U);
+        unsigned fre_kb = static_cast<unsigned>(s.free_sram_bytes / 1024U);
+        unsigned usd_kb = (tot_kb > fre_kb) ? (tot_kb - fre_kb) : 0U;
+        uint8_t ram_pct = (tot_kb > 0) ? static_cast<uint8_t>((usd_kb * 100U) / tot_kb) : 0U;
 
-    uint8_t thm_pct = (t_int > 20) ? static_cast<uint8_t>((t_int - 20) * 100 / 65) : 5;
-    if (thm_pct > 100) thm_pct = 100;
-    snprintf(mline, sizeof(mline), "DIE: %d.%d C (BTN:%u)", t_int, t_frc,
-             static_cast<unsigned>(s.button_press_count));
-    c.drawString(166, 47, mline, pal.fg, pal.bg, 1, 24);
-    c.drawProgressBar(166, 57, 146, 10, thm_pct, (t_int >= 65) ? pal.warn : pal.ok, pal.bg);
+        char mline[32];
+        if (c.overlapsY(23, 8)) {
+            snprintf(mline, sizeof(mline), "MEM: %u/%uK (%u%%)", usd_kb, tot_kb, ram_pct);
+            c.drawString(166, 23, mline, pal.fg, pal.bg, 1, 24);
+        }
+        c.drawProgressBar(166, 33, 146, 10, ram_pct, pal.accent, pal.bg);
 
-    snprintf(mline, sizeof(mline), "NET: RX %uK TX %uK",
-             static_cast<unsigned>(s.net_rx_bytes / 1024U),
-             static_cast<unsigned>(s.net_tx_bytes / 1024U));
-    c.drawString(166, 71, mline, pal.muted, pal.bg, 1, 24);
+        uint8_t thm_pct = (t_int > 20) ? static_cast<uint8_t>((t_int - 20) * 100 / 65) : 5;
+        if (thm_pct > 100) thm_pct = 100;
+        if (c.overlapsY(47, 8)) {
+            snprintf(mline, sizeof(mline), "DIE: %d.%d C (BTN:%u)", t_int, t_frc,
+                     static_cast<unsigned>(s.button_press_count));
+            c.drawString(166, 47, mline, pal.fg, pal.bg, 1, 24);
+        }
+        c.drawProgressBar(166, 57, 146, 10, thm_pct, (t_int >= 65) ? pal.warn : pal.ok, pal.bg);
 
-    c.drawCard(2, 86, 316, 84, pal.bg, pal.border);
-    c.drawString(6, 90, "PID USER  S  CPU%  MEM%  COMMAND", pal.accent, pal.bg, 1, 50);
-    c.fillRect(4, 99, 312, 1, pal.border);
+        if (c.overlapsY(71, 8)) {
+            snprintf(mline, sizeof(mline), "NET: RX %uK TX %uK",
+                     static_cast<unsigned>(s.net_rx_bytes / 1024U),
+                     static_cast<unsigned>(s.net_tx_bytes / 1024U));
+            c.drawString(166, 71, mline, pal.muted, pal.bg, 1, 24);
+        }
+    }
 
-    char pline[56];
-    c.drawString(6, 103, "  1 root  S   0.2   1.1  /sbin/init", pal.fg, pal.bg, 1, 50);
-    c.drawString(6, 114, " 18 root  S   0.4   2.0  [st7789_dma]", pal.ok, pal.bg, 1, 50);
-    snprintf(pline, sizeof(pline), " 29 root  S   %u.2   8.4  /usr/sbin/sshd (%u act)",
-             static_cast<unsigned>(s.ssh_active_sessions > 0 ? 3 : 0),
-             static_cast<unsigned>(s.ssh_active_sessions));
-    c.drawString(6, 125, pline, pal.fg, pal.bg, 1, 50);
-    c.drawString(6, 136, " 45 root  S   0.2   1.8  httpd:80 + syslogd:514", pal.fg, pal.bg, 1, 50);
-    snprintf(pline, sizeof(pline), " 61 root  R   %u.5   3.2  /bin/c6-htop --lcd",
-             static_cast<unsigned>(s.cpu_load_pct / 3));
-    c.drawString(6, 147, pline, pal.accent, pal.bg, 1, 50);
-    snprintf(pline, sizeof(pline), "UP: %us | Cron: %u | IP: %s",
-             static_cast<unsigned>(s.uptime_sec),
-             static_cast<unsigned>(s.active_cron_count),
-             s.wifi_sta_connected ? s.wifi_ip : s.wifi_ap_ip);
-    c.drawString(6, 158, pline, pal.muted, pal.bg, 1, 50);
+    if (c.overlapsY(86, 84)) {
+        c.drawCard(2, 86, 316, 84, pal.bg, pal.border);
+        c.drawString(6, 90, "PID USER  S  CPU%  MEM%  COMMAND", pal.accent, pal.bg, 1, 50);
+        c.fillRect(4, 99, 312, 1, pal.border);
+
+        char pline[56];
+        c.drawString(6, 103, "  1 root  S   0.2   1.1  /sbin/init", pal.fg, pal.bg, 1, 50);
+        c.drawString(6, 114, " 18 root  S   0.4   1.0  [st7789_dma]", pal.ok, pal.bg, 1, 50);
+        if (c.overlapsY(125, 8)) {
+            snprintf(pline, sizeof(pline), " 29 root  S   %u.1   5.6  /usr/sbin/sshd (%u act)",
+                     static_cast<unsigned>(s.ssh_active_sessions > 0 ? 1 : 0),
+                     static_cast<unsigned>(s.ssh_active_sessions));
+            c.drawString(6, 125, pline, pal.fg, pal.bg, 1, 50);
+        }
+        c.drawString(6, 136, " 45 root  S   0.1   1.5  httpd:80 + syslogd:514", pal.fg, pal.bg, 1, 50);
+        if (c.overlapsY(147, 8)) {
+            snprintf(pline, sizeof(pline), " 61 root  R   %u.2   2.5  /bin/c6-htop --lcd",
+                     static_cast<unsigned>(s.cpu_load_pct / 3));
+            c.drawString(6, 147, pline, pal.accent, pal.bg, 1, 50);
+        }
+        if (c.overlapsY(158, 8)) {
+            snprintf(pline, sizeof(pline), "UP: %us | Cron: %u | IP: %s",
+                     static_cast<unsigned>(s.uptime_sec),
+                     static_cast<unsigned>(s.active_cron_count),
+                     s.wifi_sta_connected ? s.wifi_ip : s.wifi_ap_ip);
+            c.drawString(6, 158, pline, pal.muted, pal.bg, 1, 50);
+        }
+    }
 }
 
 void renderImageView(StripCanvas& c, const RenderSnapshot& s, const ThemePalette& pal) {
@@ -542,7 +599,7 @@ void renderImageView(StripCanvas& c, const RenderSnapshot& s, const ThemePalette
 }
 
 void renderOverlays(StripCanvas& c, const RenderSnapshot& s, const ThemePalette& pal) {
-    if (s.ticker_enabled && s.ticker_text[0] != '\0') {
+    if (s.ticker_enabled && s.ticker_text[0] != '\0' && c.overlapsY(153, 19)) {
         c.fillRect(0, 153, FB_WIDTH, 1, pal.accent);
         c.fillRect(0, 154, FB_WIDTH, 18, pal.bg);
 
@@ -558,7 +615,7 @@ void renderOverlays(StripCanvas& c, const RenderSnapshot& s, const ThemePalette&
         c.drawStringScaled(4, 156, window, pal.warn, pal.bg, 1, 2, 52);
     }
 
-    if (s.alert_active && s.alert_text[0] != '\0') {
+    if (s.alert_active && s.alert_text[0] != '\0' && c.overlapsY(44, 80)) {
         bool invert = ((s.uptime_sec % 2U) == 1U);
         uint16_t box_bg = invert ? COL_AMBER : COL_RED;
         uint16_t box_fg = invert ? COL_BLACK : COL_WHITE;
