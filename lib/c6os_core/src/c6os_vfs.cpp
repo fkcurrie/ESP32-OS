@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,12 +32,9 @@ void removeTreeRecursive(const char* dir_path) {
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
         char child[512];
         snprintf(child, sizeof(child), "%s/%s", dir_path, ent->d_name);
-        struct stat st;
-        if (stat(child, &st) == 0 && S_ISDIR(st.st_mode)) {
+        if (unlink(child) != 0) {
             removeTreeRecursive(child);
             rmdir(child);
-        } else {
-            unlink(child);
         }
     }
     closedir(d);
@@ -174,14 +172,15 @@ void VirtualFs::initDefaultFiles(SystemState& state) {
     auto ensureFile = [this](const char* abs_path, const char* content) {
         char real_path[224];
         if (!resolveRealPath(abs_path, real_path, sizeof(real_path))) return;
-        struct stat st;
-        if (stat(real_path, &st) == 0) return;  // Preserve persisted user edits
         ensureParentDirs(real_path);
-        FILE* f = fopen(real_path, "wb");
-        if (f) {
+        int fd = open(real_path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (fd >= 0) {
             size_t len = strlen(content);
-            if (len > 0) fwrite(content, 1, len, f);
-            fclose(f);
+            if (len > 0) {
+                ssize_t written = write(fd, content, len);
+                (void)written;
+            }
+            close(fd);
         }
     };
 
@@ -913,9 +912,8 @@ bool VirtualFs::mkdirPath(const char* abs_path) const {
     char real_path[224];
     if (!resolveRealPath(abs_path, real_path, sizeof(real_path))) return false;
     ensureParentDirs(real_path);
-    struct stat st;
-    if (stat(real_path, &st) == 0 && S_ISDIR(st.st_mode)) return true;
-    return mkdir(real_path, 0755) == 0;
+    if (mkdir(real_path, 0755) == 0) return true;
+    return errno == EEXIST;
 }
 
 bool VirtualFs::rmdirPath(const char* abs_path) const {

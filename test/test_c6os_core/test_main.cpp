@@ -696,9 +696,9 @@ void test_scanline_fbgrab_bmp_ppm_tz_chsh_apitoken_and_reserved_pins(void) {
     TEST_ASSERT_EQUAL_UINT32(32, strlen(state.api_token));
     TEST_ASSERT_TRUE(strcmp(state.api_token, "00000000000000000000000000000000") != 0);
 
-    char passwd_buf[128];
-    TEST_ASSERT_TRUE(vfs.readFile(state, "/etc/passwd", passwd_buf, sizeof(passwd_buf)));
-    TEST_ASSERT_NOT_NULL(strstr(passwd_buf, "/bin/c6-sh"));
+    char login_shell_entry[128];
+    TEST_ASSERT_TRUE(vfs.readFile(state, "/etc/passwd", login_shell_entry, sizeof(login_shell_entry)));
+    TEST_ASSERT_NOT_NULL(strstr(login_shell_entry, "/bin/c6-sh"));
 
     // 3. Reserved board pins (SD_CS=4, WS2812=8, BOOT=9) are protected from write, while GPIO 23 is writable
     out[0] = '\0';
