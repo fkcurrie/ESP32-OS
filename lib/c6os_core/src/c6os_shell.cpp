@@ -2152,7 +2152,7 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         }
     } else if (strcmp(prog, "lua") == 0 || strcmp(prog, "/bin/lua") == 0) {
         if (argc >= 3 && strcmp(argv[1], "-e") == 0) {
-            const char* sub_argv[16];
+            const char* sub_argv[16] = {nullptr};
             int sub_argc = 0;
             sub_argv[sub_argc++] = "lua";
             for (size_t i = 3; i < argc && sub_argc < 16; ++i) {
@@ -2162,7 +2162,7 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         } else if (argc >= 2) {
             char norm[VFS_MAX_PATH_LEN];
             VirtualFs::normalizePath(cwd_, argv[1], norm, sizeof(norm));
-            const char* sub_argv[16];
+            const char* sub_argv[16] = {nullptr};
             int sub_argc = 0;
             for (size_t i = 1; i < argc && sub_argc < 16; ++i) {
                 sub_argv[sub_argc++] = argv[i];
@@ -2177,7 +2177,7 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         } else {
             char norm[VFS_MAX_PATH_LEN];
             VirtualFs::normalizePath(cwd_, argv[1], norm, sizeof(norm));
-            const char* sub_argv[16];
+            const char* sub_argv[16] = {nullptr};
             int sub_argc = 0;
             for (size_t i = 1; i < argc && sub_argc < 16; ++i) {
                 sub_argv[sub_argc++] = argv[i];
@@ -2632,7 +2632,7 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
             if (exec_depth_ >= MAX_EXEC_DEPTH) {
                 out.putStr("c6-sh: max execution depth (4) exceeded\r\n");
             } else {
-                const char* sub_argv[16];
+                const char* sub_argv[16] = {nullptr};
                 int sub_argc = 0;
                 for (size_t i = 0; i < argc && sub_argc < 16; ++i) {
                     sub_argv[sub_argc++] = argv[i];
