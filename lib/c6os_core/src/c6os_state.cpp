@@ -119,8 +119,9 @@ void SystemState::initDefaults() {
     crypto::hashPassword("esp32c6", pass_salt, pass_hash);
     pass_configured = true;
 
-    strncpy(api_token, "0123456789abcdef0123456789abcdef", sizeof(api_token) - 1);
-    strncpy(login_shell, "/bin/c6-menu", sizeof(login_shell) - 1);
+    memset(api_token, '0', 32);
+    api_token[32] = '\0';
+    snprintf(login_shell, sizeof(login_shell), "%s", "/bin/c6-menu");
 
     cpu_freq_mhz = 160;
     total_sram_bytes = 327680;

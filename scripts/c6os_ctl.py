@@ -79,7 +79,7 @@ def enter_menu_mode(ser: serial.Serial) -> str:
 
 def run_shell_command(ser: serial.Serial, cmd: str, wait_s: float = 0.35, return_to_menu: bool = True) -> str:
     enter_shell_mode(ser)
-    ser.write(f"{cmd}\r".encode("utf-8"))
+    ser.write(f"{cmd}\r".encode())
     ser.flush()
 
     deadline = time.time() + wait_s
@@ -156,7 +156,7 @@ def cmd_wifi(port: str, ssid: str, password: str) -> int:
                     if data.get("wifi_connected") and data.get("ip") != "0.0.0.0":
                         ip = data["ip"]
                         print(f"[+] Connected! IPv4: {ip} (RSSI: {data.get('rssi')} dBm)")
-                        print(f"[+] You can now SSH into the board:")
+                        print("[+] You can now SSH into the board:")
                         print(f"    ssh root@{ip}   (password: esp32c6, or use your SSH key)")
                         enter_menu_mode(ser)
                         return 0

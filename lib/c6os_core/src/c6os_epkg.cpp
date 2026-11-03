@@ -236,7 +236,7 @@ bool listPackages(const VirtualFs& vfs, BufWriter& out) {
         const char* dot = strstr(entries[i].name, ".manifest");
         if (!dot) continue;
         char full[128];
-        snprintf(full, sizeof(full), "/var/pkg/%s", entries[i].name);
+        snprintf(full, sizeof(full), "/var/pkg/%.96s", entries[i].name);
         char content[512];
         if (!vfs.readFile(dummy, full, content, sizeof(content))) continue;
 

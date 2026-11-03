@@ -10,7 +10,7 @@
 
 `C6-MicroLinux` turns a single-core RISC-V microcontroller into a live, network-accessible Linux-style node. Operators connect over 2.4 GHz Wi-Fi via `ssh root@<ip>` or attach over USB-Serial on `/dev/ttyACM0`. From there, they control the `320x172` IPS display, onboard `WS2812` LED, BLE 5.0 radio, and general-purpose pins.
 
-At boot, `main.cpp` mounts `LittleFS` for `/etc`, `/root`, and `/opt/bin`, and mounts any FAT32 microSD card on `SPI2_HOST`. Static SRAM dropped from `64,928 B` to `54,684 B`, saving `10,244 B` after replacing `libsodium` with `mbedTLS` and scanline DMA. All user runtimes (`SFTP v3`, `Lua 5.4`, `RV32IMAC` ELF VM, and `NimBLE 5.0`) use `0 B` of idle heap until called.
+At boot, `main.cpp` mounts `LittleFS` for `/etc`, `/root`, and `/apps`, and mounts any FAT32 microSD card on `SPI2_HOST`. Static SRAM dropped from `64,928 B` to `54,684 B`, saving `10,244 B` after replacing `libsodium` with `mbedTLS` and scanline DMA. All user runtimes (`SFTP v3`, `Lua 5.4`, `RV32IMAC` ELF VM, and `NimBLE 5.0`) use `0 B` of idle heap until called.
 
 | Subsystem | Implementation & Measured Bounds |
 | :--- | :--- |
@@ -48,11 +48,11 @@ Public-key logins check client signatures against `/etc/ssh/authorized_keys` on 
 
 ## 3. Packaging & Running User Apps (`epkg`, Lua 5.4, RISC-V ELF)
 
-Developers can ship tools to `/opt/bin` without rebuilding the kernel firmware. Build `.epkg` archives on your workstation with `scripts/mkepkg.py`, transfer them over `sftp`, and install them with `epkg`. Each package stores a SHA-256 payload digest verified before install.
+Developers can ship tools to `/apps` without rebuilding the kernel firmware. Build `.epkg` archives on your workstation with `scripts/mkepkg.py`, transfer them over `sftp`, and install them with `epkg`. Each package stores a SHA-256 payload digest verified before install.
 
 ```bash
 # Pack a Lua 5.4 app on your host machine
-python3 scripts/mkepkg.py -n blink -v 1.0.0 -a lua -e blink.lua -o blink.epkg
+python3 scripts/mkepkg.py -n blink -v 1.0.0 -a noarch -f blink.lua:/apps/blink.lua:0755 -o blink.epkg
 
 # Upload via SFTP and install on the ESP32-C6
 ssh root@<BOARD_IP> "epkg install /root/blink.epkg && epkg list && blink"

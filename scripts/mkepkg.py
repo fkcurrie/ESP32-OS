@@ -6,7 +6,6 @@ import hashlib
 import pathlib
 import struct
 
-
 MAGIC = b"EPK1"
 FORMAT_VER = 1
 ABI_VER = 1
@@ -54,11 +53,11 @@ def build_epkg(
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Package RV32IMAC ELF binaries, Lua scripts, or shell scripts into an .epkg archive")
-    ap.add_argument("--name", required=True)
-    ap.add_argument("--version", default="0.1.0")
-    ap.add_argument("--arch", default="rv32imac", help="rv32imac, riscv32, or noarch")
-    ap.add_argument("--description", default="C6-MicroLinux installable package")
-    ap.add_argument("--file", action="append", required=True,
+    ap.add_argument("-n", "--name", required=True)
+    ap.add_argument("-v", "--version", default="0.1.0")
+    ap.add_argument("-a", "--arch", default="rv32imac", help="rv32imac, riscv32, or noarch")
+    ap.add_argument("-d", "--description", default="C6-MicroLinux installable package")
+    ap.add_argument("-f", "--file", action="append", required=True,
                     help="Mapping in format <local_src_path>:<target_c6os_vpath>[:octal_mode]")
     ap.add_argument("-o", "--output", required=True)
     args = ap.parse_args()

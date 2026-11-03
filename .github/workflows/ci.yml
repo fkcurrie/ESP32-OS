@@ -1,0 +1,153 @@
+name: C6-MicroLinux CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-secrets:
+    name: Lint & Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python lint (Ruff) & mkepkg smoke check
+        run: |
+          python -m pip install --upgrade pip ruff
+          ruff check --select E9,F,I,UP,B scripts/
+          echo "print('ci ok')" > /tmp/ci_smoke.lua
+          python scripts/mkepkg.py -n ci_smoke -v 1.0.0 -a noarch -f /tmp/ci_smoke.lua:/apps/ci_smoke.lua:0755 -o /tmp/ci_smoke.epkg
+          test -s /tmp/ci_smoke.epkg
+
+      - name: C/C++ static analysis (cppcheck)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cppcheck
+          cppcheck --error-exitcode=1 --inline-suppr \
+            --suppress=missingIncludeSystem \
+            --suppress=unusedFunction \
+            --suppress=unmatchedSuppression \
+            --std=c++17 \
+            -Iinclude -Ilib/c6os_core/include \
+            src include lib/c6os_core
+
+      - name: Secret & credential scan (Gitleaks)
+        run: |
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz -o /tmp/gitleaks.tar.gz
+          echo "5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          /tmp/gitleaks git --no-banner --redact -v
+
+  host-tests-asan:
+    name: Host Unit Tests (ASan + UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Cache PlatformIO native packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-native-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: python -m pip install --upgrade pip platformio
+
+      - name: Run native unit tests with AddressSanitizer & UBSan
+        env:
+          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          pio test -e native -v
+          pio test -e native_asan -v
+
+  firmware-esp32c6:
+    name: ESP32-C6 Firmware & Memory Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Cache PlatformIO ESP32-C6 toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-esp32c6-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: python -m pip install --upgrade pip platformio
+
+      - name: Build Waveshare ESP32-C6-LCD-1.47 QIO firmware
+        run: pio run -e waveshare_esp32c6_lcd_147
+
+      - name: Enforce static SRAM & Flash partition ceilings
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, subprocess
+
+          elf = pathlib.Path(".pio/build/waveshare_esp32c6_lcd_147/firmware.elf")
+          fw_bin = pathlib.Path(".pio/build/waveshare_esp32c6_lcd_147/firmware.bin")
+          assert elf.is_file() and fw_bin.is_file(), "Missing firmware build outputs"
+
+          size_out = subprocess.check_output(["size", "-A", str(elf)], text=True)
+          sections = {}
+          for line in size_out.splitlines():
+              parts = line.split()
+              if len(parts) >= 2 and parts[0].startswith(".") and parts[1].isdigit():
+                  sections[parts[0]] = int(parts[1])
+
+          sram_bss = sum(v for k, v in sections.items() if "bss" in k)
+          sram_data = sum(v for k, v in sections.items() if k in (".dram0.data", ".data"))
+          static_sram = sram_bss + sram_data
+          flash_bytes = fw_bin.stat().st_size
+
+          sram_cap = 61440       # 60.0 KB hard ceiling (out of 320 KB total SRAM)
+          flash_cap = 2673868    # 80.0% of 3,342,336 B app partition
+
+          summary = (
+              "### ESP32-C6 Firmware Memory Gate\n\n"
+              "| Metric | Measured | Ceiling | Utilization |\n"
+              "| :--- | ---: | ---: | ---: |\n"
+              f"| Static SRAM (`.dram0.data` + `.dram0.bss`) | `{static_sram:,} B` | `{sram_cap:,} B` | `{static_sram / 327680 * 100:.1f}%` of 320 KB |\n"
+              f"| Firmware Image (`firmware.bin`) | `{flash_bytes:,} B` | `{flash_cap:,} B` | `{flash_bytes / 3342336 * 100:.1f}%` of 3.19 MB slot |\n"
+          )
+          print(summary)
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_file:
+              with open(summary_file, "a", encoding="utf-8") as fh:
+                  fh.write(summary + "\n")
+
+          assert static_sram <= sram_cap, f"Static SRAM {static_sram} B exceeds {sram_cap} B ceiling"
+          assert flash_bytes <= flash_cap, f"Firmware image {flash_bytes} B exceeds {flash_cap} B ceiling"
+          PY

@@ -362,9 +362,9 @@ bool SftpSession::dispatchPacket(const uint8_t* pkt, size_t len) {
         h.mem_data = mem_data;
         h.mem_len = mem_len;
 
-        char hid[8];
+        char hid[16];
         snprintf(hid, sizeof(hid), "%04d", slot);
-        uint8_t resp[16];
+        uint8_t resp[28];
         resp[0] = SSH_FXP_HANDLE;
         putU32(resp + 1, req_id);
         size_t n = putStr(resp + 5, hid);
@@ -474,9 +474,9 @@ bool SftpSession::dispatchPacket(const uint8_t* pkt, size_t len) {
         h.dir_count = count;
         h.dir_idx = 0;
 
-        char hid[8];
+        char hid[16];
         snprintf(hid, sizeof(hid), "%04d", slot);
-        uint8_t resp[16];
+        uint8_t resp[28];
         resp[0] = SSH_FXP_HANDLE;
         putU32(resp + 1, req_id);
         size_t n = putStr(resp + 5, hid);

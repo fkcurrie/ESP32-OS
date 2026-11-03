@@ -252,11 +252,11 @@ void renderDashboard(StripCanvas& c, const RenderSnapshot& s, const ThemePalette
     c.fillRect(0, 0, FB_WIDTH, 22, pal.bg);
     c.fillRect(0, 21, FB_WIDTH, 1, pal.border);
 
-    char hdr_left[36];
+    char hdr_left[48];
     snprintf(hdr_left, sizeof(hdr_left), "root@%s", s.hostname);
     c.drawStringScaled(4, 3, hdr_left, pal.accent, pal.bg, 1, 2, 22);
 
-    char hdr_right[28];
+    char hdr_right[32];
     if (s.wifi_sta_connected) {
         snprintf(hdr_right, sizeof(hdr_right), "WLAN %ddBm", static_cast<int>(s.wifi_rssi));
         c.drawStringScaled(224, 3, hdr_right, pal.ok, pal.bg, 1, 2, 15);
@@ -279,7 +279,7 @@ void renderDashboard(StripCanvas& c, const RenderSnapshot& s, const ThemePalette
         c.drawStringScaled(242, 30, "[PORT :22]", pal.muted, pal.bg, 1, 2, 11);
     }
 
-    char net_sub[58];
+    char net_sub[80];
     if (s.wifi_sta_connected) {
         snprintf(net_sub, sizeof(net_sub), "SSID: %-16.16s  AP: %-3s  Logins: %u",
                  s.wifi_ssid, s.wifi_ap_enabled ? "ON" : "OFF",
@@ -296,7 +296,7 @@ void renderDashboard(StripCanvas& c, const RenderSnapshot& s, const ThemePalette
     unsigned used_kb  = (total_kb > free_kb) ? (total_kb - free_kb) : 0U;
     uint8_t ram_pct   = (total_kb > 0) ? static_cast<uint8_t>((used_kb * 100U) / total_kb) : 0U;
 
-    char ram_line[58];
+    char ram_line[80];
     unsigned hrs  = static_cast<unsigned>(s.uptime_sec / 3600U);
     unsigned mins = static_cast<unsigned>((s.uptime_sec % 3600U) / 60U);
     unsigned secs = static_cast<unsigned>(s.uptime_sec % 60U);
@@ -321,7 +321,7 @@ void renderDashboard(StripCanvas& c, const RenderSnapshot& s, const ThemePalette
 
 void renderFbConsole(StripCanvas& c, const RenderSnapshot& s, const ThemePalette& pal) {
     c.fillRect(0, 0, FB_WIDTH, 14, pal.accent);
-    char top_bar[58];
+    char top_bar[80];
     const char* ip = s.wifi_sta_connected ? s.wifi_ip : s.wifi_ap_ip;
     snprintf(top_bar, sizeof(top_bar), " /dev/tty0 | root@%s | %s ", s.hostname, ip);
     c.drawString(2, 3, top_bar, pal.bg, pal.accent, 1, 52);
@@ -345,7 +345,7 @@ void renderSignboard(StripCanvas& c, const RenderSnapshot& s, const ThemePalette
     c.drawRect(0, 0, FB_WIDTH, FB_HEIGHT, pal.border);
     c.drawRect(3, 3, FB_WIDTH - 6, FB_HEIGHT - 6, pal.accent);
 
-    char badge[56];
+    char badge[72];
     const char* ip = s.wifi_sta_connected ? s.wifi_ip : s.wifi_ap_ip;
     snprintf(badge, sizeof(badge), "[ %s | SSH %s ]", s.hostname, ip);
     c.drawString(12, 10, badge, pal.muted, pal.bg, 1, 48);
