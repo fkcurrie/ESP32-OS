@@ -9,9 +9,8 @@ void ScreenManager::begin() {
 }
 
 void ScreenManager::renderState(const SystemState& state, bool force_full) {
-    RenderSnapshot snap;
-    snap.captureFrom(state, force_full ? DIRTY_FULL : state.dirty_regions);
-    render(snap, force_full);
+    snap_.captureFrom(state, force_full ? DIRTY_FULL : state.dirty_regions);
+    render(snap_, force_full);
 }
 
 void ScreenManager::render(const RenderSnapshot& snap, bool force_full) {

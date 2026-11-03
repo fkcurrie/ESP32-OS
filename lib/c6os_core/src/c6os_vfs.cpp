@@ -212,9 +212,11 @@ void VirtualFs::initDefaultFiles(SystemState& state) {
                "# /etc/crontab: <interval_sec> <command>\n"
                "# Use 'crontab -l' or 'crontab -a <sec> <cmd>'\n");
 
-    char auth_keys_buf[1024];
-    crypto::formatDefaultAuthorizedKeys(auth_keys_buf, sizeof(auth_keys_buf));
-    ensureFile("/etc/ssh/authorized_keys", auth_keys_buf);
+    HeapArray<char> auth_keys_buf(1024);
+    if (auth_keys_buf) {
+        crypto::formatDefaultAuthorizedKeys(auth_keys_buf.get(), auth_keys_buf.bytes());
+        ensureFile("/etc/ssh/authorized_keys", auth_keys_buf.get());
+    }
 
     ensureFile("/root/README.txt",
                "C6-MicroLinux Quick Reference:\n"
@@ -489,8 +491,9 @@ bool VirtualFs::listDirectory(const char* abs_path, char* out_buf, size_t max_le
 
     if (!isDirectory(abs_path)) return false;
 
-    VfsDirEntry entries[32];
-    size_t count = readDirEntries(abs_path, entries, 32);
+    HeapArray<VfsDirEntry> entries(32);
+    if (!entries) return false;
+    size_t count = readDirEntries(abs_path, entries.get(), 32);
     for (size_t i = 0; i < count; ++i) {
         if (entries[i].is_dir) {
             w.fmt("%s/  ", entries[i].name);
@@ -524,11 +527,12 @@ bool VirtualFs::statPath(const char* abs_path, uint64_t* out_size, uint32_t* out
     }
 
     // Synthetic /proc, /sys, /dev files
-    SystemState dummy;
-    dummy.initDefaults();
-    char probe[256];
-    if (readFile(dummy, abs_path, probe, sizeof(probe))) {
-        if (out_size) *out_size = strlen(probe);
+    HeapArray<SystemState> dummy(1);
+    HeapArray<char> probe(256);
+    if (!dummy || !probe) return false;
+    dummy[0].initDefaults();
+    if (readFile(dummy[0], abs_path, probe.get(), probe.bytes())) {
+        if (out_size) *out_size = strlen(probe.get());
         if (out_mode) *out_mode = 0100444U;
         if (out_mtime) *out_mtime = 0;
         return true;

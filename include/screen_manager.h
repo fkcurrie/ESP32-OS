@@ -24,6 +24,7 @@ public:
 
 private:
     lcd::St7789Lcd lcd_;
+    RenderSnapshot snap_{};
     ScreenMode last_mode_;
     ThemeId last_theme_;
     uint8_t last_backlight_;

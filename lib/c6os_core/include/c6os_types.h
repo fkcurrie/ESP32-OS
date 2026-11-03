@@ -5,9 +5,34 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 namespace c6os {
+
+// Lightweight RAII heap buffer to keep large temporary arrays off FreeRTOS task stacks
+template <typename T>
+class HeapArray {
+public:
+    explicit HeapArray(size_t count)
+        : ptr_(count > 0 ? static_cast<T*>(calloc(count, sizeof(T))) : nullptr),
+          count_(count) {}
+    ~HeapArray() {
+        if (ptr_) free(ptr_);
+    }
+    HeapArray(const HeapArray&) = delete;
+    HeapArray& operator=(const HeapArray&) = delete;
+
+    T* get() const { return ptr_; }
+    size_t size() const { return count_; }
+    size_t bytes() const { return count_ * sizeof(T); }
+    explicit operator bool() const { return ptr_ != nullptr; }
+    T& operator[](size_t i) const { return ptr_[i]; }
+
+private:
+    T* ptr_;
+    size_t count_;
+};
 
 // Display Modes for the 1.47" ST7789 (320x172) LCD
 enum class ScreenMode : uint8_t {

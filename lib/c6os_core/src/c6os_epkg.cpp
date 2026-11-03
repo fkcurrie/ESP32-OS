@@ -158,8 +158,13 @@ bool installPackage(SystemState& state, VirtualFs& vfs, const char* pkg_abs_path
     }
 
     // Extract files and write /var/pkg/<name>.manifest
-    char manifest_buf[1024];
-    BufWriter mw(manifest_buf, sizeof(manifest_buf));
+    HeapArray<char> manifest_buf(1024);
+    if (!manifest_buf) {
+        free(payload);
+        out.putStr("epkg: out of heap memory\n");
+        return false;
+    }
+    BufWriter mw(manifest_buf.get(), manifest_buf.bytes());
     mw.fmt("name=%s\nversion=%s\narch=%s\ndescription=%s\n", name, version, arch, desc);
 
     pos = 0;
@@ -185,7 +190,7 @@ bool installPackage(SystemState& state, VirtualFs& vfs, const char* pkg_abs_path
     vfs.mkdirPath("/var/pkg");
     char manifest_path[96];
     snprintf(manifest_path, sizeof(manifest_path), "/var/pkg/%s.manifest", name);
-    vfs.writeFile(state, manifest_path, manifest_buf, false);
+    vfs.writeFile(state, manifest_path, manifest_buf.get(), false);
 
     out.fmt("epkg: installed %s %s (%s, %u file%s, SHA-256 verified)\n",
             name, version, arch, file_count, file_count == 1 ? "" : "s");
@@ -200,15 +205,15 @@ bool removePackage(SystemState& state, VirtualFs& vfs, const char* pkg_name, Buf
     char manifest_path[96];
     snprintf(manifest_path, sizeof(manifest_path), "/var/pkg/%s.manifest", pkg_name);
 
-    char content[1024];
-    if (!vfs.readFile(state, manifest_path, content, sizeof(content))) {
+    HeapArray<char> content(1024);
+    if (!content || !vfs.readFile(state, manifest_path, content.get(), content.bytes())) {
         out.fmt("epkg: package '%s' is not installed\n", pkg_name);
         return false;
     }
 
     unsigned removed_files = 0;
     char* saveptr = nullptr;
-    char* line = strtok_r(content, "\r\n", &saveptr);
+    char* line = strtok_r(content.get(), "\r\n", &saveptr);
     while (line != nullptr) {
         if (strncmp(line, "file=", 5) == 0) {
             if (vfs.removeFile(state, line + 5)) {
@@ -225,24 +230,25 @@ bool removePackage(SystemState& state, VirtualFs& vfs, const char* pkg_name, Buf
 }
 
 bool listPackages(const VirtualFs& vfs, BufWriter& out) {
-    VfsDirEntry entries[32];
-    size_t count = vfs.readDirEntries("/var/pkg", entries, 32);
+    HeapArray<VfsDirEntry> entries(32);
+    HeapArray<SystemState> dummy(1);
+    HeapArray<char> content(512);
+    if (!entries || !dummy || !content) return false;
+    size_t count = vfs.readDirEntries("/var/pkg", entries.get(), 32);
     unsigned pkg_count = 0;
 
-    SystemState dummy;
-    dummy.initDefaults();
+    dummy[0].initDefaults();
 
     for (size_t i = 0; i < count; ++i) {
         const char* dot = strstr(entries[i].name, ".manifest");
         if (!dot) continue;
         char full[128];
         snprintf(full, sizeof(full), "/var/pkg/%.96s", entries[i].name);
-        char content[512];
-        if (!vfs.readFile(dummy, full, content, sizeof(content))) continue;
+        if (!vfs.readFile(dummy[0], full, content.get(), content.bytes())) continue;
 
         char name[36] = "", ver[20] = "", arch[24] = "", desc[68] = "";
         char* saveptr = nullptr;
-        for (char* ln = strtok_r(content, "\r\n", &saveptr); ln; ln = strtok_r(nullptr, "\r\n", &saveptr)) {
+        for (char* ln = strtok_r(content.get(), "\r\n", &saveptr); ln; ln = strtok_r(nullptr, "\r\n", &saveptr)) {
             if (strncmp(ln, "name=", 5) == 0) strncpy(name, ln + 5, sizeof(name) - 1);
             else if (strncmp(ln, "version=", 8) == 0) strncpy(ver, ln + 8, sizeof(ver) - 1);
             else if (strncmp(ln, "arch=", 5) == 0) strncpy(arch, ln + 5, sizeof(arch) - 1);
@@ -265,12 +271,12 @@ bool packageInfo(const SystemState& state, const VirtualFs& vfs, const char* pkg
     }
     char manifest_path[96];
     snprintf(manifest_path, sizeof(manifest_path), "/var/pkg/%s.manifest", pkg_name);
-    char content[1024];
-    if (!vfs.readFile(state, manifest_path, content, sizeof(content))) {
+    HeapArray<char> content(1024);
+    if (!content || !vfs.readFile(state, manifest_path, content.get(), content.bytes())) {
         out.fmt("epkg: package '%s' is not installed\n", pkg_name);
         return false;
     }
-    out.putStr(content);
+    out.putStr(content.get());
     return true;
 }
 

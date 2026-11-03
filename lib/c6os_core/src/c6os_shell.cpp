@@ -187,9 +187,9 @@ void ShellSession::begin(SystemState& state, VirtualFs& vfs, bool start_in_menu,
         renderMenuTo(state, out);
     } else {
         mode_ = SessionMode::SHELL_CLI;
-        char motd[384];
-        if (vfs.readFile(state, "/etc/motd", motd, sizeof(motd))) {
-            out.putWithCrLf(motd);
+        HeapArray<char> motd(384);
+        if (motd && vfs.readFile(state, "/etc/motd", motd.get(), motd.bytes())) {
+            out.putWithCrLf(motd.get());
             out.putStr("\r\n");
         }
         renderPromptTo(state, out);
@@ -295,14 +295,15 @@ void ShellSession::renderTopTo(const SystemState& state, bool is_htop, bool clea
     unsigned cache_kb = 16U;
     unsigned mem_pct  = (used_kb * 100U) / total_kb;
 
-    TaskEntry tasks[14];
+    HeapArray<TaskEntry> tasks(14);
+    if (!tasks) return;
     size_t task_count = 0;
 
     const HardwareOps* hw = getHardwareOps();
-    TaskInfoEntry live[14];
+    HeapArray<TaskInfoEntry> live(14);
     uint32_t live_total_permille = 0;
-    if (hw && hw->get_tasks) {
-        size_t n = hw->get_tasks(live, 14, &live_total_permille);
+    if (live && hw && hw->get_tasks) {
+        size_t n = hw->get_tasks(live.get(), 14, &live_total_permille);
         for (size_t i = 0; i < n && task_count < 14; ++i) {
             TaskEntry& dst = tasks[task_count++];
             dst.pid = static_cast<unsigned>(live[i].pid);
@@ -503,13 +504,15 @@ void ShellSession::renderWatchFrameTo(SystemState& state, VirtualFs& vfs, bool c
         out.putStr("watch: max execution depth (4) exceeded\r\n");
     } else {
         ExecDepthGuard guard(exec_depth_);
-        char cmd_out[1024];
-        BufWriter sub(cmd_out, sizeof(cmd_out), false);
-        SessionMode saved_mode = mode_;
-        mode_ = SessionMode::SHELL_CLI;
-        executeCommandLineTo(state, vfs, watch_cmd_, sub);
-        mode_ = saved_mode;
-        out.putStr(cmd_out);
+        HeapArray<char> cmd_out(1024);
+        if (cmd_out) {
+            BufWriter sub(cmd_out.get(), cmd_out.bytes(), false);
+            SessionMode saved_mode = mode_;
+            mode_ = SessionMode::SHELL_CLI;
+            executeCommandLineTo(state, vfs, watch_cmd_, sub);
+            mode_ = saved_mode;
+            out.putStr(cmd_out.get());
+        }
     }
 
     out.putStr("\033[K\r\n\033[7m [watch] Press 'q' or Ctrl+C to exit live watch \033[0m\033[K");
@@ -698,18 +701,20 @@ bool ShellSession::handleMenuKey(SystemState& state, VirtualFs& vfs, char ch, Bu
             return true;
         }
         case '9': {
-            char buf[512];
-            out.putStr("\r\n\033[1;36m=== /proc/version ===\033[0m\r\n");
-            if (vfs.readFile(state, "/proc/version", buf, sizeof(buf))) {
-                out.putWithCrLf(buf);
-            }
-            out.putStr("\033[1;36m=== /proc/cpuinfo ===\033[0m\r\n");
-            if (vfs.readFile(state, "/proc/cpuinfo", buf, sizeof(buf))) {
-                out.putWithCrLf(buf);
-            }
-            out.putStr("\033[1;36m=== /proc/meminfo ===\033[0m\r\n");
-            if (vfs.readFile(state, "/proc/meminfo", buf, sizeof(buf))) {
-                out.putWithCrLf(buf);
+            HeapArray<char> buf(512);
+            if (buf) {
+                out.putStr("\r\n\033[1;36m=== /proc/version ===\033[0m\r\n");
+                if (vfs.readFile(state, "/proc/version", buf.get(), buf.bytes())) {
+                    out.putWithCrLf(buf.get());
+                }
+                out.putStr("\033[1;36m=== /proc/cpuinfo ===\033[0m\r\n");
+                if (vfs.readFile(state, "/proc/cpuinfo", buf.get(), buf.bytes())) {
+                    out.putWithCrLf(buf.get());
+                }
+                out.putStr("\033[1;36m=== /proc/meminfo ===\033[0m\r\n");
+                if (vfs.readFile(state, "/proc/meminfo", buf.get(), buf.bytes())) {
+                    out.putWithCrLf(buf.get());
+                }
             }
             out.putStr("\033[1;36m=== Thermal & Hardware Sensors ===\033[0m\r\n");
             out.fmt(
@@ -1085,7 +1090,6 @@ void ShellSession::formatDateStr(const SystemState& state, bool force_utc, char*
 }
 
 void ShellSession::syncCronFromVfs(SystemState& state, const VirtualFs& vfs) {
-    char content[VFS_MAX_FILE_SIZE];
     for (size_t i = 0; i < MAX_CRON_JOBS; ++i) {
         state.cron_jobs[i].active = false;
         state.cron_jobs[i].enabled = false;
@@ -1093,12 +1097,13 @@ void ShellSession::syncCronFromVfs(SystemState& state, const VirtualFs& vfs) {
         state.cron_jobs[i].last_run_sec = state.uptime_sec;
         state.cron_jobs[i].cmd[0] = '\0';
     }
-    if (!vfs.readFile(state, "/etc/crontab", content, sizeof(content))) {
+    HeapArray<char> content(VFS_MAX_FILE_SIZE);
+    if (!content || !vfs.readFile(state, "/etc/crontab", content.get(), content.bytes())) {
         return;
     }
     size_t slot = 0;
     char* saveptr = nullptr;
-    char* line = strtok_r(content, "\n", &saveptr);
+    char* line = strtok_r(content.get(), "\n", &saveptr);
     while (line && slot < MAX_CRON_JOBS) {
         while (*line == ' ' || *line == '\t' || *line == '\r') ++line;
         if (*line != '\0' && *line != '#') {
@@ -1124,8 +1129,9 @@ void ShellSession::syncCronFromVfs(SystemState& state, const VirtualFs& vfs) {
 }
 
 void ShellSession::syncVfsFromCron(SystemState& state, VirtualFs& vfs) {
-    char buf[VFS_MAX_FILE_SIZE];
-    BufWriter w(buf, sizeof(buf), false);
+    HeapArray<char> buf(VFS_MAX_FILE_SIZE);
+    if (!buf) return;
+    BufWriter w(buf.get(), buf.bytes(), false);
     w.putStr("# /etc/crontab: <interval_sec> <command>\n");
     for (size_t i = 0; i < MAX_CRON_JOBS; ++i) {
         if (state.cron_jobs[i].active && state.cron_jobs[i].interval_sec > 0) {
@@ -1134,7 +1140,7 @@ void ShellSession::syncVfsFromCron(SystemState& state, VirtualFs& vfs) {
                   state.cron_jobs[i].cmd);
         }
     }
-    vfs.writeFile(state, "/etc/crontab", buf, false);
+    vfs.writeFile(state, "/etc/crontab", buf.get(), false);
 }
 
 void ShellSession::formatStatusJson(const SystemState& state, char* out_buf, size_t max_len) {
@@ -1323,9 +1329,10 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
     const char* prog = argv[0];
     const HardwareOps* hw = getHardwareOps();
 
-    char redir_buf[1024];
-    BufWriter redir_writer(redir_buf, sizeof(redir_buf), false);
-    BufWriter& out = redir_path ? redir_writer : caller_out;
+    HeapArray<char> redir_buf(redir_path ? 1024 : 0);
+    BufWriter redir_writer(redir_buf.get(), redir_buf.bytes(), false);
+    BufWriter& out = (redir_path && redir_buf) ? redir_writer : caller_out;
+    char norm[VFS_MAX_PATH_LEN];
 
     if (strcmp(prog, "s") == 0 || strcmp(prog, "true") == 0 || strcmp(prog, ":") == 0) {
         return true;
@@ -1397,7 +1404,6 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         out.fmt("%s\r\n", cwd_);
     } else if (strcmp(prog, "cd") == 0) {
         const char* dest = (argc >= 2) ? argv[1] : "/root";
-        char norm[VFS_MAX_PATH_LEN];
         VirtualFs::normalizePath(cwd_, dest, norm, sizeof(norm));
         if (vfs.isDirectory(norm)) {
             strncpy(cwd_, norm, sizeof(cwd_) - 1);
@@ -1408,11 +1414,10 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
     } else if (strcmp(prog, "ls") == 0) {
         const char* target = (argc >= 2 && argv[1][0] != '-') ? argv[1] :
                              (argc >= 3 ? argv[2] : cwd_);
-        char norm[VFS_MAX_PATH_LEN];
         VirtualFs::normalizePath(cwd_, target, norm, sizeof(norm));
-        char listing[512];
-        if (vfs.listDirectory(norm, listing, sizeof(listing))) {
-            out.putWithCrLf(listing);
+        HeapArray<char> listing(512);
+        if (listing && vfs.listDirectory(norm, listing.get(), listing.bytes())) {
+            out.putWithCrLf(listing.get());
         } else {
             out.fmt("ls: cannot access '%s': No such file or directory\r\n", target);
         }
@@ -1420,11 +1425,10 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         if (argc < 2) {
             out.putStr("Usage: cat <path>\r\n");
         } else {
-            char norm[VFS_MAX_PATH_LEN];
             VirtualFs::normalizePath(cwd_, argv[1], norm, sizeof(norm));
-            char content[1024];
-            if (vfs.readFile(state, norm, content, sizeof(content))) {
-                out.putWithCrLf(content);
+            HeapArray<char> content(1024);
+            if (content && vfs.readFile(state, norm, content.get(), content.bytes())) {
+                out.putWithCrLf(content.get());
             } else {
                 out.fmt("cat: %s: No such file or directory\r\n", argv[1]);
             }
@@ -1434,7 +1438,6 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
             out.putStr("Usage: mkdir <dir>\r\n");
         } else {
             const char* arg = (strcmp(argv[1], "-p") == 0 && argc >= 3) ? argv[2] : argv[1];
-            char norm[VFS_MAX_PATH_LEN];
             VirtualFs::normalizePath(cwd_, arg, norm, sizeof(norm));
             if (!vfs.mkdirPath(norm)) {
                 out.fmt("mkdir: cannot create directory '%s'\r\n", arg);
@@ -1444,7 +1447,6 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         if (argc < 2) {
             out.putStr("Usage: rmdir <dir>\r\n");
         } else {
-            char norm[VFS_MAX_PATH_LEN];
             VirtualFs::normalizePath(cwd_, argv[1], norm, sizeof(norm));
             if (!vfs.rmdirPath(norm)) {
                 out.fmt("rmdir: failed to remove '%s'\r\n", argv[1]);
@@ -1454,10 +1456,10 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         if (argc < 3) {
             out.putStr("Usage: mv <src> <dst>\r\n");
         } else {
-            char src[VFS_MAX_PATH_LEN], dst[VFS_MAX_PATH_LEN];
-            VirtualFs::normalizePath(cwd_, argv[1], src, sizeof(src));
+            char dst[VFS_MAX_PATH_LEN];
+            VirtualFs::normalizePath(cwd_, argv[1], norm, sizeof(norm));
             VirtualFs::normalizePath(cwd_, argv[2], dst, sizeof(dst));
-            if (!vfs.renamePath(src, dst)) {
+            if (!vfs.renamePath(norm, dst)) {
                 out.fmt("mv: cannot move '%s' to '%s'\r\n", argv[1], argv[2]);
             }
         }
@@ -1466,7 +1468,6 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
             out.putStr("Usage: rm <path>\r\n");
         } else {
             const char* arg = (argv[1][0] == '-' && argc >= 3) ? argv[2] : argv[1];
-            char norm[VFS_MAX_PATH_LEN];
             VirtualFs::normalizePath(cwd_, arg, norm, sizeof(norm));
             if (!vfs.removeFile(state, norm)) {
                 out.fmt("rm: cannot remove '%s': Operation not permitted or no such file\r\n", arg);
@@ -1514,9 +1515,9 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
             out.fmt("/dev/mmcblk0p1   %8u     128  %8u   1%% /mnt/sd\r\n", sd_kb, sd_avail);
         }
     } else if (strcmp(prog, "ps") == 0) {
-        TaskInfoEntry live[16];
+        HeapArray<TaskInfoEntry> live(16);
         uint32_t total_permille = 0;
-        size_t n = (hw && hw->get_tasks) ? hw->get_tasks(live, 16, &total_permille) : 0;
+        size_t n = (live && hw && hw->get_tasks) ? hw->get_tasks(live.get(), 16, &total_permille) : 0;
         if (n > 0) {
             out.putStr("  PID USER      STK_FREE STAT %CPU COMMAND\r\n");
             for (size_t i = 0; i < n; ++i) {
@@ -1747,7 +1748,6 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
             }
         }
         if (save_path) {
-            char norm[VFS_MAX_PATH_LEN];
             VirtualFs::normalizePath(cwd_, save_path, norm, sizeof(norm));
             size_t written_bytes = 0;
             if (display::writeFramebufferImage(state, vfs, norm, &written_bytes)) {
@@ -2035,8 +2035,8 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
                     state.ble_enabled = true;
                 }
             }
-            BleScanResult results[12];
-            int count = (hw && hw->ble_scan) ? hw->ble_scan(sec * 1000U, results, 12) : 0;
+            HeapArray<BleScanResult> results(12);
+            int count = (results && hw && hw->ble_scan) ? hw->ble_scan(sec * 1000U, results.get(), 12) : 0;
             out.fmt("BLE 5.0 scan (%us): %d peripheral(s) found\r\n",
                     static_cast<unsigned>(sec), count > 0 ? count : 0);
             for (int i = 0; i < count && i < 12; ++i) {
@@ -2138,7 +2138,6 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         }
     } else if (strcmp(prog, "epkg") == 0 || strcmp(prog, "/bin/epkg") == 0) {
         if (argc >= 3 && strcmp(argv[1], "install") == 0) {
-            char norm[VFS_MAX_PATH_LEN];
             VirtualFs::normalizePath(cwd_, argv[2], norm, sizeof(norm));
             epkg::installPackage(state, vfs, norm, out);
         } else if (argc >= 3 && (strcmp(argv[1], "remove") == 0 || strcmp(argv[1], "rm") == 0)) {
@@ -2160,7 +2159,6 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
             }
             luavm::runChunk(state, vfs, "=(command line)", argv[2], sub_argc, sub_argv, out);
         } else if (argc >= 2) {
-            char norm[VFS_MAX_PATH_LEN];
             VirtualFs::normalizePath(cwd_, argv[1], norm, sizeof(norm));
             const char* sub_argv[16] = {nullptr};
             int sub_argc = 0;
@@ -2175,7 +2173,6 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         if (argc < 2) {
             out.putStr("Usage: elf <binary.elf> [args...]\r\n");
         } else {
-            char norm[VFS_MAX_PATH_LEN];
             VirtualFs::normalizePath(cwd_, argv[1], norm, sizeof(norm));
             const char* sub_argv[16] = {nullptr};
             int sub_argc = 0;
@@ -2292,22 +2289,25 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
                 "Usage: edit <path> [line1] [line2] ...\r\n"
                 "  (Omit [line1] in interactive shell to open line editor)\r\n");
         } else {
-            char norm[VFS_MAX_PATH_LEN];
             VirtualFs::normalizePath(cwd_, argv[1], norm, sizeof(norm));
             if (argc >= 3) {
-                char body[VFS_MAX_FILE_SIZE];
-                BufWriter bw(body, sizeof(body), false);
-                for (size_t i = 2; i < argc; ++i) {
-                    bw.fmt("%s\n", argv[i]);
-                }
-                if (vfs.writeFile(state, norm, body, false)) {
-                    if (strcmp(norm, "/etc/crontab") == 0) {
-                        syncCronFromVfs(state, vfs);
-                    }
-                    out.fmt("edit: wrote %u bytes to %s\r\n",
-                            static_cast<unsigned>(bw.length()), norm);
+                HeapArray<char> body(VFS_MAX_FILE_SIZE);
+                if (!body) {
+                    out.putStr("edit: out of memory\r\n");
                 } else {
-                    out.fmt("edit: cannot write to %s\r\n", norm);
+                    BufWriter bw(body.get(), body.bytes(), false);
+                    for (size_t i = 2; i < argc; ++i) {
+                        bw.fmt("%s\n", argv[i]);
+                    }
+                    if (vfs.writeFile(state, norm, body.get(), false)) {
+                        if (strcmp(norm, "/etc/crontab") == 0) {
+                            syncCronFromVfs(state, vfs);
+                        }
+                        out.fmt("edit: wrote %u bytes to %s\r\n",
+                                static_cast<unsigned>(bw.length()), norm);
+                    } else {
+                        out.fmt("edit: cannot write to %s\r\n", norm);
+                    }
                 }
             } else if (!ensureEditBuffer()) {
                 out.putStr("edit: out of memory\r\n");
@@ -2345,7 +2345,6 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
                 executeCommandLineTo(state, vfs, argv[2], out);
             }
         } else {
-            char norm[VFS_MAX_PATH_LEN];
             VirtualFs::normalizePath(cwd_, argv[1], norm, sizeof(norm));
             runScriptFile(state, vfs, norm, out);
         }
@@ -2462,9 +2461,11 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         }
     } else if (strcmp(prog, "screen") == 0) {
         if (argc < 2 || strcmp(argv[1], "status") == 0) {
-            char json[768];
-            formatStatusJson(state, json, sizeof(json));
-            out.putStr(json);
+            HeapArray<char> json(768);
+            if (json) {
+                formatStatusJson(state, json.get(), json.bytes());
+                out.putStr(json.get());
+            }
         } else if (strcmp(argv[1], "mode") == 0 && argc >= 3) {
             if (vfs.writeFile(state, "/sys/class/graphics/fb0/mode", argv[2], false)) {
                 out.fmt("OK MODE %s\r\n", screenModeName(state.screen_mode));
@@ -2654,10 +2655,9 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         }
     }
 
-    if (redir_path) {
-        char norm[VFS_MAX_PATH_LEN];
+    if (redir_path && redir_buf) {
         VirtualFs::normalizePath(cwd_, redir_path, norm, sizeof(norm));
-        if (!vfs.writeFile(state, norm, redir_buf, redir_append)) {
+        if (!vfs.writeFile(state, norm, redir_buf.get(), redir_append)) {
             caller_out.fmt("c6-sh: %s: Permission denied or invalid device value\r\n", redir_path);
         } else if (strcmp(norm, "/etc/crontab") == 0) {
             syncCronFromVfs(state, vfs);

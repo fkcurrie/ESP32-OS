@@ -402,12 +402,13 @@ int l_ble_scan(lua_State* L) {
     LuaRunCtx* ctx = getCtx(L);
     uint32_t ms = static_cast<uint32_t>(luaL_optinteger(L, 1, 2000));
     if (ms > 8000U) ms = 8000U;
-    BleScanResult results[12];
+    HeapArray<BleScanResult> results(12);
+    if (!results) return luaL_error(L, "out of memory");
     const HardwareOps* hw = getHardwareOps();
     if (!ctx->state->ble_enabled && hw && hw->ble_enable) {
         if (hw->ble_enable(true) == 0) ctx->state->ble_enabled = true;
     }
-    int count = (hw && hw->ble_scan) ? hw->ble_scan(ms, results, 12) : 0;
+    int count = (hw && hw->ble_scan) ? hw->ble_scan(ms, results.get(), 12) : 0;
     lua_newtable(L);
     for (int i = 0; i < count; ++i) {
         lua_newtable(L);
@@ -485,8 +486,9 @@ int l_fs_ls(lua_State* L) {
     const char* p = luaL_optstring(L, 1, "/root");
     char norm[160];
     VirtualFs::normalizePath("/root", p, norm, sizeof(norm));
-    VfsDirEntry entries[32];
-    size_t n = ctx->vfs->readDirEntries(norm, entries, 32);
+    HeapArray<VfsDirEntry> entries(32);
+    if (!entries) return luaL_error(L, "out of memory");
+    size_t n = ctx->vfs->readDirEntries(norm, entries.get(), 32);
     lua_newtable(L);
     for (size_t i = 0; i < n; ++i) {
         lua_pushstring(L, entries[i].name);

@@ -31,6 +31,8 @@
 
 extern "C" void ble_store_config_init(void);
 
+SET_LOOP_TASK_STACK_SIZE(12 * 1024);
+
 namespace {
 
 constexpr const char* SOFTAP_SSID = "C6-Linux-OS";
@@ -40,6 +42,8 @@ c6os::SystemState g_state;
 c6os::VirtualFs g_vfs;
 c6os::ScreenManager g_screen;
 c6os::SshServer g_sshd(22);
+c6os::ShellSession g_bg_shell;
+c6os::ShellSession g_http_shell;
 WiFiServer g_httpd(80);
 WiFiUDP g_syslog_udp;
 SemaphoreHandle_t g_mutex = nullptr;
@@ -907,15 +911,16 @@ void pollHttpAndSyslog() {
     }
 
     if (req_line.startsWith("GET /api/status")) {
-        char json[1024];
-        json[0] = '\0';
-        if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            g_state.http_requests++;
-            c6os::ShellSession::formatStatusJson(g_state, json, sizeof(json));
-            xSemaphoreGive(g_mutex);
+        c6os::HeapArray<char> json(1024);
+        if (json) {
+            if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                g_state.http_requests++;
+                c6os::ShellSession::formatStatusJson(g_state, json.get(), json.bytes());
+                xSemaphoreGive(g_mutex);
+            }
+            client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n");
+            client.print(json.get());
         }
-        client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n");
-        client.print(json);
     } else if (req_line.startsWith("GET /api/cmd")) {
         int sp2 = req_line.indexOf(' ', 4);
         String uri = (sp2 > 4) ? req_line.substring(4, sp2) : req_line.substring(4);
@@ -962,9 +967,8 @@ void pollHttpAndSyslog() {
         char* out = static_cast<char*>(malloc(2048));
         if (out) {
             out[0] = '\0';
-            c6os::ShellSession http_sh;
             if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(300)) == pdTRUE) {
-                http_sh.executeCommandLine(g_state, g_vfs, cmd_buf, out, 2048);
+                g_http_shell.executeCommandLine(g_state, g_vfs, cmd_buf, out, 2048);
                 xSemaphoreGive(g_mutex);
             }
             client.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n");
@@ -1367,9 +1371,10 @@ void setup() {
     g_state.appendDmesg(millis(), "syslogd: UDP listener ready on 0.0.0.0:514");
     g_state.appendDmesg(millis(), "init: Executing /etc/rc.local & starting services");
     {
-        char rc_out[512];
-        c6os::ShellSession boot_sh;
-        boot_sh.executeCommandLine(g_state, g_vfs, "sh /etc/rc.local", rc_out, sizeof(rc_out));
+        c6os::HeapArray<char> rc_out(512);
+        if (rc_out) {
+            g_bg_shell.executeCommandLine(g_state, g_vfs, "sh /etc/rc.local", rc_out.get(), rc_out.bytes());
+        }
     }
     g_screen.renderState(g_state, false);
 
@@ -1438,10 +1443,11 @@ void loop() {
                         g_state.cron_jobs[i].interval_sec) {
                         g_state.cron_jobs[i].last_run_sec = g_state.uptime_sec;
                         g_state.cron_jobs[i].run_count++;
-                        char cron_out[512];
-                        c6os::ShellSession cron_sh;
-                        cron_sh.executeCommandLine(
-                            g_state, g_vfs, g_state.cron_jobs[i].cmd, cron_out, sizeof(cron_out));
+                        c6os::HeapArray<char> cron_out(512);
+                        if (cron_out) {
+                            g_bg_shell.executeCommandLine(
+                                g_state, g_vfs, g_state.cron_jobs[i].cmd, cron_out.get(), cron_out.bytes());
+                        }
                     }
                 }
             }
