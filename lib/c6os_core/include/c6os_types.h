@@ -452,11 +452,15 @@ struct SystemState {
         return fb_lines[phys];
     }
 
+    const char* getFbLine(size_t logical_idx) const { return fbLineAt(logical_idx); }
+
     const char* dmesgLineAt(size_t logical_idx) const {
         if (logical_idx >= dmesg_count) return "";
         size_t phys = (dmesg_head + logical_idx) % DMESG_MAX_LINES;
         return dmesg[phys];
     }
+
+    const char* getDmesgLine(size_t logical_idx) const { return dmesgLineAt(logical_idx); }
 
     void initDefaults();
 

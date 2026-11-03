@@ -401,6 +401,26 @@ void test_new_ten_os_features(void) {
     out[0] = '\0';
     TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "logger Deployment verified", out, sizeof(out)));
     TEST_ASSERT_EQUAL_UINT32(1, state.syslog_packets);
+
+    // 11. O(1) Circular Ring Buffer wrap-around verification for dmesg & fb_lines
+    state.clearFbConsole();
+    for (int i = 0; i < 30; ++i) {
+        char line[32];
+        snprintf(line, sizeof(line), "fb-%02d", i);
+        state.appendFbConsoleLine(line);
+    }
+    TEST_ASSERT_EQUAL_UINT32(FB_CONSOLE_ROWS, state.fb_line_count);
+    TEST_ASSERT_EQUAL_STRING("fb-12", state.getFbLine(0));
+    TEST_ASSERT_EQUAL_STRING("fb-29", state.getFbLine(FB_CONSOLE_ROWS - 1));
+
+    for (int i = 0; i < 40; ++i) {
+        char line[32];
+        snprintf(line, sizeof(line), "klog-%02d", i);
+        state.appendDmesg(static_cast<uint32_t>(i * 1000), line);
+    }
+    TEST_ASSERT_EQUAL_UINT32(DMESG_MAX_LINES, state.dmesg_count);
+    TEST_ASSERT_NOT_NULL(strstr(state.getDmesgLine(0), "klog-08"));
+    TEST_ASSERT_NOT_NULL(strstr(state.getDmesgLine(DMESG_MAX_LINES - 1), "klog-39"));
 }
 
 void test_ssh_ed25519_rsa_and_salted_password_auth(void) {
