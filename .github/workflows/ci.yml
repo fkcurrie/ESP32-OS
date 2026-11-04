@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -35,7 +34,9 @@ jobs:
           ruff check --select E9,F,I,UP,B scripts/
           echo "print('ci ok')" > /tmp/ci_smoke.lua
           python scripts/mkepkg.py -n ci_smoke -v 1.0.0 -a noarch -f /tmp/ci_smoke.lua:/apps/ci_smoke.lua:0755 -o /tmp/ci_smoke.epkg
-          test -s /tmp/ci_smoke.epkg
+          python scripts/mkepkg.py --keygen /tmp/ci_rel
+          python scripts/mkepkg.py -n ci_signed -v 1.0.0 -a noarch -f /tmp/ci_smoke.lua:/apps/ci_smoke.lua:0755 -k /tmp/ci_rel.key -o /tmp/ci_signed.epkg
+          test -s /tmp/ci_smoke.epkg && test -s /tmp/ci_signed.epkg && test -s /tmp/ci_rel.pub
 
       - name: C/C++ static analysis (cppcheck)
         run: |

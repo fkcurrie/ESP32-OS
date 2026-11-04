@@ -180,6 +180,10 @@ void SystemState::initDefaults() {
     theme = ThemeId::CYBER_CYAN;
     backlight_pct = 100;
     landscape_flipped = false;
+    screen_sleeping = false;
+    screen_dim_sec = 120;
+    screen_sleep_sec = 600;
+    last_activity_sec = 0;
     strncpy(headline, "C6-MicroLinux Ready", sizeof(headline) - 1);
     strncpy(subtitle, "SSH Port 22 | CLI Screen Control", sizeof(subtitle) - 1);
     strncpy(banner_footer, "Use 'menu' over SSH or /dev/ttyACM0", sizeof(banner_footer) - 1);
@@ -231,7 +235,7 @@ void RenderSnapshot::captureFrom(const SystemState& s, uint8_t dirty_mask) {
     active_cron_count = static_cast<uint8_t>(s.activeCronCount());
     screen_mode = s.screen_mode;
     theme = s.theme;
-    backlight_pct = s.backlight_pct;
+    backlight_pct = s.effectiveBacklightPct();
     landscape_flipped = s.landscape_flipped;
     if (s.screen_mode == ScreenMode::OS_DASHBOARD || s.screen_mode == ScreenMode::SIGNBOARD) {
         memcpy(headline, s.headline, sizeof(headline));

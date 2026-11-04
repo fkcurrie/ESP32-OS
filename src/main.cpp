@@ -355,9 +355,17 @@ int hwBleScan(uint32_t duration_ms, c6os::BleScanResult* out_results, size_t max
     if (!done_sem) return -1;
 
     BleScanCtx ctx{out_results, max_results, 0, done_sem};
+    bool wifi_busy = false;
+    if (g_mutex && xSemaphoreTake(g_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        wifi_busy = (g_state.ssh_active_sessions > 0 || g_state.wifi_ap_enabled);
+        xSemaphoreGive(g_mutex);
+    }
+    // Adaptive 2.4 GHz radio coexistence (0.625 ms BLE units):
+    // - 80 ms interval (0x80) with 20 ms window (0x20 = 25% duty) when SSH/SoftAP active
+    // - 80 ms interval (0x80) with 60 ms window (0x60 = 75% duty) when Wi-Fi is idle
     struct ble_gap_disc_params params = {};
-    params.itvl = 0x30;
-    params.window = 0x30;
+    params.itvl = 0x80;
+    params.window = wifi_busy ? 0x20 : 0x60;
     params.filter_policy = 0;
     params.limited = 0;
     params.passive = 0;
@@ -651,6 +659,8 @@ void loadPersistentConfig() {
     if (ap_pinned) {
         g_state.wifi_ap_enabled = true;
     }
+    g_state.screen_dim_sec   = prefs.getUShort("scr_dim", 120);
+    g_state.screen_sleep_sec = prefs.getUShort("scr_slp", 600);
 
     // Salted SHA-256 root password (migrating any legacy plaintext NVS entry once)
     if (prefs.getBytesLength("pass_salt") == 16 && prefs.getBytesLength("pass_hash") == 32) {
@@ -692,6 +702,8 @@ void savePersistentConfig() {
     prefs.putString("wifi_ssid", g_state.wifi_cfg_ssid);
     prefs.putString("wifi_pass", g_state.wifi_cfg_pass);
     prefs.putBool("ap_pinned", g_state.wifi_ap_pinned);
+    prefs.putUShort("scr_dim", g_state.screen_dim_sec);
+    prefs.putUShort("scr_slp", g_state.screen_sleep_sec);
     prefs.end();
 }
 
@@ -1133,6 +1145,7 @@ void pollHttpAndSyslog() {
         if (out) {
             out[0] = '\0';
             if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(300)) == pdTRUE) {
+                g_state.noteActivity();
                 g_bg_shell.executeCommandLine(g_state, g_vfs, cmd_buf, out.get(), out.bytes());
                 xSemaphoreGive(g_mutex);
             }
@@ -1395,6 +1408,7 @@ void serialConsoleTask(void* param) {
                 if (out_buf) {
                     out_buf[0] = '\0';
                     if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+                        g_state.noteActivity();
                         bool keep = serial_shell.consumeBytes(g_state, g_vfs, rx, got,
                                                               out_buf.get(), out_buf.bytes());
                         if (!keep) {
@@ -1518,7 +1532,12 @@ void pollBootButton() {
         if (held_ms >= BTN_DEBOUNCE_MS) {
             if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                 g_state.button_press_count++;
-                if (held_ms >= BTN_LONG_PRESS_MS) {
+                bool was_sleeping = g_state.screen_sleeping;
+                g_state.noteActivity();
+                if (was_sleeping) {
+                    g_state.appendDmesg(now, "buttond: GPIO9 wake from panel sleep");
+                    g_state.markDirty(c6os::DIRTY_FULL);
+                } else if (held_ms >= BTN_LONG_PRESS_MS) {
                     if (g_state.backlight_pct >= 90) g_state.backlight_pct = 50;
                     else if (g_state.backlight_pct >= 40) g_state.backlight_pct = 15;
                     else g_state.backlight_pct = 100;
@@ -1630,6 +1649,7 @@ void loop() {
     static uint32_t last_sec_tick = 0;
     static uint32_t last_led_tick = 0;
     static uint32_t last_ticker_tick = 0;
+    static uint8_t prev_eff_bl = 255;
 
     c6os::RenderSnapshot& render_snap = g_screen.snapshot();
 
@@ -1639,7 +1659,7 @@ void loop() {
     if (now - last_ticker_tick >= 220U) {
         last_ticker_tick = now;
         if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-            if (g_state.ticker_enabled) {
+            if (g_state.ticker_enabled && !g_state.screen_sleeping) {
                 g_state.ticker_offset++;
                 g_state.markDirty(c6os::DIRTY_TICKER);
             }
@@ -1688,19 +1708,42 @@ void loop() {
                 }
             }
 
-            if (g_state.screen_mode == c6os::ScreenMode::OS_DASHBOARD ||
-                g_state.screen_mode == c6os::ScreenMode::MONITOR) {
-                g_state.markDirty(c6os::DIRTY_HEADER | c6os::DIRTY_CARDS);
-            } else if (g_state.screen_mode == c6os::ScreenMode::DIAGNOSTICS) {
-                g_state.markDirty(c6os::DIRTY_CARDS);
+            bool want_sleep = g_state.shouldPanelSleep();
+            if (want_sleep != g_state.screen_sleeping) {
+                g_state.screen_sleeping = want_sleep;
+                if (!want_sleep) {
+                    g_state.markDirty(c6os::DIRTY_FULL);
+                }
             }
+
+            uint8_t eff_bl = g_state.effectiveBacklightPct();
+            if (!g_state.screen_sleeping) {
+                if (eff_bl != prev_eff_bl) {
+                    g_state.markDirty(c6os::DIRTY_HEADER | c6os::DIRTY_CARDS);
+                }
+                if (g_state.screen_mode == c6os::ScreenMode::OS_DASHBOARD ||
+                    g_state.screen_mode == c6os::ScreenMode::MONITOR) {
+                    g_state.markDirty(c6os::DIRTY_HEADER | c6os::DIRTY_CARDS);
+                } else if (g_state.screen_mode == c6os::ScreenMode::DIAGNOSTICS) {
+                    g_state.markDirty(c6os::DIRTY_CARDS);
+                }
+            }
+            prev_eff_bl = eff_bl;
             xSemaphoreGive(g_mutex);
         }
     }
 
     bool should_render = false;
+    bool panel_sleeping = false;
+    uint8_t eff_bl = 100;
     if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(30)) == pdTRUE) {
-        if (g_state.ui_dirty) {
+        if (g_state.alert_active && g_state.screen_sleeping) {
+            g_state.screen_sleeping = false;
+            g_state.markDirty(c6os::DIRTY_FULL);
+        }
+        panel_sleeping = g_state.screen_sleeping;
+        eff_bl = g_state.effectiveBacklightPct();
+        if (!panel_sleeping && g_state.ui_dirty) {
             uint8_t dmask = g_state.dirty_regions ? g_state.dirty_regions : c6os::DIRTY_FULL;
             render_snap.captureFrom(g_state, dmask);
             g_state.ui_dirty = false;
@@ -1716,6 +1759,7 @@ void loop() {
         xSemaphoreGive(g_mutex);
     }
 
+    g_screen.applyPowerState(panel_sleeping, eff_bl);
     if (should_render) {
         g_screen.render(render_snap, false);
     }

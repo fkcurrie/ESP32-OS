@@ -59,6 +59,15 @@ size_t formatDefaultAuthorizedKeys(char* out, size_t out_cap);
 bool isPubkeyAuthorized(const char* authorized_keys_text,
                         const uint8_t* pk_blob, size_t pk_blob_len);
 
+// Parse OpenSSH 'ssh-ed25519 <base64>' (or 64-hex-char raw pubkey) entries from
+// /etc/epkg/trusted_keys into 32-byte Ed25519 public keys. Returns count parsed.
+size_t parseEd25519TrustedKeys(const char* trusted_keys_text,
+                               uint8_t (*out_pks)[32], size_t max_keys);
+
+// Format a 32-byte Ed25519 public key as a standard OpenSSH 'ssh-ed25519 <base64> [comment]\n' line
+size_t formatOpenSshEd25519Pubkey(const uint8_t pk[32], const char* comment,
+                                  char* out_line, size_t out_cap);
+
 // Build RFC 4252 §7 publickey signed data payload
 size_t buildUserauthSignedData(const uint8_t session_id[32],
                                const char* username,
