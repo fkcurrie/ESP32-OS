@@ -719,6 +719,89 @@ void test_scanline_fbgrab_bmp_ppm_tz_chsh_apitoken_and_reserved_pins(void) {
     TEST_ASSERT_NOT_NULL(strstr(out, "max execution depth"));
 }
 
+void test_vfs_usage_dirty_selective_snapshot_and_8row_strip_parity(void) {
+    SystemState state;
+    state.initDefaults();
+    VirtualFs vfs;
+    vfs.initDefaultFiles(state);
+
+    // 1. VFS usage_dirty_ lifecycle avoids redundant flash metadata scans on read-only ticks
+    TEST_ASSERT_TRUE(vfs.consumeUsageDirty());
+    TEST_ASSERT_FALSE(vfs.consumeUsageDirty());
+
+    char buf[128] = {0};
+    TEST_ASSERT_TRUE(vfs.readFile(state, "/etc/hostname", buf, sizeof(buf)));
+    size_t sz = 0;
+    TEST_ASSERT_TRUE(vfs.fileSize("/etc/rc.local", &sz));
+    TEST_ASSERT_FALSE(vfs.consumeUsageDirty());
+
+    TEST_ASSERT_TRUE(vfs.writeFile(state, "/tmp/dirty_check.txt", "hello\n", false));
+    TEST_ASSERT_TRUE(vfs.consumeUsageDirty());
+    TEST_ASSERT_FALSE(vfs.consumeUsageDirty());
+
+    TEST_ASSERT_TRUE(vfs.mkdirPath("/tmp/subd"));
+    TEST_ASSERT_TRUE(vfs.consumeUsageDirty());
+    TEST_ASSERT_TRUE(vfs.renamePath("/tmp/dirty_check.txt", "/tmp/subd/moved.txt"));
+    TEST_ASSERT_TRUE(vfs.consumeUsageDirty());
+    TEST_ASSERT_TRUE(vfs.removeFile(state, "/tmp/subd/moved.txt"));
+    TEST_ASSERT_TRUE(vfs.consumeUsageDirty());
+    TEST_ASSERT_TRUE(vfs.rmdirPath("/tmp/subd"));
+    TEST_ASSERT_TRUE(vfs.consumeUsageDirty());
+    TEST_ASSERT_FALSE(vfs.consumeUsageDirty());
+
+    // 2. Mode-selective RenderSnapshot::captureFrom preserves active mode & overlay fields
+    state.appendDmesg(1234, "kernel: selective snapshot check");
+    strncpy(state.ssh_hostkey_fp, "SHA256:TestKeyFingerprint12345", sizeof(state.ssh_hostkey_fp) - 1);
+    state.ticker_enabled = true;
+    strncpy(state.ticker_text, "Rolling telemetry ticker", sizeof(state.ticker_text) - 1);
+    state.custom_bar_visible = true;
+    state.custom_bar_pct = 64;
+    strncpy(state.custom_bar_label, "OTA Sync", sizeof(state.custom_bar_label) - 1);
+
+    RenderSnapshot snap = {};
+    state.screen_mode = ScreenMode::OS_DASHBOARD;
+    snap.captureFrom(state, DIRTY_FULL);
+    TEST_ASSERT_EQUAL_STRING(state.headline, snap.headline);
+    TEST_ASSERT_EQUAL_STRING(state.ticker_text, snap.ticker_text);
+    TEST_ASSERT_EQUAL_STRING("OTA Sync", snap.custom_bar_label);
+
+    state.screen_mode = ScreenMode::DIAGNOSTICS;
+    snap.captureFrom(state, DIRTY_FULL);
+    TEST_ASSERT_EQUAL_STRING("SHA256:TestKeyFingerprint12345", snap.ssh_hostkey_fp);
+
+    state.screen_mode = ScreenMode::FB_CONSOLE;
+    snap.captureFrom(state, DIRTY_FULL);
+    TEST_ASSERT_TRUE(snap.fb_line_count > 0);
+
+    // 3. 8-row strip rendering (DMA_STRIP_ROWS == 8) matches full-frame rasterization bit-for-bit
+    TEST_ASSERT_EQUAL_INT16(8, display::DMA_STRIP_ROWS);
+    HeapArray<uint16_t> full_fb(static_cast<size_t>(display::FB_WIDTH) * display::FB_HEIGHT);
+    HeapArray<uint16_t> tiled_fb(static_cast<size_t>(display::FB_WIDTH) * display::FB_HEIGHT);
+    TEST_ASSERT_TRUE(static_cast<bool>(full_fb));
+    TEST_ASSERT_TRUE(static_cast<bool>(tiled_fb));
+
+    for (uint8_t m = 0; m < static_cast<uint8_t>(ScreenMode::COUNT); ++m) {
+        state.screen_mode = static_cast<ScreenMode>(m);
+        state.alert_active = (m == static_cast<uint8_t>(ScreenMode::MONITOR));
+        strncpy(state.alert_text, "HIGH TEMP TEST", sizeof(state.alert_text) - 1);
+        snap.captureFrom(state, DIRTY_FULL);
+
+        display::renderStrip(snap, 0, display::FB_HEIGHT, full_fb.get(), false);
+        memset(tiled_fb.get(), 0xA5, tiled_fb.bytes());
+        for (int16_t y = 0; y < display::FB_HEIGHT; y = static_cast<int16_t>(y + display::DMA_STRIP_ROWS)) {
+            int16_t h = display::DMA_STRIP_ROWS;
+            if (y + h > display::FB_HEIGHT) {
+                h = static_cast<int16_t>(display::FB_HEIGHT - y);
+            }
+            display::renderStrip(
+                snap, y, h,
+                tiled_fb.get() + static_cast<size_t>(y) * static_cast<size_t>(display::FB_WIDTH),
+                false);
+        }
+        TEST_ASSERT_EQUAL_MEMORY(full_fb.get(), tiled_fb.get(), full_fb.bytes());
+    }
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -733,5 +816,6 @@ int main(int argc, char** argv) {
     RUN_TEST(test_epkg_install_sha256_tamper_reject_and_lua_runtime);
     RUN_TEST(test_rv32imac_elf_sandbox_execution);
     RUN_TEST(test_scanline_fbgrab_bmp_ppm_tz_chsh_apitoken_and_reserved_pins);
+    RUN_TEST(test_vfs_usage_dirty_selective_snapshot_and_8row_strip_parity);
     return UNITY_END();
 }

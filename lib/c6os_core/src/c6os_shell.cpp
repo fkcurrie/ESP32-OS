@@ -118,6 +118,15 @@ void formatLiveTaskCommand(const char* raw_name, uint16_t ssh_port,
     if (strcmp(raw_name, "sshd") == 0) {
         snprintf(out_cmd, cmd_cap, "/usr/sbin/sshd -D -p %u", static_cast<unsigned>(ssh_port));
         snprintf(out_tree, tree_cap, "+- /usr/sbin/sshd -p %u", static_cast<unsigned>(ssh_port));
+    } else if (strcmp(raw_name, "sshd_priv") == 0) {
+        snprintf(out_cmd, cmd_cap, "/usr/sbin/sshd: root@pts");
+        snprintf(out_tree, tree_cap, "|  `- sshd: root@pts");
+    } else if (strcmp(raw_name, "net_mgr") == 0) {
+        snprintf(out_cmd, cmd_cap, "/usr/sbin/netd [http:80,udp:514]");
+        snprintf(out_tree, tree_cap, "+- /usr/sbin/netd");
+    } else if (strcmp(raw_name, "ttyACM0") == 0) {
+        snprintf(out_cmd, cmd_cap, "/sbin/agetty ttyACM0 115200");
+        snprintf(out_tree, tree_cap, "+- /sbin/agetty ttyACM0");
     } else if (strcmp(raw_name, "loopTask") == 0 || strcmp(raw_name, "main") == 0) {
         snprintf(out_cmd, cmd_cap, "/sbin/init [%s]", raw_name);
         snprintf(out_tree, tree_cap, "/sbin/init [%s]", raw_name);

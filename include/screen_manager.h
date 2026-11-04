@@ -21,6 +21,7 @@ public:
     void begin();
     void render(const RenderSnapshot& snap, bool force_full = false);
     void renderState(const SystemState& state, bool force_full = false);
+    RenderSnapshot& snapshot() { return snap_; }
 
 private:
     lcd::St7789Lcd lcd_;

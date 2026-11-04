@@ -71,11 +71,24 @@ public:
     bool rmdirPath(const char* abs_path) const;
     bool renamePath(const char* old_abs, const char* new_abs) const;
 
+    // Tracks whether flash filesystem byte usage needs recomputing
+    bool consumeUsageDirty() const {
+        if (!usage_dirty_) return false;
+        usage_dirty_ = false;
+        return true;
+    }
+
 private:
+#ifdef ESP_PLATFORM
+    char rootfs_prefix_[24];
+    char sd_prefix_[24];
+#else
     char rootfs_prefix_[96];
     char sd_prefix_[96];
     char temp_base_[96];
     bool owns_temp_root_;
+#endif
+    mutable bool usage_dirty_;
 
     void ensureParentDirs(const char* real_path) const;
 };

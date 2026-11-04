@@ -2,7 +2,6 @@
 #define SSH_SERVER_H
 
 #include <Arduino.h>
-#include <WiFi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <stdint.h>
@@ -15,24 +14,27 @@ namespace c6os {
 
 class SshServer {
 public:
-    SshServer(uint16_t port = 22)
-        : server_(port), port_(port) {
+    explicit SshServer(uint16_t port = 22)
+        : listen_fd_(-1), port_(port) {
         memset(host_pk_, 0, sizeof(host_pk_));
         memset(host_sk_, 0, sizeof(host_sk_));
     }
 
-    // Initializes or loads persistent ssh-ed25519 host key from NVS and starts listening on port 22
+    ~SshServer();
+
+    // Initializes or loads persistent ssh-ed25519 host key from NVS and binds port 22
     void begin(SystemState& state, SemaphoreHandle_t mutex);
 
-    // Non-blocking accept dispatcher called from the sshd FreeRTOS task loop
+    // Event-driven select() accept dispatcher called from the sshd FreeRTOS task loop
     void pollAcceptAndServe(SystemState& state, VirtualFs& vfs, SemaphoreHandle_t mutex);
 
-    void serveAcceptedClient(WiFiClient client, SystemState& state, VirtualFs& vfs, SemaphoreHandle_t mutex);
+    void serveAcceptedClient(int client_fd, const char* remote_ip,
+                             SystemState& state, VirtualFs& vfs, SemaphoreHandle_t mutex);
 
 private:
-    void handleClient(WiFiClient& client, SystemState& state, VirtualFs& vfs, SemaphoreHandle_t mutex);
+    void handleClient(int client_fd, SystemState& state, VirtualFs& vfs, SemaphoreHandle_t mutex);
 
-    WiFiServer server_;
+    int listen_fd_;
     uint16_t port_;
     uint8_t host_pk_[32];
     uint8_t host_sk_[64];

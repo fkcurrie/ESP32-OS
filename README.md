@@ -2,7 +2,7 @@
 
 **Status:** Active (`c6os 6.12`) • November 2026.
 
-**TL;DR:** Standard ESP32 firmware requires a full recompile and USB reflash for every small script or tool change. We built `C6-MicroLinux` (`c6os`) for the Waveshare `ESP32-C6-LCD-1.47` (`ESP32-C6FH4`, `160 MHz` RISC-V, `320 KB` SRAM, `8 MB` QIO Flash). Engineers log in over SSHv2, push files via SFTP v3, and install Lua 5.4, RISC-V `.elf`, or shell apps via `epkg`. The QIO image uses `54,684 B` of static SRAM and `1,811,472 B` of flash. Because `ESP32-C6` lacks an MMU, apps run in bounded heap sandboxes, leaving multi-key `epkg` signing as our main open question.
+**TL;DR:** Standard ESP32 firmware requires a full recompile and USB reflash for every small script or tool change. We built `C6-MicroLinux` (`c6os`) for the Waveshare `ESP32-C6-LCD-1.47` (`ESP32-C6FH4`, `160 MHz` RISC-V, `320 KB` SRAM, `8 MB` QIO Flash). Engineers log in over SSHv2, push files via SFTP v3, and install Lua 5.4, RISC-V `.elf`, or shell apps via `epkg`. The QIO image uses `54,796 B` of static SRAM and `1,839,664 B` of flash, while freeing `28.6 KB` of idle internal RAM and cutting background task wakeups by `80.9%`. Because `ESP32-C6` lacks an MMU, apps run in bounded sandboxes, leaving multi-key `epkg` signing as our main open question.
 
 ---
 
@@ -10,17 +10,17 @@
 
 `C6-MicroLinux` turns a single-core RISC-V microcontroller into a live, network-accessible Linux-style node. Operators connect over 2.4 GHz Wi-Fi via `ssh root@<ip>` or attach over USB-Serial on `/dev/ttyACM0`. From there, they control the `320x172` IPS display, onboard `WS2812` LED, BLE 5.0 radio, and general-purpose pins.
 
-At boot, `main.cpp` mounts `LittleFS` for `/etc`, `/root`, and `/apps`, and mounts any FAT32 microSD card on `SPI2_HOST`. Static SRAM dropped from `64,928 B` to `54,684 B`, saving `10,244 B` after replacing `libsodium` with `mbedTLS` and scanline DMA. All user runtimes (`SFTP v3`, `Lua 5.4`, `RV32IMAC` ELF VM, and `NimBLE 5.0`) use `0 B` of idle heap until called.
+At boot, `main.cpp` mounts `LittleFS` for `/etc`, `/root`, and `/apps`, and mounts any FAT32 microSD card on `SPI2_HOST`. Static SRAM sits at `54,796 B` (`16.7%` of `320 KB`), `8`-row DMA strip buffers hold `10,240 B`, and idle daemons block in `lwip_select()` rather than spin-polling sockets. All user runtimes (`SFTP v3`, `Lua 5.4`, `RV32IMAC` ELF VM, and `NimBLE 5.0`) use `0 B` of idle heap until called.
 
 | Subsystem | Implementation & Measured Bounds |
 | :--- | :--- |
 | Target Hardware | `ESP32-C6FH4` (`RV32IMAC` @ `160 MHz`, `320 KB` SRAM, `8 MB` QIO Flash @ `80 MHz`) + `1.47"` `ST7789` (`320x172` RGB565) |
-| Firmware Size | Static SRAM: `54,684 B / 327,680 B` (`16.7%`); Flash: `1,811,472 B / 3,342,336 B` (`54.2%`) |
-| SSHv2 & SFTP v3 (`:22`) | `curve25519-sha256` KEX, `aes128-ctr`, `hmac-sha2-256`, two-way window adjust, `ssh-ed25519` + `rsa-sha2-256/512` key verify against `/etc/ssh/authorized_keys`, 1024-round salted SHA-256 NVS `passwd`, and binary `sftp` |
+| Firmware Size | Static SRAM: `54,796 B / 327,680 B` (`16.7%`, CI gate `57,344 B`); Flash binary: `1,839,664 B / 3,342,336 B` (`55.0%`) |
+| SSHv2 & SFTP v3 (`:22`) | Non-blocking `lwip_select()` sockets, `5,824 B` session workspace, `curve25519-sha256` KEX, `aes128-ctr`, `hmac-sha2-256`, `ssh-ed25519` + `rsa-sha2-256/512`, NVS `passwd`, and binary `sftp` |
 | User App Runtime | `epkg` (`EPK1` + SHA-256 check), 32-bit `Lua 5.4` (`64 KB` heap cap, `300k`-op hook), `RV32IMAC` `.elf` VM (`48 KB` sandbox), and `.sh` scripts (recursion depth `4`) |
-| Display Engine | `esp_lcd_panel_io_spi` @ `80 MHz` on `SPI2_HOST`, `20.4 KB` (`2 x 320 x 16 x 2 B`) DMA scanline buffers, dirty-region flags, and pixel-accurate `320x172` `.bmp`/`.ppm` `fbgrab` |
-| Radios & Buses | Event-driven Wi-Fi STA + WPA2 SoftAP (`C6-Linux-OS`), lazy ESP-IDF `NimBLE 5.0` (`ble`), `gpio` (`0..23` non-reserved), `pwm`, `adc` (`GPIO 0..3`), `i2c`, and lwIP ICMP `ping` |
-| Telemetry & HTTP (`:80`) | Live FreeRTOS `uxTaskGetSystemState()` in `ps`/`top`, `/proc` & `/sys` VFS, `America/Toronto` POSIX `tz`, read-only `/api/status`, and NVS bearer-gated `/api/cmd` |
+| Display Engine | `esp_lcd_panel_io_spi` @ `80 MHz` on `SPI2_HOST`, `10.2 KB` (`2 x 320 x 8 x 2 B`) DMA scanline buffers, Y-clipped dirty strips, and pixel-accurate `320x172` `.bmp`/`.ppm` `fbgrab` |
+| Radios & Buses | Event-driven Wi-Fi STA (`WIFI_PS_MIN_MODEM` when idle, `WIFI_PS_NONE` on active SSH) + WPA2 SoftAP, lazy `NimBLE 5.0`, `gpio`, `pwm`, `adc`, `i2c`, and ICMP `ping` |
+| Telemetry & HTTP (`:80`) | O(1) `ulTaskGetIdleRunTimeCounter()` 1 Hz CPU load, `uxTaskGetSystemState()` in `ps`/`top`, dirty-gated `LittleFS` usage, `/proc` & `/sys`, and lwIP `/api/status` + `/api/cmd` |
 
 ---
 
@@ -102,7 +102,7 @@ curl -s -H "Authorization: Bearer <TOKEN>" "http://<BOARD_IP>/api/cmd?c=sensors"
 
 ## 5. Building, Testing, and Flashing
 
-Run the 10-suite host test harness on Linux or macOS before building the ESP32-C6 image.
+Run the 11-suite host test harness on Linux or macOS before building the ESP32-C6 image.
 
 ```bash
 # Run host unit tests (SSH crypto, SFTP v3, epkg, Lua 5.4, RV32IMAC ELF VM, fbgrab)

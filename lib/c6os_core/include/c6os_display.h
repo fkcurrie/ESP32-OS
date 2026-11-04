@@ -12,7 +12,7 @@ namespace display {
 
 constexpr int16_t FB_WIDTH  = 320;
 constexpr int16_t FB_HEIGHT = 172;
-constexpr int16_t DMA_STRIP_ROWS = 16;  // 2 x 320 x 16 x 2B = 20,480 B dual-DMA buffer
+constexpr int16_t DMA_STRIP_ROWS = 8;   // 2 x 320 x 8 x 2B = 10,240 B dual-DMA buffer
 
 // Returns true if horizontal strip [y0, y1) intersects any region marked in dirty_mask
 bool stripOverlapsDirty(uint8_t dirty_mask, int16_t y0, int16_t y1);

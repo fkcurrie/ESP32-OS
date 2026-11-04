@@ -263,7 +263,7 @@ constexpr size_t DMESG_LINE_LEN  = 76;
 
 struct WifiScanEntry {
     char ssid[33];
-    int32_t rssi;
+    int8_t rssi;
     uint8_t channel;
     bool open;
 };
@@ -453,18 +453,18 @@ struct SystemState {
     bool fs_sync_requested;
 
     // Latest Wi-Fi Scan Results
-    size_t wifi_scan_count;
+    uint8_t wifi_scan_count;
     WifiScanEntry wifi_scan[MAX_WIFI_SCAN_RESULTS];
 
     // O(1) Ring-Indexed Framebuffer Console (/dev/tty0 on physical LCD)
     char fb_lines[FB_CONSOLE_ROWS][FB_CONSOLE_COLS + 1];
-    size_t fb_head;
-    size_t fb_line_count;
+    uint8_t fb_head;
+    uint8_t fb_line_count;
 
     // O(1) Ring-Indexed Kernel Ring Buffer (dmesg)
     char dmesg[DMESG_MAX_LINES][DMESG_LINE_LEN];
-    size_t dmesg_head;
-    size_t dmesg_count;
+    uint8_t dmesg_head;
+    uint8_t dmesg_count;
 
     void markDirty(uint8_t regions = DIRTY_FULL) {
         ui_dirty = true;
@@ -519,7 +519,7 @@ struct SystemState {
                 ++fb_line_count;
             } else {
                 slot = fb_head;
-                fb_head = (fb_head + 1) % FB_CONSOLE_ROWS;
+                fb_head = static_cast<uint8_t>((fb_head + 1U) % FB_CONSOLE_ROWS);
             }
             memcpy(fb_lines[slot], line, len + 1);
             if (len == 0 && *text == '\0') break;
@@ -575,7 +575,7 @@ struct SystemState {
             ++dmesg_count;
         } else {
             slot = dmesg_head;
-            dmesg_head = (dmesg_head + 1) % DMESG_MAX_LINES;
+            dmesg_head = static_cast<uint8_t>((dmesg_head + 1U) % DMESG_MAX_LINES);
         }
         memcpy(dmesg[slot], formatted, static_cast<size_t>(pos) + 1);
         appendFbConsoleLine(formatted);
