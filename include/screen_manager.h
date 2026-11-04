@@ -19,6 +19,7 @@ public:
           last_fbi_pattern_(255) {}
 
     void begin();
+    void applyPowerState(bool sleeping, uint8_t effective_backlight);
     void render(const RenderSnapshot& snap, bool force_full = false);
     void renderState(const SystemState& state, bool force_full = false);
     RenderSnapshot& snapshot() { return snap_; }

@@ -325,6 +325,8 @@ struct HardwareOps {
     void (*rotate_api_token)(char out_token[33]);
     uint32_t (*uptime_ms)();
     uint32_t (*free_heap)();
+    // Optional: FAT32 microSD usage via f_getfree(); returns 0 on success
+    int (*sd_usage)(uint64_t* out_total_bytes, uint64_t* out_free_bytes);
 };
 
 void setHardwareOps(const HardwareOps* ops);
@@ -351,7 +353,21 @@ struct SystemState {
     uint32_t rootfs_used_kb;
     bool sd_mounted;
     uint32_t sd_total_mb;
+    uint32_t sd_used_mb;
+    uint32_t sd_free_mb;
     uint32_t uptime_sec;
+
+    // Persistent syslogd rotation (/mnt/sd/var/log/messages or /var/log/messages fallback)
+    bool log_persist_enabled;
+    bool log_sd_paused;          // true while microSD free space sits below the floor
+    bool log_flush_requested;    // set by `logrotate flush` / sync / reboot
+    bool log_rotate_requested;   // set by `logrotate force`
+    uint16_t log_file_cap_kb;    // per-file ceiling (default 256 KB)
+    uint8_t log_file_count;      // messages + rotated generations (default 4 => 1 MB)
+    uint32_t dmesg_seq;          // monotonic count of appendDmesg() calls
+    uint32_t log_lines_written;
+    uint32_t log_rotations;
+    uint32_t log_lines_dropped;
 
     // Thermal, CPU Load Sparkline, and Wall-Clock NTP State
     int16_t cpu_temp_deci_c;  // e.g., 415 -> 41.5 C
@@ -408,6 +424,10 @@ struct SystemState {
     ThemeId theme;
     uint8_t backlight_pct;
     bool landscape_flipped;
+    bool screen_sleeping;
+    uint16_t screen_dim_sec;
+    uint16_t screen_sleep_sec;
+    uint32_t last_activity_sec;
     char headline[48];
     char subtitle[64];
     char banner_footer[64];
@@ -469,6 +489,38 @@ struct SystemState {
     void markDirty(uint8_t regions = DIRTY_FULL) {
         ui_dirty = true;
         dirty_regions |= regions;
+    }
+
+    void noteActivity() {
+        bool was_dimmed = (screen_dim_sec > 0 && idleSeconds() >= screen_dim_sec);
+        last_activity_sec = uptime_sec;
+        if (screen_sleeping) {
+            screen_sleeping = false;
+            markDirty(DIRTY_FULL);
+        } else if (was_dimmed) {
+            markDirty(DIRTY_HEADER);
+        }
+    }
+
+    uint32_t idleSeconds() const {
+        return (uptime_sec >= last_activity_sec) ? (uptime_sec - last_activity_sec) : 0U;
+    }
+
+    bool shouldPanelSleep() const {
+        if (alert_active || screen_sleep_sec == 0) return false;
+        return idleSeconds() >= screen_sleep_sec;
+    }
+
+    uint8_t effectiveBacklightPct() const {
+        if (alert_active) return backlight_pct;
+        uint32_t idle = idleSeconds();
+        if (screen_sleep_sec > 0 && idle >= screen_sleep_sec) {
+            return 0;
+        }
+        if (screen_dim_sec > 0 && idle >= screen_dim_sec) {
+            return (backlight_pct < 15U) ? backlight_pct : 15U;
+        }
+        return backlight_pct;
     }
 
     const char* fbLineAt(size_t logical_idx) const {
@@ -578,6 +630,7 @@ struct SystemState {
             dmesg_head = static_cast<uint8_t>((dmesg_head + 1U) % DMESG_MAX_LINES);
         }
         memcpy(dmesg[slot], formatted, static_cast<size_t>(pos) + 1);
+        ++dmesg_seq;
         appendFbConsoleLine(formatted);
     }
 };

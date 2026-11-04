@@ -7,6 +7,7 @@
 #include "c6os_epkg.h"
 #include "c6os_lua.h"
 #include "c6os_shell.h"
+#include "c6os_syslog.h"
 #include "c6os_types.h"
 #include "c6os_vfs.h"
 #include "ssh_auth.h"
@@ -802,6 +803,444 @@ void test_vfs_usage_dirty_selective_snapshot_and_8row_strip_parity(void) {
     }
 }
 
+void test_screen_idle_dim_panel_sleep_and_wake(void) {
+    SystemState state;
+    state.initDefaults();
+    VirtualFs vfs;
+    vfs.initDefaultFiles(state);
+
+    TEST_ASSERT_EQUAL_UINT16(120, state.screen_dim_sec);
+    TEST_ASSERT_EQUAL_UINT16(600, state.screen_sleep_sec);
+    TEST_ASSERT_EQUAL_UINT8(100, state.effectiveBacklightPct());
+    TEST_ASSERT_FALSE(state.shouldPanelSleep());
+
+    // Stage 1: After 120s idle, backlight dims to 15% without panel sleep
+    state.uptime_sec = 125;
+    TEST_ASSERT_EQUAL_UINT8(15, state.effectiveBacklightPct());
+    TEST_ASSERT_FALSE(state.shouldPanelSleep());
+    RenderSnapshot snap = {};
+    snap.captureFrom(state, DIRTY_HEADER);
+    TEST_ASSERT_EQUAL_UINT8(15, snap.backlight_pct);
+
+    // Stage 2: After 600s idle, backlight drops to 0% and ST7789 enters panel sleep
+    state.uptime_sec = 605;
+    TEST_ASSERT_EQUAL_UINT8(0, state.effectiveBacklightPct());
+    TEST_ASSERT_TRUE(state.shouldPanelSleep());
+
+    // Critical alert wakes display policy immediately even while idle
+    ShellSession session;
+    char out[1024];
+    session.begin(state, vfs, false, out, sizeof(out));
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "screen alert ThermalTrip", out, sizeof(out)));
+    TEST_ASSERT_TRUE(state.alert_active);
+    TEST_ASSERT_FALSE(state.shouldPanelSleep());
+    TEST_ASSERT_EQUAL_UINT8(100, state.effectiveBacklightPct());
+
+    // Clear alert, enter sleep, then wake via interactive shell input
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "screen clear", out, sizeof(out)));
+    state.screen_sleeping = true;
+    state.last_activity_sec = 0;
+    state.dirty_regions = 0;
+    state.ui_dirty = false;
+    out[0] = '\0';
+    session.consumeBytes(state, vfs, "\n", 1, out, sizeof(out));
+    TEST_ASSERT_FALSE(state.screen_sleeping);
+    TEST_ASSERT_EQUAL_UINT32(605, state.last_activity_sec);
+    TEST_ASSERT_EQUAL_UINT8(100, state.effectiveBacklightPct());
+    TEST_ASSERT_TRUE((state.dirty_regions & DIRTY_FULL) != 0);
+
+    // CLI and sysfs timeout configuration
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "screen timeout 30 90", out, sizeof(out)));
+    TEST_ASSERT_EQUAL_UINT16(30, state.screen_dim_sec);
+    TEST_ASSERT_EQUAL_UINT16(90, state.screen_sleep_sec);
+
+    TEST_ASSERT_TRUE(vfs.writeFile(state, "/sys/class/graphics/fb0/timeout", "45 180\n", false));
+    TEST_ASSERT_EQUAL_UINT16(45, state.screen_dim_sec);
+    TEST_ASSERT_EQUAL_UINT16(180, state.screen_sleep_sec);
+    char sys_buf[64] = {0};
+    TEST_ASSERT_TRUE(vfs.readFile(state, "/sys/class/graphics/fb0/timeout", sys_buf, sizeof(sys_buf)));
+    TEST_ASSERT_EQUAL_STRING("45 180\n", sys_buf);
+
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "screen timeout off", out, sizeof(out)));
+    TEST_ASSERT_EQUAL_UINT16(0, state.screen_dim_sec);
+    TEST_ASSERT_EQUAL_UINT16(0, state.screen_sleep_sec);
+}
+
+void test_epkg_ed25519_trust_on_populate_and_streamed_install(void) {
+    SystemState state;
+    state.initDefaults();
+    VirtualFs vfs;
+    vfs.initDefaultFiles(state);
+
+    ShellSession session;
+    char out[2048];
+    session.begin(state, vfs, false, out, sizeof(out));
+
+    // 1. Default /etc/epkg/trusted_keys has 0 keys -> unsigned multi-chunk (> 4 KB) EPK1 streams cleanly
+    const size_t big_len = 5400;  // Spans 3 x 2,048 B streaming chunks
+    HeapArray<uint8_t> big_src(big_len);
+    HeapArray<uint8_t> pkg_blob(big_len + 512);
+    TEST_ASSERT_TRUE(static_cast<bool>(big_src) && static_cast<bool>(pkg_blob));
+    for (size_t i = 0; i < big_len; ++i) {
+        big_src[i] = static_cast<uint8_t>('A' + (i % 26));
+    }
+    size_t u_len = epkg::buildPackageBlob(
+        "stream-blob", "1.0.0", "noarch", "Multi-chunk streamed asset",
+        "/apps/streamed.dat", 0644, big_src.get(), big_len,
+        pkg_blob.get(), pkg_blob.bytes());
+    TEST_ASSERT_TRUE(u_len > 178 + big_len);
+    TEST_ASSERT_TRUE(vfs.writeBinary(state, "/tmp/unsigned.epkg", pkg_blob.get(), u_len, false));
+
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "epkg install /tmp/unsigned.epkg", out, sizeof(out)));
+    TEST_ASSERT_NOT_NULL(strstr(out, "installed stream-blob 1.0.0"));
+
+    HeapArray<uint8_t> read_back(big_len);
+    size_t got = 0;
+    TEST_ASSERT_TRUE(vfs.readBinary("/apps/streamed.dat", 0, read_back.get(), big_len, &got));
+    TEST_ASSERT_EQUAL_UINT32(big_len, got);
+    TEST_ASSERT_EQUAL_MEMORY(big_src.get(), read_back.get(), big_len);
+
+    // 2. Populate /etc/epkg/trusted_keys with an Ed25519 key -> unsigned EPK1 rejected unless --allow-unsigned
+    uint8_t trusted_seed[32], rogue_seed[32];
+    for (size_t i = 0; i < 32; ++i) {
+        trusted_seed[i] = static_cast<uint8_t>(0x11U + i);
+        rogue_seed[i]   = static_cast<uint8_t>(0x91U + i);
+    }
+    uint8_t trusted_pk[32], trusted_sk[64], rogue_pk[32], rogue_sk[64];
+    crypto::ed25519KeypairFromSeed(trusted_pk, trusted_sk, trusted_seed);
+    crypto::ed25519KeypairFromSeed(rogue_pk, rogue_sk, rogue_seed);
+
+    char pub_line[160] = {0};
+    TEST_ASSERT_TRUE(crypto::formatOpenSshEd25519Pubkey(trusted_pk, "release@c6-linux", pub_line, sizeof(pub_line)) > 0);
+    strncat(pub_line, "\n", sizeof(pub_line) - strlen(pub_line) - 1);
+    TEST_ASSERT_TRUE(vfs.writeFile(state, "/etc/epkg/trusted_keys", pub_line, false));
+
+    out[0] = '\0';
+    session.executeCommandLine(state, vfs, "epkg install /tmp/unsigned.epkg", out, sizeof(out));
+    TEST_ASSERT_NOT_NULL(strstr(out, "unsigned EPK1 rejected"));
+
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(
+        state, vfs, "epkg install --allow-unsigned /tmp/unsigned.epkg", out, sizeof(out)));
+    TEST_ASSERT_NOT_NULL(strstr(out, "installed stream-blob 1.0.0"));
+
+    // 3. Valid Ed25519-signed EPK2 installs cleanly and records signed=ed25519
+    const char* lua_code = "print('signed_epk2_ok')\n";
+    size_t s_len = epkg::buildSignedPackageBlob(
+        "signed-tool", "2.0.0", "noarch", "Signed EPK2 package",
+        "/apps/signed_tool.lua", 0755,
+        reinterpret_cast<const uint8_t*>(lua_code), strlen(lua_code),
+        trusted_sk, pkg_blob.get(), pkg_blob.bytes());
+    TEST_ASSERT_TRUE(s_len > 242);
+    TEST_ASSERT_TRUE(vfs.writeBinary(state, "/tmp/signed.epkg", pkg_blob.get(), s_len, false));
+
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "epkg install /tmp/signed.epkg", out, sizeof(out)));
+    TEST_ASSERT_NOT_NULL(strstr(out, "Ed25519 + SHA-256 verified"));
+
+    char manifest[512] = {0};
+    TEST_ASSERT_TRUE(vfs.readFile(state, "/var/pkg/signed-tool.manifest", manifest, sizeof(manifest)));
+    TEST_ASSERT_NOT_NULL(strstr(manifest, "signed=ed25519"));
+
+    // 4. Tampered EPK2 signature & untrusted-signer EPK2 are rejected even with --allow-unsigned
+    pkg_blob[200] ^= 0x01U;
+    TEST_ASSERT_TRUE(vfs.writeBinary(state, "/tmp/bad_sig.epkg", pkg_blob.get(), s_len, false));
+    out[0] = '\0';
+    session.executeCommandLine(state, vfs, "epkg install --allow-unsigned /tmp/bad_sig.epkg", out, sizeof(out));
+    TEST_ASSERT_NOT_NULL(strstr(out, "Ed25519 signature verification FAILED"));
+
+    size_t r_len = epkg::buildSignedPackageBlob(
+        "rogue-tool", "1.0.0", "noarch", "Untrusted signer",
+        "/apps/rogue.lua", 0755,
+        reinterpret_cast<const uint8_t*>(lua_code), strlen(lua_code),
+        rogue_sk, pkg_blob.get(), pkg_blob.bytes());
+    TEST_ASSERT_TRUE(vfs.writeBinary(state, "/tmp/rogue.epkg", pkg_blob.get(), r_len, false));
+    out[0] = '\0';
+    session.executeCommandLine(state, vfs, "epkg install /tmp/rogue.epkg", out, sizeof(out));
+    TEST_ASSERT_NOT_NULL(strstr(out, "Ed25519 signature verification FAILED"));
+}
+
+namespace {
+
+size_t buildMinimalExecElf(const uint32_t* insts, size_t inst_count,
+                           uint32_t p_flags, uint32_t p_memsz,
+                           uint8_t* out_buf, size_t out_cap) {
+    const size_t code_off = 0x80U;
+    const size_t code_bytes = inst_count * 4U;
+    if (code_off + code_bytes > out_cap) return 0;
+    memset(out_buf, 0, code_off + code_bytes);
+
+    auto wr16le = [](uint8_t* p, uint16_t v) {
+        p[0] = static_cast<uint8_t>(v & 0xFFU);
+        p[1] = static_cast<uint8_t>((v >> 8) & 0xFFU);
+    };
+    auto wr32le = [](uint8_t* p, uint32_t v) {
+        p[0] = static_cast<uint8_t>(v & 0xFFU);
+        p[1] = static_cast<uint8_t>((v >> 8) & 0xFFU);
+        p[2] = static_cast<uint8_t>((v >> 16) & 0xFFU);
+        p[3] = static_cast<uint8_t>((v >> 24) & 0xFFU);
+    };
+
+    // Elf32_Ehdr (52 bytes)
+    out_buf[0] = 0x7FU; out_buf[1] = 'E'; out_buf[2] = 'L'; out_buf[3] = 'F';
+    out_buf[4] = 1;  // ELFCLASS32
+    out_buf[5] = 1;  // ELFDATA2LSB
+    out_buf[6] = 1;  // EV_CURRENT
+    wr16le(out_buf + 16, 2);      // ET_EXEC
+    wr16le(out_buf + 18, 243);    // EM_RISCV
+    wr32le(out_buf + 20, 1);
+    wr32le(out_buf + 24, 0x00010000U);  // e_entry
+    wr32le(out_buf + 28, 52U);          // e_phoff
+    wr16le(out_buf + 40, 52U);          // e_ehsize
+    wr16le(out_buf + 42, 32U);          // e_phentsize
+    wr16le(out_buf + 44, 1U);           // e_phnum
+
+    // Elf32_Phdr at offset 52 (32 bytes)
+    uint8_t* ph = out_buf + 52U;
+    wr32le(ph + 0, 1U);                 // PT_LOAD
+    wr32le(ph + 4, code_off);           // p_offset
+    wr32le(ph + 8, 0x00010000U);        // p_vaddr
+    wr32le(ph + 12, 0x00010000U);       // p_paddr
+    wr32le(ph + 16, static_cast<uint32_t>(code_bytes));
+    wr32le(ph + 20, p_memsz);
+    wr32le(ph + 24, p_flags);
+    wr32le(ph + 28, 4U);
+
+    for (size_t i = 0; i < inst_count; ++i) {
+        wr32le(out_buf + code_off + i * 4U, insts[i]);
+    }
+    return code_off + code_bytes;
+}
+
+}  // namespace
+
+void test_rv32imac_elf_dynamic_sizing_and_wx_fencing(void) {
+    SystemState state;
+    state.initDefaults();
+    VirtualFs vfs;
+    vfs.initDefaultFiles(state);
+
+    // 1. Small ET_REL utility dynamically allocates 16 KB (16,384 B) instead of fixed 48 KB
+    TEST_ASSERT_TRUE(vfs.writeBinary(state, "/apps/small.elf", TEST_RV32_ELF, sizeof(TEST_RV32_ELF), false));
+    char log_buf[512];
+    BufWriter w(log_buf, sizeof(log_buf));
+    int exit_code = -1;
+    size_t vm_bytes = 0;
+    const char* argv_small[] = {"small", "Check16K"};
+    TEST_ASSERT_TRUE(elf::runElfFile(state, vfs, "/apps/small.elf", 2, argv_small, w, &exit_code, &vm_bytes));
+    TEST_ASSERT_EQUAL_INT(0, exit_code);
+    TEST_ASSERT_EQUAL_UINT32(16384U, static_cast<uint32_t>(vm_bytes));
+
+    // 2. Medium 16 KB PT_LOAD image scales sandbox dynamically to 24 KB (24,576 B)
+    uint8_t elf_buf[256];
+    const uint32_t ok_prog[] = {
+        0x02A00513U,  // addi a0, zero, 42
+        0x05D00893U,  // addi a7, zero, 93 (SYS_exit)
+        0x00000073U,  // ecall
+    };
+    size_t elen = buildMinimalExecElf(ok_prog, 3, 0x5U /* PF_R|PF_X */, 16384U, elf_buf, sizeof(elf_buf));
+    TEST_ASSERT_TRUE(elen > 0);
+    TEST_ASSERT_TRUE(vfs.writeBinary(state, "/apps/med24k.elf", elf_buf, elen, false));
+    BufWriter w2(log_buf, sizeof(log_buf));
+    TEST_ASSERT_TRUE(elf::runElfFile(state, vfs, "/apps/med24k.elf", 1, nullptr, w2, &exit_code, &vm_bytes));
+    TEST_ASSERT_EQUAL_INT(42, exit_code);
+    TEST_ASSERT_EQUAL_UINT32(24576U, static_cast<uint32_t>(vm_bytes));
+
+    // 3. Loader rejects PT_LOAD segment marked both Writable and Executable (PF_W | PF_X)
+    elen = buildMinimalExecElf(ok_prog, 3, 0x7U /* PF_R|PF_W|PF_X */, 64U, elf_buf, sizeof(elf_buf));
+    TEST_ASSERT_TRUE(vfs.writeBinary(state, "/apps/rwx_bad.elf", elf_buf, elen, false));
+    BufWriter w3(log_buf, sizeof(log_buf));
+    TEST_ASSERT_FALSE(elf::runElfFile(state, vfs, "/apps/rwx_bad.elf", 1, nullptr, w3, &exit_code, &vm_bytes));
+    TEST_ASSERT_NOT_NULL(strstr(log_buf, "W^X violation"));
+
+    // 4. Runtime traps STORE into executable .text (W^X write fault)
+    const uint32_t write_text_prog[] = {
+        0x00000297U,  // auipc t0, 0
+        0x0002A023U,  // sw zero, 0(t0)
+    };
+    elen = buildMinimalExecElf(write_text_prog, 2, 0x5U /* PF_R|PF_X */, 64U, elf_buf, sizeof(elf_buf));
+    TEST_ASSERT_TRUE(vfs.writeBinary(state, "/apps/wx_write.elf", elf_buf, elen, false));
+    BufWriter w4(log_buf, sizeof(log_buf));
+    TEST_ASSERT_FALSE(elf::runElfFile(state, vfs, "/apps/wx_write.elf", 1, nullptr, w4, &exit_code, &vm_bytes));
+    TEST_ASSERT_NOT_NULL(strstr(log_buf, "W^X write fault"));
+
+    // 5. Runtime traps JALR onto writable stack (W^X execute fault)
+    const uint32_t exec_stack_prog[] = {
+        0x000082B7U,  // lui t0, 8
+        0x06728293U,  // addi t0, t0, 0x67  (0x00008067 = ret)
+        0x00512023U,  // sw t0, 0(sp)
+        0x000100E7U,  // jalr ra, 0(sp)
+    };
+    elen = buildMinimalExecElf(exec_stack_prog, 4, 0x5U /* PF_R|PF_X */, 64U, elf_buf, sizeof(elf_buf));
+    TEST_ASSERT_TRUE(vfs.writeBinary(state, "/apps/wx_exec.elf", elf_buf, elen, false));
+    BufWriter w5(log_buf, sizeof(log_buf));
+    TEST_ASSERT_FALSE(elf::runElfFile(state, vfs, "/apps/wx_exec.elf", 1, nullptr, w5, &exit_code, &vm_bytes));
+    TEST_ASSERT_NOT_NULL(strstr(log_buf, "W^X execute fault"));
+}
+
+namespace {
+
+uint64_t g_mock_sd_total = 0;
+uint64_t g_mock_sd_free = 0;
+
+int mockSdUsage(uint64_t* out_total, uint64_t* out_free) {
+    *out_total = g_mock_sd_total;
+    *out_free = g_mock_sd_free;
+    return 0;
+}
+
+size_t sumLogBytes(VirtualFs& vfs, const char* base, unsigned gens, unsigned* out_files) {
+    size_t total = 0;
+    unsigned files = 0;
+    for (unsigned g = 0; g < gens; ++g) {
+        char path[64];
+        if (g == 0) snprintf(path, sizeof(path), "%s", base);
+        else snprintf(path, sizeof(path), "%s.%u", base, g);
+        size_t sz = 0;
+        if (vfs.fileSize(path, &sz)) {
+            total += sz;
+            ++files;
+        }
+    }
+    if (out_files) *out_files = files;
+    return total;
+}
+
+}  // namespace
+
+void test_syslogd_sd_rotation_cap_and_free_space_floor(void) {
+    SystemState state;
+    state.initDefaults();
+    VirtualFs vfs;
+    vfs.initDefaultFiles(state);
+    SyslogRotator rotator;
+
+    // 1. LittleFS fallback (no SD): caps clamp to 16 KB x 2 and target is /var/log/messages
+    TEST_ASSERT_EQUAL_STRING("/var/log/messages", SyslogRotator::targetPath(state));
+    TEST_ASSERT_EQUAL_UINT32(16U * 1024U, SyslogRotator::effectiveCapBytes(state));
+    TEST_ASSERT_EQUAL_UINT8(2, SyslogRotator::effectiveFileCount(state));
+
+    // 2. First service persists the boot lines resident in the dmesg ring
+    state.appendDmesg(1000, "kernel: boot line A");
+    state.appendDmesg(1100, "kernel: boot line B");
+    state.uptime_sec = 1;
+    TEST_ASSERT_TRUE(rotator.service(state, vfs, /*force=*/true));
+    TEST_ASSERT_EQUAL_UINT32(2, state.log_lines_written);
+    char buf[512] = {0};
+    TEST_ASSERT_TRUE(vfs.readFile(state, "/var/log/messages", buf, sizeof(buf)));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "kernel: boot line A"));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "kernel: boot line B"));
+
+    // 3. Interval gating: new lines stay staged until 10 s elapse or force
+    state.appendDmesg(2000, "sshd: session opened");
+    state.uptime_sec = 3;
+    TEST_ASSERT_FALSE(rotator.service(state, vfs, false));
+    TEST_ASSERT_TRUE(rotator.stagedBytes() > 0);
+    state.uptime_sec = 12;
+    TEST_ASSERT_TRUE(rotator.service(state, vfs, false));
+    TEST_ASSERT_EQUAL_UINT32(0, rotator.stagedBytes());
+    TEST_ASSERT_EQUAL_UINT32(3, state.log_lines_written);
+
+    // 4. Ring overrun between services counts dropped lines instead of corrupting output
+    for (int i = 0; i < 40; ++i) {
+        state.appendDmesg(3000U + static_cast<uint32_t>(i), "burst: filler line for overrun test");
+    }
+    state.uptime_sec = 30;
+    rotator.service(state, vfs, true);
+    TEST_ASSERT_EQUAL_UINT32(8, state.log_lines_dropped);
+
+    // 5. microSD target with 4 KB x 3 rotation never exceeds the 12 KB ceiling
+    state.sd_mounted = true;
+    state.sd_total_mb = 1024;
+    state.log_file_cap_kb = 4;
+    state.log_file_count = 3;
+    g_mock_sd_total = 1024ULL * 1024ULL * 1024ULL;
+    g_mock_sd_free = 512ULL * 1024ULL * 1024ULL;
+    HardwareOps ops = {};
+    ops.sd_usage = mockSdUsage;
+    setHardwareOps(&ops);
+
+    TEST_ASSERT_EQUAL_STRING("/mnt/sd/var/log/messages", SyslogRotator::targetPath(state));
+    TEST_ASSERT_EQUAL_UINT32(4096U, SyslogRotator::effectiveCapBytes(state));
+    TEST_ASSERT_EQUAL_UINT8(3, SyslogRotator::effectiveFileCount(state));
+
+    uint32_t rotations_before = state.log_rotations;
+    for (int round = 0; round < 60; ++round) {
+        for (int i = 0; i < 6; ++i) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "sdlog: round %d line %d payload-xxxxxxxxxxxxxxxx", round, i);
+            state.appendDmesg(40000U + static_cast<uint32_t>(round * 6 + i), msg);
+        }
+        state.uptime_sec = 100U + static_cast<uint32_t>(round);
+        rotator.service(state, vfs, true);
+    }
+    unsigned files = 0;
+    size_t total_bytes = sumLogBytes(vfs, "/mnt/sd/var/log/messages", 6, &files);
+    TEST_ASSERT_TRUE(state.log_rotations > rotations_before);
+    TEST_ASSERT_EQUAL_UINT32(3, files);
+    TEST_ASSERT_TRUE(total_bytes <= 3U * 4096U);
+    size_t gen3 = 0;
+    TEST_ASSERT_FALSE(vfs.fileSize("/mnt/sd/var/log/messages.3", &gen3));
+    TEST_ASSERT_EQUAL_UINT32(512, state.sd_total_mb - state.sd_used_mb);
+    TEST_ASSERT_FALSE(state.log_sd_paused);
+
+    // 6. Free-space floor: below 16 MB free, rotated generations purge and new lines pause
+    g_mock_sd_free = 8ULL * 1024ULL * 1024ULL;
+    uint32_t dropped_before = state.log_lines_dropped;
+    state.appendDmesg(90000, "sdlog: should be dropped while paused");
+    state.uptime_sec = 200;
+    TEST_ASSERT_FALSE(rotator.service(state, vfs, true));
+    TEST_ASSERT_TRUE(state.log_sd_paused);
+    TEST_ASSERT_TRUE(state.log_lines_dropped > dropped_before);
+    sumLogBytes(vfs, "/mnt/sd/var/log/messages", 6, &files);
+    TEST_ASSERT_EQUAL_UINT32(1, files);
+
+    // 7. Recovery once free space returns, plus df / logrotate CLI surfaces
+    g_mock_sd_free = 256ULL * 1024ULL * 1024ULL;
+    state.appendDmesg(91000, "sdlog: resumed after free space recovered");
+    state.uptime_sec = 220;
+    TEST_ASSERT_TRUE(rotator.service(state, vfs, true));
+    TEST_ASSERT_FALSE(state.log_sd_paused);
+
+    ShellSession session;
+    char out[2048];
+    session.begin(state, vfs, false, out, sizeof(out));
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "df", out, sizeof(out)));
+    TEST_ASSERT_NOT_NULL(strstr(out, "/mnt/sd"));
+    TEST_ASSERT_NOT_NULL(strstr(out, " 75% /mnt/sd"));
+
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "logrotate 512 2", out, sizeof(out)));
+    TEST_ASSERT_EQUAL_UINT16(512, state.log_file_cap_kb);
+    TEST_ASSERT_EQUAL_UINT8(2, state.log_file_count);
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "logrotate status", out, sizeof(out)));
+    TEST_ASSERT_NOT_NULL(strstr(out, "512 KB x 2 files (ceiling 1024 KB)"));
+    out[0] = '\0';
+    session.executeCommandLine(state, vfs, "logrotate 3 9", out, sizeof(out));
+    TEST_ASSERT_NOT_NULL(strstr(out, "ERR usage"));
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "logrotate force", out, sizeof(out)));
+    TEST_ASSERT_TRUE(state.log_rotate_requested);
+    uint32_t rot_before = state.log_rotations;
+    state.uptime_sec = 240;
+    rotator.service(state, vfs, false);
+    TEST_ASSERT_EQUAL_UINT32(rot_before + 1, state.log_rotations);
+    TEST_ASSERT_FALSE(state.log_rotate_requested);
+
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "screen status", out, sizeof(out)));
+    TEST_ASSERT_NOT_NULL(strstr(out, "\"log_target\":\"/mnt/sd/var/log/messages\""));
+    TEST_ASSERT_NOT_NULL(strstr(out, "\"sd_free_mb\":256"));
+    setHardwareOps(nullptr);
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -817,5 +1256,9 @@ int main(int argc, char** argv) {
     RUN_TEST(test_rv32imac_elf_sandbox_execution);
     RUN_TEST(test_scanline_fbgrab_bmp_ppm_tz_chsh_apitoken_and_reserved_pins);
     RUN_TEST(test_vfs_usage_dirty_selective_snapshot_and_8row_strip_parity);
+    RUN_TEST(test_screen_idle_dim_panel_sleep_and_wake);
+    RUN_TEST(test_epkg_ed25519_trust_on_populate_and_streamed_install);
+    RUN_TEST(test_rv32imac_elf_dynamic_sizing_and_wx_fencing);
+    RUN_TEST(test_syslogd_sd_rotation_cap_and_free_space_floor);
     return UNITY_END();
 }

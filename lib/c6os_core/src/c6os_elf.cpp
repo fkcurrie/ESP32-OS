@@ -17,12 +17,18 @@ constexpr uint16_t ET_REL   = 1;
 constexpr uint16_t ET_EXEC  = 2;
 constexpr uint16_t EM_RISCV = 243;
 
-constexpr uint32_t PT_LOAD     = 1;
-constexpr uint32_t SHT_PROGBITS = 1;
-constexpr uint32_t SHT_SYMTAB  = 2;
-constexpr uint32_t SHT_RELA    = 4;
-constexpr uint32_t SHT_NOBITS  = 8;
-constexpr uint32_t SHF_ALLOC   = 0x2;
+constexpr uint32_t PT_LOAD       = 1;
+constexpr uint32_t PF_X          = 0x1U;
+constexpr uint32_t PF_W          = 0x2U;
+constexpr uint32_t PF_R          = 0x4U;
+
+constexpr uint32_t SHT_PROGBITS  = 1;
+constexpr uint32_t SHT_SYMTAB    = 2;
+constexpr uint32_t SHT_RELA      = 4;
+constexpr uint32_t SHT_NOBITS    = 8;
+constexpr uint32_t SHF_WRITE     = 0x1U;
+constexpr uint32_t SHF_ALLOC     = 0x2U;
+constexpr uint32_t SHF_EXECINSTR = 0x4U;
 
 constexpr uint32_t R_RISCV_NONE         = 0;
 constexpr uint32_t R_RISCV_32           = 1;
@@ -43,15 +49,19 @@ constexpr uint32_t R_RISCV_RVC_BRANCH   = 44;
 constexpr uint32_t R_RISCV_RVC_JUMP     = 45;
 constexpr uint32_t R_RISCV_RELAX        = 51;
 
-constexpr uint32_t VM_BASE      = 0x00010000U;
-constexpr uint32_t VM_SIZE      = 49152U;       // 48 KB sandboxed RAM+ROM+stack+heap
-constexpr uint32_t VM_HEAP_BASE = 0x00018000U;
-constexpr uint32_t VM_HEAP_END  = 0x0001A800U;
-constexpr uint32_t VM_ARGV_BASE = 0x0001A800U;
-constexpr uint32_t VM_SP_INIT   = 0x0001BFF0U;
-constexpr uint32_t TRAMP_BASE   = 0xF0000000U;
-constexpr uint32_t EXIT_TRAMP   = 0xF000FFFCU;
-constexpr uint32_t MAX_STEPS    = 2000000U;
+constexpr uint32_t VM_BASE        = 0x00010000U;
+constexpr uint32_t VM_MIN_SIZE    = 16384U;   // 16 KB minimum dynamic sandbox
+constexpr uint32_t VM_MAX_SIZE    = 49152U;   // 48 KB maximum dynamic sandbox
+constexpr uint32_t VM_STEP_SIZE   = 4096U;    // 4 KB allocation quantum
+constexpr uint32_t VM_STACK_ARENA = 4096U;    // Top 4 KB reserved for argv + stack
+constexpr uint32_t TRAMP_BASE     = 0xF0000000U;
+constexpr uint32_t EXIT_TRAMP     = 0xF000FFFCU;
+constexpr uint32_t MAX_STEPS      = 2000000U;
+
+constexpr uint8_t PERM_R = 0x1U;
+constexpr uint8_t PERM_W = 0x2U;
+constexpr uint8_t PERM_X = 0x4U;
+constexpr size_t  MAX_VM_REGIONS = 24U;
 
 #pragma pack(push, 1)
 struct Elf32Ehdr {
@@ -242,16 +252,44 @@ uint32_t encodeBType(uint32_t inst, int32_t off) {
     return (inst & 0x01FFF07FU) | (b12 << 31) | (b10_5 << 25) | (b4_1 << 8) | (b11 << 7);
 }
 
+bool computeDynamicVmSize(uint32_t image_span_bytes, uint32_t* out_vm_size) {
+    if (image_span_bytes + VM_STACK_ARENA + 1024U > VM_MAX_SIZE) {
+        return false;
+    }
+    uint32_t needed = image_span_bytes + 8192U;  // >= 4 KB heap + 4 KB argv/stack
+    if (needed > VM_MAX_SIZE) {
+        needed = VM_MAX_SIZE;
+    }
+    uint32_t sz = (needed + VM_STEP_SIZE - 1U) & ~(VM_STEP_SIZE - 1U);
+    if (sz < VM_MIN_SIZE) sz = VM_MIN_SIZE;
+    if (sz > VM_MAX_SIZE) sz = VM_MAX_SIZE;
+    *out_vm_size = sz;
+    return true;
+}
+
 struct HiRelocRecord {
     uint32_t pc_addr;
     int32_t full_off;
 };
 
+struct MemRegion {
+    uint32_t lo;
+    uint32_t hi;
+    uint8_t perm;
+};
+
 struct RvVm {
     uint8_t* mem;
+    uint32_t mem_size;
+    uint32_t heap_base;
+    uint32_t heap_brk;
+    uint32_t heap_end;
+    uint32_t argv_base;
+    uint32_t sp_init;
+    MemRegion regions[MAX_VM_REGIONS];
+    size_t region_count;
     uint32_t regs[32];
     uint32_t pc;
-    uint32_t heap_brk;
     uint32_t lr_addr;
     bool lr_valid;
     bool exited;
@@ -261,13 +299,66 @@ struct RvVm {
     BufWriter* out;
 
     bool validRange(uint32_t vaddr, size_t len) const {
-        if (vaddr < VM_BASE || len > VM_SIZE) return false;
+        if (vaddr < VM_BASE || len > mem_size) return false;
         uint32_t off = vaddr - VM_BASE;
-        return off + len <= VM_SIZE;
+        return off + len <= mem_size;
     }
 
-    uint8_t* ptr(uint32_t vaddr, size_t len) const {
+    bool addRegion(uint32_t lo, uint32_t hi, uint8_t perm) {
+        if (lo >= hi) return true;
+        if ((perm & (PERM_W | PERM_X)) == (PERM_W | PERM_X)) return false;
+        if (lo < VM_BASE || hi > VM_BASE + mem_size) return false;
+        if (region_count >= MAX_VM_REGIONS) return false;
+        for (size_t i = 0; i < region_count; ++i) {
+            const MemRegion& r = regions[i];
+            if (lo < r.hi && hi > r.lo) {
+                uint8_t combined = static_cast<uint8_t>(perm | r.perm);
+                if ((combined & (PERM_W | PERM_X)) == (PERM_W | PERM_X)) {
+                    return false;
+                }
+            }
+        }
+        regions[region_count++] = {lo, hi, perm};
+        return true;
+    }
+
+    bool hasPerm(uint32_t vaddr, size_t len, uint8_t req_perm) const {
+        if (!validRange(vaddr, len)) return false;
+        if (len == 0) return true;
+        uint32_t cur = vaddr;
+        uint32_t end = vaddr + static_cast<uint32_t>(len);
+        while (cur < end) {
+            bool matched = false;
+            for (size_t i = 0; i < region_count; ++i) {
+                const MemRegion& r = regions[i];
+                if (cur >= r.lo && cur < r.hi &&
+                    (r.perm & req_perm) == req_perm &&
+                    (r.perm & (PERM_W | PERM_X)) != (PERM_W | PERM_X)) {
+                    cur = (end < r.hi) ? end : r.hi;
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) return false;
+        }
+        return true;
+    }
+
+    // Loader-only raw pointer (used before execution begins)
+    uint8_t* rawPtr(uint32_t vaddr, size_t len) const {
         return validRange(vaddr, len) ? (mem + (vaddr - VM_BASE)) : nullptr;
+    }
+
+    const uint8_t* readPtr(uint32_t vaddr, size_t len) const {
+        return hasPerm(vaddr, len, PERM_R) ? (mem + (vaddr - VM_BASE)) : nullptr;
+    }
+
+    uint8_t* writePtr(uint32_t vaddr, size_t len) const {
+        return hasPerm(vaddr, len, PERM_W) ? (mem + (vaddr - VM_BASE)) : nullptr;
+    }
+
+    const uint8_t* execPtr(uint32_t vaddr, size_t len) const {
+        return (len > 0 && hasPerm(vaddr, len, PERM_X)) ? (mem + (vaddr - VM_BASE)) : nullptr;
     }
 
     bool readCString(uint32_t vaddr, char* dst, size_t cap) const {
@@ -276,11 +367,13 @@ struct RvVm {
             dst[0] = '\0';
             return true;
         }
-        if (vaddr < VM_BASE || vaddr >= VM_BASE + VM_SIZE) return false;
-        size_t max_avail = (VM_BASE + VM_SIZE) - vaddr;
+        if (vaddr < VM_BASE || vaddr >= VM_BASE + mem_size) return false;
+        size_t max_avail = (VM_BASE + mem_size) - vaddr;
         const char* src = reinterpret_cast<const char*>(mem + (vaddr - VM_BASE));
         size_t i = 0;
-        while (i < cap - 1 && i < max_avail && src[i] != '\0') {
+        while (i < cap - 1 && i < max_avail) {
+            if (!hasPerm(vaddr + static_cast<uint32_t>(i), 1, PERM_R)) return false;
+            if (src[i] == '\0') break;
             dst[i] = src[i];
             ++i;
         }
@@ -303,7 +396,7 @@ size_t vmFormat(RvVm& vm, uint32_t fmt_vaddr, int first_arg_reg, char* dst, size
             return vm.regs[reg];
         }
         uint32_t sp_off = vm.regs[2] + static_cast<uint32_t>(reg - 18) * 4U;
-        const uint8_t* p = vm.ptr(sp_off, 4);
+        const uint8_t* p = vm.readPtr(sp_off, 4);
         return p ? rd32(p) : 0U;
     };
 
@@ -377,15 +470,19 @@ bool handleImportCall(RvVm& vm, ImportId id) {
                 vm.regs[10] = 0;
                 return true;
             }
-            uint8_t* dst = vm.ptr(a0, a1);
+            uint8_t* dst = vm.writePtr(a0, a1);
             if (!dst) return false;
             size_t n = vmFormat(vm, a2, 13, reinterpret_cast<char*>(dst), a1);
             vm.regs[10] = static_cast<uint32_t>(n);
             return true;
         }
         case IMP_MALLOC: {
+            if (a0 > vm.heap_end - vm.heap_brk) {
+                vm.regs[10] = 0;
+                return true;
+            }
             uint32_t sz = (a0 + 7U) & ~7U;
-            if (vm.heap_brk + sz > VM_HEAP_END) {
+            if (sz > vm.heap_end - vm.heap_brk) {
                 vm.regs[10] = 0;
             } else {
                 vm.regs[10] = vm.heap_brk;
@@ -397,15 +494,15 @@ bool handleImportCall(RvVm& vm, ImportId id) {
             vm.regs[10] = 0;
             return true;
         case IMP_MEMCPY: {
-            uint8_t* dst = vm.ptr(a0, a2);
-            const uint8_t* src = vm.ptr(a1, a2);
+            uint8_t* dst = vm.writePtr(a0, a2);
+            const uint8_t* src = vm.readPtr(a1, a2);
             if (!dst || !src) return false;
             if (a2 > 0) memmove(dst, src, a2);
             vm.regs[10] = a0;
             return true;
         }
         case IMP_MEMSET: {
-            uint8_t* dst = vm.ptr(a0, a2);
+            uint8_t* dst = vm.writePtr(a0, a2);
             if (!dst) return false;
             if (a2 > 0) memset(dst, static_cast<int>(a1 & 0xFFU), a2);
             vm.regs[10] = a0;
@@ -523,7 +620,7 @@ bool handleImportCall(RvVm& vm, ImportId id) {
                 return true;
             }
             if (max_n > 32) max_n = 32;
-            uint8_t* dst = vm.ptr(a0, static_cast<size_t>(max_n));
+            uint8_t* dst = vm.writePtr(a0, static_cast<size_t>(max_n));
             if (!dst) return false;
             int n = (hw && hw->i2c_scan) ? hw->i2c_scan(dst, static_cast<size_t>(max_n)) : 0;
             vm.regs[10] = static_cast<uint32_t>(n);
@@ -688,16 +785,21 @@ bool executeVm(RvVm& vm) {
         if (vm.pc >= TRAMP_BASE && vm.pc < TRAMP_BASE + IMP_COUNT * 4U) {
             ImportId id = static_cast<ImportId>((vm.pc - TRAMP_BASE) / 4U);
             if (!handleImportCall(vm, id)) {
-                vm.out->fmt("elf: invalid memory access in C ABI call #%u\n", static_cast<unsigned>(id));
+                vm.out->fmt("elf: W^X or bounds fault in C ABI call #%u\n", static_cast<unsigned>(id));
                 return false;
             }
             vm.pc = vm.regs[1];
             continue;
         }
 
-        const uint8_t* pc_ptr = vm.ptr(vm.pc, 2);
+        const uint8_t* pc_ptr = vm.execPtr(vm.pc, 2);
         if (!pc_ptr) {
-            vm.out->fmt("elf: fault fetching PC=0x%08x\n", static_cast<unsigned>(vm.pc));
+            if (vm.validRange(vm.pc, 2)) {
+                vm.out->fmt("elf: W^X execute fault at non-executable PC=0x%08x\n",
+                            static_cast<unsigned>(vm.pc));
+            } else {
+                vm.out->fmt("elf: fault fetching PC=0x%08x\n", static_cast<unsigned>(vm.pc));
+            }
             return false;
         }
 
@@ -713,8 +815,12 @@ bool executeVm(RvVm& vm) {
                 return false;
             }
         } else {
-            const uint8_t* p32 = vm.ptr(vm.pc, 4);
-            if (!p32) return false;
+            const uint8_t* p32 = vm.execPtr(vm.pc, 4);
+            if (!p32) {
+                vm.out->fmt("elf: W^X execute fault spanning PC=0x%08x\n",
+                            static_cast<unsigned>(vm.pc));
+                return false;
+            }
             inst = rd32(p32);
         }
 
@@ -769,7 +875,7 @@ bool executeVm(RvVm& vm) {
                 int32_t off = signExtend(inst >> 20, 12);
                 uint32_t addr = vm.regs[rs1] + static_cast<uint32_t>(off);
                 size_t sz = (funct3 == 0 || funct3 == 4) ? 1 : ((funct3 == 1 || funct3 == 5) ? 2 : 4);
-                const uint8_t* p = vm.ptr(addr, sz);
+                const uint8_t* p = vm.readPtr(addr, sz);
                 if (!p) {
                     vm.out->fmt("elf: load fault at 0x%08x (PC=0x%08x)\n",
                                 static_cast<unsigned>(addr), static_cast<unsigned>(vm.pc));
@@ -789,10 +895,15 @@ bool executeVm(RvVm& vm) {
                 int32_t off = signExtend(u, 12);
                 uint32_t addr = vm.regs[rs1] + static_cast<uint32_t>(off);
                 size_t sz = (funct3 == 0) ? 1 : ((funct3 == 1) ? 2 : 4);
-                uint8_t* p = vm.ptr(addr, sz);
+                uint8_t* p = vm.writePtr(addr, sz);
                 if (!p) {
-                    vm.out->fmt("elf: store fault at 0x%08x (PC=0x%08x)\n",
-                                static_cast<unsigned>(addr), static_cast<unsigned>(vm.pc));
+                    if (vm.validRange(addr, sz)) {
+                        vm.out->fmt("elf: W^X write fault at non-writable 0x%08x (PC=0x%08x)\n",
+                                    static_cast<unsigned>(addr), static_cast<unsigned>(vm.pc));
+                    } else {
+                        vm.out->fmt("elf: store fault at 0x%08x (PC=0x%08x)\n",
+                                    static_cast<unsigned>(addr), static_cast<unsigned>(vm.pc));
+                    }
                     return false;
                 }
                 uint32_t val = vm.regs[rs2];
@@ -867,8 +978,12 @@ bool executeVm(RvVm& vm) {
             }
             case 0x2FU: {  // RV32A Atomics
                 uint32_t addr = vm.regs[rs1];
-                uint8_t* p = vm.ptr(addr, 4);
-                if (!p) return false;
+                uint8_t* p = vm.writePtr(addr, 4);
+                if (!p) {
+                    vm.out->fmt("elf: W^X or bounds atomic fault at 0x%08x (PC=0x%08x)\n",
+                                static_cast<unsigned>(addr), static_cast<unsigned>(vm.pc));
+                    return false;
+                }
                 uint32_t funct5 = funct7 >> 2;
                 uint32_t old = rd32(p);
                 uint32_t rhs = vm.regs[rs2];
@@ -909,12 +1024,12 @@ bool executeVm(RvVm& vm) {
                         } else if (sysno == 64U) {  // write(fd, buf, count)
                             uint32_t buf_va = vm.regs[11];
                             uint32_t count  = vm.regs[12];
-                            const uint8_t* src = vm.ptr(buf_va, count);
+                            const uint8_t* src = vm.readPtr(buf_va, count);
                             if (!src) return false;
                             vm.out->putRaw(reinterpret_cast<const char*>(src), count);
                             vm.regs[10] = count;
                         } else if (sysno == 214U) {  // brk
-                            if (vm.regs[10] >= VM_HEAP_BASE && vm.regs[10] <= VM_HEAP_END) {
+                            if (vm.regs[10] >= vm.heap_base && vm.regs[10] <= vm.heap_end) {
                                 vm.heap_brk = vm.regs[10];
                             }
                             vm.regs[10] = vm.heap_brk;
@@ -956,25 +1071,73 @@ bool loadRelocatableElf(const uint8_t* file_buf, size_t file_len, RvVm& vm, uint
 
     const auto* shdrs = reinterpret_cast<const Elf32Shdr*>(file_buf + eh->e_shoff);
     uint32_t sec_vaddr[48] = {0};
+
+    // 3-pass W^X section layout: [0] RX code, [1] R-only rodata, [2] RW data/bss
     uint32_t cursor = VM_BASE;
+    uint32_t exec_end = VM_BASE;
+    uint32_t ro_end = VM_BASE;
+
+    for (int pass = 0; pass < 3; ++pass) {
+        for (uint16_t i = 0; i < eh->e_shnum; ++i) {
+            const Elf32Shdr& sh = shdrs[i];
+            if ((sh.sh_flags & SHF_ALLOC) == 0) continue;
+            bool is_x = (sh.sh_flags & SHF_EXECINSTR) != 0;
+            bool is_w = (sh.sh_flags & SHF_WRITE) != 0;
+            if (is_x && is_w) {
+                out.putStr("elf: W^X violation (section is both writable and executable)\n");
+                return false;
+            }
+            int sec_pass = is_x ? 0 : (!is_w ? 1 : 2);
+            if (sec_pass != pass) continue;
+
+            uint32_t align = (sh.sh_addralign > 4U) ? sh.sh_addralign : 4U;
+            cursor = (cursor + align - 1U) & ~(align - 1U);
+            sec_vaddr[i] = cursor;
+            if (sh.sh_size > VM_MAX_SIZE || (cursor - VM_BASE) + sh.sh_size > VM_MAX_SIZE) {
+                out.putStr("elf: sections exceed sandbox capacity\n");
+                return false;
+            }
+            if (sh.sh_type == SHT_PROGBITS && sh.sh_size > 0 && sh.sh_offset + sh.sh_size > file_len) {
+                out.putStr("elf: truncated PROGBITS section\n");
+                return false;
+            }
+            cursor += sh.sh_size;
+        }
+        cursor = (cursor + 3U) & ~3U;
+        if (pass == 0) exec_end = cursor;
+        else if (pass == 1) ro_end = cursor;
+    }
+
+    uint32_t rw_end = cursor;
+    uint32_t vm_size = 0;
+    if (!computeDynamicVmSize(rw_end - VM_BASE, &vm_size)) {
+        out.putStr("elf: sections exceed 48 KB sandbox capacity\n");
+        return false;
+    }
+
+    vm.mem = static_cast<uint8_t*>(malloc(vm_size));
+    if (!vm.mem) {
+        out.fmt("elf: insufficient heap for %u KB ELF sandbox\n", static_cast<unsigned>(vm_size / 1024U));
+        return false;
+    }
+    memset(vm.mem, 0, vm_size);
+    vm.mem_size  = vm_size;
+    vm.heap_base = (rw_end + 15U) & ~15U;
+    vm.heap_brk  = vm.heap_base;
+    vm.argv_base = VM_BASE + vm_size - VM_STACK_ARENA;
+    vm.heap_end  = vm.argv_base;
+    vm.sp_init   = VM_BASE + vm_size - 16U;
 
     for (uint16_t i = 0; i < eh->e_shnum; ++i) {
         const Elf32Shdr& sh = shdrs[i];
         if ((sh.sh_flags & SHF_ALLOC) == 0 || sh.sh_size == 0) continue;
-        uint32_t align = (sh.sh_addralign > 4) ? sh.sh_addralign : 4U;
-        cursor = (cursor + align - 1U) & ~(align - 1U);
-        if (cursor + sh.sh_size > VM_HEAP_BASE) {
-            out.putStr("elf: sections exceed 32 KB code/data arena\n");
-            return false;
-        }
-        sec_vaddr[i] = cursor;
+        uint8_t* dst = vm.rawPtr(sec_vaddr[i], sh.sh_size);
+        if (!dst) return false;
         if (sh.sh_type == SHT_PROGBITS) {
-            if (sh.sh_offset + sh.sh_size > file_len) return false;
-            memcpy(vm.mem + (cursor - VM_BASE), file_buf + sh.sh_offset, sh.sh_size);
+            memcpy(dst, file_buf + sh.sh_offset, sh.sh_size);
         } else if (sh.sh_type == SHT_NOBITS) {
-            memset(vm.mem + (cursor - VM_BASE), 0, sh.sh_size);
+            memset(dst, 0, sh.sh_size);
         }
-        cursor += sh.sh_size;
     }
 
     // Locate symbol table & string table
@@ -1023,8 +1186,9 @@ bool loadRelocatableElf(const uint8_t* file_buf, size_t file_len, RvVm& vm, uint
         return true;
     };
 
-    // Pass 1: apply HI20 / CALL / JAL / BRANCH / 32 relocations and record PCREL_HI20 offsets
-    HiRelocRecord hi_records[64];
+    // Apply relocations on raw loader memory prior to locking W^X permissions
+    HeapArray<HiRelocRecord> hi_records(64);
+    if (!hi_records) return false;
     size_t hi_count = 0;
 
     for (uint16_t i = 0; i < eh->e_shnum; ++i) {
@@ -1053,19 +1217,19 @@ bool loadRelocatableElf(const uint8_t* file_buf, size_t file_len, RvVm& vm, uint
                 int32_t A = relas[r].r_addend;
 
                 if (type == R_RISCV_32) {
-                    uint8_t* p = vm.ptr(P, 4);
+                    uint8_t* p = vm.rawPtr(P, 4);
                     if (!p) return false;
                     wr32(p, S + static_cast<uint32_t>(A));
                 } else if (type == R_RISCV_ADD32) {
-                    uint8_t* p = vm.ptr(P, 4);
+                    uint8_t* p = vm.rawPtr(P, 4);
                     if (!p) return false;
                     wr32(p, rd32(p) + S + static_cast<uint32_t>(A));
                 } else if (type == R_RISCV_SUB32) {
-                    uint8_t* p = vm.ptr(P, 4);
+                    uint8_t* p = vm.rawPtr(P, 4);
                     if (!p) return false;
                     wr32(p, rd32(p) - (S + static_cast<uint32_t>(A)));
                 } else if (type == R_RISCV_CALL || type == R_RISCV_CALL_PLT) {
-                    uint8_t* p = vm.ptr(P, 8);
+                    uint8_t* p = vm.rawPtr(P, 8);
                     if (!p) return false;
                     int32_t off = static_cast<int32_t>((S + static_cast<uint32_t>(A)) - P);
                     uint32_t hi20 = static_cast<uint32_t>((off + 0x800) >> 12);
@@ -1073,7 +1237,7 @@ bool loadRelocatableElf(const uint8_t* file_buf, size_t file_len, RvVm& vm, uint
                     wr32(p, encodeUType(rd32(p), hi20));
                     wr32(p + 4, encodeIType(rd32(p + 4), lo12));
                 } else if (type == R_RISCV_PCREL_HI20) {
-                    uint8_t* p = vm.ptr(P, 4);
+                    uint8_t* p = vm.rawPtr(P, 4);
                     if (!p) return false;
                     int32_t off = static_cast<int32_t>((S + static_cast<uint32_t>(A)) - P);
                     uint32_t hi20 = static_cast<uint32_t>((off + 0x800) >> 12);
@@ -1082,7 +1246,7 @@ bool loadRelocatableElf(const uint8_t* file_buf, size_t file_len, RvVm& vm, uint
                         hi_records[hi_count++] = {P, off};
                     }
                 } else if (type == R_RISCV_PCREL_LO12_I || type == R_RISCV_PCREL_LO12_S) {
-                    uint8_t* p = vm.ptr(P, 4);
+                    uint8_t* p = vm.rawPtr(P, 4);
                     if (!p) return false;
                     int32_t full_off = 0;
                     for (size_t h = 0; h < hi_count; ++h) {
@@ -1095,29 +1259,29 @@ bool loadRelocatableElf(const uint8_t* file_buf, size_t file_len, RvVm& vm, uint
                     if (type == R_RISCV_PCREL_LO12_I) wr32(p, encodeIType(rd32(p), lo12));
                     else wr32(p, encodeSType(rd32(p), lo12));
                 } else if (type == R_RISCV_HI20) {
-                    uint8_t* p = vm.ptr(P, 4);
+                    uint8_t* p = vm.rawPtr(P, 4);
                     if (!p) return false;
                     int32_t val = static_cast<int32_t>(S) + A;
                     uint32_t hi20 = static_cast<uint32_t>((val + 0x800) >> 12);
                     wr32(p, encodeUType(rd32(p), hi20));
                 } else if (type == R_RISCV_LO12_I || type == R_RISCV_LO12_S) {
-                    uint8_t* p = vm.ptr(P, 4);
+                    uint8_t* p = vm.rawPtr(P, 4);
                     if (!p) return false;
                     uint32_t lo12 = static_cast<uint32_t>(static_cast<int32_t>(S) + A) & 0xFFFU;
                     if (type == R_RISCV_LO12_I) wr32(p, encodeIType(rd32(p), lo12));
                     else wr32(p, encodeSType(rd32(p), lo12));
                 } else if (type == R_RISCV_JAL) {
-                    uint8_t* p = vm.ptr(P, 4);
+                    uint8_t* p = vm.rawPtr(P, 4);
                     if (!p) return false;
                     int32_t off = static_cast<int32_t>((S + static_cast<uint32_t>(A)) - P);
                     wr32(p, encodeJType(rd32(p), off));
                 } else if (type == R_RISCV_BRANCH) {
-                    uint8_t* p = vm.ptr(P, 4);
+                    uint8_t* p = vm.rawPtr(P, 4);
                     if (!p) return false;
                     int32_t off = static_cast<int32_t>((S + static_cast<uint32_t>(A)) - P);
                     wr32(p, encodeBType(rd32(p), off));
                 } else if (type == R_RISCV_RVC_JUMP) {
-                    uint8_t* p = vm.ptr(P, 2);
+                    uint8_t* p = vm.rawPtr(P, 2);
                     if (!p) return false;
                     uint32_t u = static_cast<uint32_t>(static_cast<int32_t>((S + static_cast<uint32_t>(A)) - P));
                     uint16_t cj = static_cast<uint16_t>((rd16(p) & 0xE003U) |
@@ -1127,7 +1291,7 @@ bool loadRelocatableElf(const uint8_t* file_buf, size_t file_len, RvVm& vm, uint
                         (((u >> 1) & 7U) << 3) | (((u >> 5) & 1U) << 2));
                     wr16(p, cj);
                 } else if (type == R_RISCV_RVC_BRANCH) {
-                    uint8_t* p = vm.ptr(P, 2);
+                    uint8_t* p = vm.rawPtr(P, 2);
                     if (!p) return false;
                     uint32_t u = static_cast<uint32_t>(static_cast<int32_t>((S + static_cast<uint32_t>(A)) - P));
                     uint16_t cb = static_cast<uint16_t>((rd16(p) & 0xE383U) |
@@ -1140,12 +1304,26 @@ bool loadRelocatableElf(const uint8_t* file_buf, size_t file_len, RvVm& vm, uint
         }
     }
 
-    // Find entry symbol (`main` or `_start`)
+    // Lock strict W^X permission regions: [RX code][R rodata][RW data+bss+heap+argv+stack]
+    if (!vm.addRegion(VM_BASE, exec_end, PERM_R | PERM_X) ||
+        !vm.addRegion(exec_end, ro_end, PERM_R) ||
+        !vm.addRegion(ro_end, VM_BASE + vm_size, PERM_R | PERM_W)) {
+        out.putStr("elf: failed configuring W^X regions\n");
+        return false;
+    }
+
+    // Find entry symbol (`main`, `app_main`, or `_start`) inside executable region
     for (size_t i = 0; i < sym_count; ++i) {
         if (syms[i].st_name >= str_sh.sh_size || syms[i].st_shndx == 0) continue;
         const char* name = strtab + syms[i].st_name;
         if (strcmp(name, "main") == 0 || strcmp(name, "app_main") == 0 || strcmp(name, "_start") == 0) {
-            *out_entry = sec_vaddr[syms[i].st_shndx] + syms[i].st_value;
+            uint32_t candidate = sec_vaddr[syms[i].st_shndx] + syms[i].st_value;
+            if (!vm.execPtr(candidate, 2)) {
+                out.fmt("elf: W^X violation (entry '%s' at 0x%08x is not executable)\n",
+                        name, static_cast<unsigned>(candidate));
+                return false;
+            }
+            *out_entry = candidate;
             return true;
         }
     }
@@ -1164,27 +1342,78 @@ bool loadExecElf(const uint8_t* file_buf, size_t file_len, RvVm& vm, uint32_t* o
     }
 
     const auto* phdrs = reinterpret_cast<const Elf32Phdr*>(file_buf + eh->e_phoff);
+    uint32_t max_end = VM_BASE;
+
     for (uint16_t i = 0; i < eh->e_phnum; ++i) {
         const Elf32Phdr& ph = phdrs[i];
         if (ph.p_type != PT_LOAD || ph.p_memsz == 0) continue;
-        if (!vm.validRange(ph.p_vaddr, ph.p_memsz) || ph.p_offset + ph.p_filesz > file_len ||
-            ph.p_filesz > ph.p_memsz) {
+        if ((ph.p_flags & (PF_W | PF_X)) == (PF_W | PF_X)) {
+            out.putStr("elf: W^X violation (PT_LOAD segment is both writable and executable)\n");
+            return false;
+        }
+        if (ph.p_vaddr < VM_BASE || ph.p_memsz > VM_MAX_SIZE ||
+            (ph.p_vaddr - VM_BASE) + ph.p_memsz > VM_MAX_SIZE ||
+            ph.p_offset + ph.p_filesz > file_len || ph.p_filesz > ph.p_memsz) {
             out.fmt("elf: PT_LOAD segment 0x%08x..0x%08x outside sandbox [0x%08x..0x%08x)\n",
                     static_cast<unsigned>(ph.p_vaddr),
                     static_cast<unsigned>(ph.p_vaddr + ph.p_memsz),
                     static_cast<unsigned>(VM_BASE),
-                    static_cast<unsigned>(VM_BASE + VM_SIZE));
+                    static_cast<unsigned>(VM_BASE + VM_MAX_SIZE));
             return false;
         }
-        uint8_t* dst = vm.ptr(ph.p_vaddr, ph.p_memsz);
+        uint32_t seg_end = ph.p_vaddr + ph.p_memsz;
+        if (seg_end > max_end) max_end = seg_end;
+    }
+
+    if (max_end <= VM_BASE) {
+        out.putStr("elf: no loadable PT_LOAD segments\n");
+        return false;
+    }
+
+    uint32_t vm_size = 0;
+    if (!computeDynamicVmSize(max_end - VM_BASE, &vm_size)) {
+        out.putStr("elf: PT_LOAD segments exceed 48 KB sandbox capacity\n");
+        return false;
+    }
+
+    vm.mem = static_cast<uint8_t*>(malloc(vm_size));
+    if (!vm.mem) {
+        out.fmt("elf: insufficient heap for %u KB ELF sandbox\n", static_cast<unsigned>(vm_size / 1024U));
+        return false;
+    }
+    memset(vm.mem, 0, vm_size);
+    vm.mem_size  = vm_size;
+    vm.heap_base = (max_end + 15U) & ~15U;
+    vm.heap_brk  = vm.heap_base;
+    vm.argv_base = VM_BASE + vm_size - VM_STACK_ARENA;
+    vm.heap_end  = vm.argv_base;
+    vm.sp_init   = VM_BASE + vm_size - 16U;
+
+    for (uint16_t i = 0; i < eh->e_phnum; ++i) {
+        const Elf32Phdr& ph = phdrs[i];
+        if (ph.p_type != PT_LOAD || ph.p_memsz == 0) continue;
+        uint8_t* dst = vm.rawPtr(ph.p_vaddr, ph.p_memsz);
+        if (!dst) return false;
         memset(dst, 0, ph.p_memsz);
         if (ph.p_filesz > 0) {
             memcpy(dst, file_buf + ph.p_offset, ph.p_filesz);
         }
+        uint8_t perm = PERM_R;
+        if ((ph.p_flags & PF_X) != 0) perm |= PERM_X;
+        else if ((ph.p_flags & PF_W) != 0) perm |= PERM_W;
+        if (!vm.addRegion(ph.p_vaddr, ph.p_vaddr + ph.p_memsz, perm)) {
+            out.putStr("elf: W^X violation across overlapping PT_LOAD segments\n");
+            return false;
+        }
     }
 
-    if (!vm.validRange(eh->e_entry, 2)) {
-        out.fmt("elf: invalid entry point 0x%08x\n", static_cast<unsigned>(eh->e_entry));
+    if (!vm.addRegion(max_end, VM_BASE + vm_size, PERM_R | PERM_W)) {
+        out.putStr("elf: failed configuring RW heap/stack region\n");
+        return false;
+    }
+
+    if (!vm.execPtr(eh->e_entry, 2)) {
+        out.fmt("elf: W^X violation or invalid entry point 0x%08x\n", static_cast<unsigned>(eh->e_entry));
         return false;
     }
     *out_entry = eh->e_entry;
@@ -1200,8 +1429,11 @@ bool hasElfMagic(const uint8_t* data, size_t len) {
 
 bool runElfFile(SystemState& state, VirtualFs& vfs,
                 const char* elf_abs_path, int argc, const char* const* argv,
-                BufWriter& out, int* out_exit_code) {
+                BufWriter& out, int* out_exit_code,
+                size_t* out_vm_bytes) {
     if (out_exit_code) *out_exit_code = -1;
+    if (out_vm_bytes) *out_vm_bytes = 0;
+
     size_t file_len = 0;
     if (!vfs.fileSize(elf_abs_path, &file_len) || file_len < sizeof(Elf32Ehdr) || file_len > 65536U) {
         out.fmt("elf: cannot open valid RV32IMAC ELF '%s'\n", elf_abs_path ? elf_abs_path : "");
@@ -1209,18 +1441,14 @@ bool runElfFile(SystemState& state, VirtualFs& vfs,
     }
 
     auto* file_buf = static_cast<uint8_t*>(malloc(file_len));
-    auto* vm_mem   = static_cast<uint8_t*>(malloc(VM_SIZE));
-    if (!file_buf || !vm_mem) {
-        free(file_buf);
-        free(vm_mem);
-        out.putStr("elf: insufficient heap for 48 KB ELF sandbox\n");
+    if (!file_buf) {
+        out.putStr("elf: insufficient heap to read ELF header\n");
         return false;
     }
 
     size_t got = 0;
     if (!vfs.readBinary(elf_abs_path, 0, file_buf, file_len, &got) || got != file_len) {
         free(file_buf);
-        free(vm_mem);
         out.putStr("elf: read error\n");
         return false;
     }
@@ -1229,15 +1457,11 @@ bool runElfFile(SystemState& state, VirtualFs& vfs,
     if (!hasElfMagic(eh->e_ident, 4) || eh->e_ident[4] != 1 /* ELFCLASS32 */ ||
         eh->e_ident[5] != 1 /* ELFDATA2LSB */ || eh->e_machine != EM_RISCV) {
         free(file_buf);
-        free(vm_mem);
         out.putStr("elf: expected 32-bit little-endian RISC-V (EM_RISCV=243) binary\n");
         return false;
     }
 
-    memset(vm_mem, 0, VM_SIZE);
     RvVm vm = {};
-    vm.mem = vm_mem;
-    vm.heap_brk = VM_HEAP_BASE;
     vm.state = &state;
     vm.vfs = &vfs;
     vm.out = &out;
@@ -1251,32 +1475,43 @@ bool runElfFile(SystemState& state, VirtualFs& vfs,
     } else {
         out.fmt("elf: unsupported ELF type %u\n", eh->e_type);
     }
+    // Release raw ELF buffer immediately so it never coexists with VM execution
     free(file_buf);
 
     if (!loaded) {
-        free(vm_mem);
+        free(vm.mem);
         return false;
     }
 
-    // Populate argc / argv inside VM_ARGV_BASE
+    if (out_vm_bytes) {
+        *out_vm_bytes = vm.mem_size;
+    }
+
+    // Populate argc / argv inside vm.argv_base (RW non-executable arena)
     int safe_argc = (argc > 0 && argc <= 8) ? argc : 1;
-    uint32_t ptr_table = VM_ARGV_BASE;
-    uint32_t str_cursor = VM_ARGV_BASE + 40U;
+    uint32_t ptr_table = vm.argv_base;
+    uint32_t str_cursor = vm.argv_base + 40U;
     for (int i = 0; i < safe_argc; ++i) {
         const char* s = (argv && i < argc && argv[i]) ? argv[i] : elf_abs_path;
         size_t slen = strlen(s) + 1;
-        if (str_cursor + slen >= VM_SP_INIT - 256U) {
+        if (str_cursor + slen >= vm.sp_init - 256U) {
             safe_argc = i;
             break;
         }
-        memcpy(vm.ptr(str_cursor, slen), s, slen);
-        wr32(vm.ptr(ptr_table + static_cast<uint32_t>(i) * 4U, 4), str_cursor);
+        uint8_t* sdst = vm.writePtr(str_cursor, slen);
+        uint8_t* pdst = vm.writePtr(ptr_table + static_cast<uint32_t>(i) * 4U, 4);
+        if (!sdst || !pdst) {
+            free(vm.mem);
+            return false;
+        }
+        memcpy(sdst, s, slen);
+        wr32(pdst, str_cursor);
         str_cursor += static_cast<uint32_t>(slen);
     }
 
     vm.pc = entry_va;
     vm.regs[1]  = EXIT_TRAMP;  // ra -> clean return from main()
-    vm.regs[2]  = VM_SP_INIT;  // sp
+    vm.regs[2]  = vm.sp_init;  // sp
     vm.regs[10] = static_cast<uint32_t>(safe_argc);  // a0 = argc
     vm.regs[11] = ptr_table;                         // a1 = argv
 
@@ -1284,7 +1519,7 @@ bool runElfFile(SystemState& state, VirtualFs& vfs,
     if (ok && out_exit_code) {
         *out_exit_code = vm.exit_code;
     }
-    free(vm_mem);
+    free(vm.mem);
     return ok;
 }
 

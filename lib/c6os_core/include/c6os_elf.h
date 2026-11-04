@@ -13,11 +13,12 @@ namespace elf {
 // Returns true if the first 4 bytes match "\x7fELF"
 bool hasElfMagic(const uint8_t* data, size_t len);
 
-// Loads and executes an RV32IMAC ELF32 binary (ET_REL or ET_EXEC) inside a bounds-checked
-// 48 KB sandboxed address space with C6-MicroLinux C ABI imports and Linux RISC-V ecalls.
+// Loads and executes an RV32IMAC ELF32 binary (ET_REL or ET_EXEC) inside a dynamically
+// sized (16..48 KB) W^X bounds-checked sandbox with C6-MicroLinux C ABI imports and ecalls.
 bool runElfFile(SystemState& state, VirtualFs& vfs,
                 const char* elf_abs_path, int argc, const char* const* argv,
-                BufWriter& out, int* out_exit_code = nullptr);
+                BufWriter& out, int* out_exit_code = nullptr,
+                size_t* out_vm_bytes = nullptr);
 
 }  // namespace elf
 }  // namespace c6os

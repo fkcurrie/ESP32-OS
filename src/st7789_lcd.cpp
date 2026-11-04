@@ -11,7 +11,8 @@ St7789Lcd::St7789Lcd()
       fifo_head_(0),
       fifo_tail_(0),
       next_slot_(0),
-      bus_ready_(false) {}
+      bus_ready_(false),
+      panel_asleep_(false) {}
 
 St7789Lcd::~St7789Lcd() {
     waitIdle();
@@ -188,6 +189,23 @@ void St7789Lcd::setBacklight(uint8_t pct) {
     if (pct > 100) pct = 100;
     uint32_t duty = (static_cast<uint32_t>(pct) * 1023U) / 100U;
     ledcWrite(board::PIN_LCD_BL, duty);
+}
+
+void St7789Lcd::setPanelSleep(bool sleep) {
+    if (!io_ || sleep == panel_asleep_) return;
+    waitIdle();
+    if (sleep) {
+        setBacklight(0);
+        writeCmdParam(0x28);  // DISPOFF
+        writeCmdParam(0x10);  // SLPIN
+        delay(5);
+        panel_asleep_ = true;
+    } else {
+        writeCmdParam(0x11);  // SLPOUT
+        delay(120);
+        writeCmdParam(0x29);  // DISPON
+        panel_asleep_ = false;
+    }
 }
 
 void St7789Lcd::beginVerticalWindow(uint16_t y0, uint16_t y1) {
