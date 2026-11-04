@@ -7,6 +7,7 @@
 #include "c6os_epkg.h"
 #include "c6os_lua.h"
 #include "c6os_shell.h"
+#include "c6os_syslog.h"
 #include "c6os_types.h"
 #include "c6os_vfs.h"
 #include "ssh_auth.h"
@@ -1082,6 +1083,164 @@ void test_rv32imac_elf_dynamic_sizing_and_wx_fencing(void) {
     TEST_ASSERT_NOT_NULL(strstr(log_buf, "W^X execute fault"));
 }
 
+namespace {
+
+uint64_t g_mock_sd_total = 0;
+uint64_t g_mock_sd_free = 0;
+
+int mockSdUsage(uint64_t* out_total, uint64_t* out_free) {
+    *out_total = g_mock_sd_total;
+    *out_free = g_mock_sd_free;
+    return 0;
+}
+
+size_t sumLogBytes(VirtualFs& vfs, const char* base, unsigned gens, unsigned* out_files) {
+    size_t total = 0;
+    unsigned files = 0;
+    for (unsigned g = 0; g < gens; ++g) {
+        char path[64];
+        if (g == 0) snprintf(path, sizeof(path), "%s", base);
+        else snprintf(path, sizeof(path), "%s.%u", base, g);
+        size_t sz = 0;
+        if (vfs.fileSize(path, &sz)) {
+            total += sz;
+            ++files;
+        }
+    }
+    if (out_files) *out_files = files;
+    return total;
+}
+
+}  // namespace
+
+void test_syslogd_sd_rotation_cap_and_free_space_floor(void) {
+    SystemState state;
+    state.initDefaults();
+    VirtualFs vfs;
+    vfs.initDefaultFiles(state);
+    SyslogRotator rotator;
+
+    // 1. LittleFS fallback (no SD): caps clamp to 16 KB x 2 and target is /var/log/messages
+    TEST_ASSERT_EQUAL_STRING("/var/log/messages", SyslogRotator::targetPath(state));
+    TEST_ASSERT_EQUAL_UINT32(16U * 1024U, SyslogRotator::effectiveCapBytes(state));
+    TEST_ASSERT_EQUAL_UINT8(2, SyslogRotator::effectiveFileCount(state));
+
+    // 2. First service persists the boot lines resident in the dmesg ring
+    state.appendDmesg(1000, "kernel: boot line A");
+    state.appendDmesg(1100, "kernel: boot line B");
+    state.uptime_sec = 1;
+    TEST_ASSERT_TRUE(rotator.service(state, vfs, /*force=*/true));
+    TEST_ASSERT_EQUAL_UINT32(2, state.log_lines_written);
+    char buf[512] = {0};
+    TEST_ASSERT_TRUE(vfs.readFile(state, "/var/log/messages", buf, sizeof(buf)));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "kernel: boot line A"));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "kernel: boot line B"));
+
+    // 3. Interval gating: new lines stay staged until 10 s elapse or force
+    state.appendDmesg(2000, "sshd: session opened");
+    state.uptime_sec = 3;
+    TEST_ASSERT_FALSE(rotator.service(state, vfs, false));
+    TEST_ASSERT_TRUE(rotator.stagedBytes() > 0);
+    state.uptime_sec = 12;
+    TEST_ASSERT_TRUE(rotator.service(state, vfs, false));
+    TEST_ASSERT_EQUAL_UINT32(0, rotator.stagedBytes());
+    TEST_ASSERT_EQUAL_UINT32(3, state.log_lines_written);
+
+    // 4. Ring overrun between services counts dropped lines instead of corrupting output
+    for (int i = 0; i < 40; ++i) {
+        state.appendDmesg(3000U + static_cast<uint32_t>(i), "burst: filler line for overrun test");
+    }
+    state.uptime_sec = 30;
+    rotator.service(state, vfs, true);
+    TEST_ASSERT_EQUAL_UINT32(8, state.log_lines_dropped);
+
+    // 5. microSD target with 4 KB x 3 rotation never exceeds the 12 KB ceiling
+    state.sd_mounted = true;
+    state.sd_total_mb = 1024;
+    state.log_file_cap_kb = 4;
+    state.log_file_count = 3;
+    g_mock_sd_total = 1024ULL * 1024ULL * 1024ULL;
+    g_mock_sd_free = 512ULL * 1024ULL * 1024ULL;
+    HardwareOps ops = {};
+    ops.sd_usage = mockSdUsage;
+    setHardwareOps(&ops);
+
+    TEST_ASSERT_EQUAL_STRING("/mnt/sd/var/log/messages", SyslogRotator::targetPath(state));
+    TEST_ASSERT_EQUAL_UINT32(4096U, SyslogRotator::effectiveCapBytes(state));
+    TEST_ASSERT_EQUAL_UINT8(3, SyslogRotator::effectiveFileCount(state));
+
+    uint32_t rotations_before = state.log_rotations;
+    for (int round = 0; round < 60; ++round) {
+        for (int i = 0; i < 6; ++i) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "sdlog: round %d line %d payload-xxxxxxxxxxxxxxxx", round, i);
+            state.appendDmesg(40000U + static_cast<uint32_t>(round * 6 + i), msg);
+        }
+        state.uptime_sec = 100U + static_cast<uint32_t>(round);
+        rotator.service(state, vfs, true);
+    }
+    unsigned files = 0;
+    size_t total_bytes = sumLogBytes(vfs, "/mnt/sd/var/log/messages", 6, &files);
+    TEST_ASSERT_TRUE(state.log_rotations > rotations_before);
+    TEST_ASSERT_EQUAL_UINT32(3, files);
+    TEST_ASSERT_TRUE(total_bytes <= 3U * 4096U);
+    size_t gen3 = 0;
+    TEST_ASSERT_FALSE(vfs.fileSize("/mnt/sd/var/log/messages.3", &gen3));
+    TEST_ASSERT_EQUAL_UINT32(512, state.sd_total_mb - state.sd_used_mb);
+    TEST_ASSERT_FALSE(state.log_sd_paused);
+
+    // 6. Free-space floor: below 16 MB free, rotated generations purge and new lines pause
+    g_mock_sd_free = 8ULL * 1024ULL * 1024ULL;
+    uint32_t dropped_before = state.log_lines_dropped;
+    state.appendDmesg(90000, "sdlog: should be dropped while paused");
+    state.uptime_sec = 200;
+    TEST_ASSERT_FALSE(rotator.service(state, vfs, true));
+    TEST_ASSERT_TRUE(state.log_sd_paused);
+    TEST_ASSERT_TRUE(state.log_lines_dropped > dropped_before);
+    sumLogBytes(vfs, "/mnt/sd/var/log/messages", 6, &files);
+    TEST_ASSERT_EQUAL_UINT32(1, files);
+
+    // 7. Recovery once free space returns, plus df / logrotate CLI surfaces
+    g_mock_sd_free = 256ULL * 1024ULL * 1024ULL;
+    state.appendDmesg(91000, "sdlog: resumed after free space recovered");
+    state.uptime_sec = 220;
+    TEST_ASSERT_TRUE(rotator.service(state, vfs, true));
+    TEST_ASSERT_FALSE(state.log_sd_paused);
+
+    ShellSession session;
+    char out[2048];
+    session.begin(state, vfs, false, out, sizeof(out));
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "df", out, sizeof(out)));
+    TEST_ASSERT_NOT_NULL(strstr(out, "/mnt/sd"));
+    TEST_ASSERT_NOT_NULL(strstr(out, " 75% /mnt/sd"));
+
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "logrotate 512 2", out, sizeof(out)));
+    TEST_ASSERT_EQUAL_UINT16(512, state.log_file_cap_kb);
+    TEST_ASSERT_EQUAL_UINT8(2, state.log_file_count);
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "logrotate status", out, sizeof(out)));
+    TEST_ASSERT_NOT_NULL(strstr(out, "512 KB x 2 files (ceiling 1024 KB)"));
+    out[0] = '\0';
+    session.executeCommandLine(state, vfs, "logrotate 3 9", out, sizeof(out));
+    TEST_ASSERT_NOT_NULL(strstr(out, "ERR usage"));
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "logrotate force", out, sizeof(out)));
+    TEST_ASSERT_TRUE(state.log_rotate_requested);
+    uint32_t rot_before = state.log_rotations;
+    state.uptime_sec = 240;
+    rotator.service(state, vfs, false);
+    TEST_ASSERT_EQUAL_UINT32(rot_before + 1, state.log_rotations);
+    TEST_ASSERT_FALSE(state.log_rotate_requested);
+
+    out[0] = '\0';
+    TEST_ASSERT_TRUE(session.executeCommandLine(state, vfs, "screen status", out, sizeof(out)));
+    TEST_ASSERT_NOT_NULL(strstr(out, "\"log_target\":\"/mnt/sd/var/log/messages\""));
+    TEST_ASSERT_NOT_NULL(strstr(out, "\"sd_free_mb\":256"));
+    setHardwareOps(nullptr);
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -1100,5 +1259,6 @@ int main(int argc, char** argv) {
     RUN_TEST(test_screen_idle_dim_panel_sleep_and_wake);
     RUN_TEST(test_epkg_ed25519_trust_on_populate_and_streamed_install);
     RUN_TEST(test_rv32imac_elf_dynamic_sizing_and_wx_fencing);
+    RUN_TEST(test_syslogd_sd_rotation_cap_and_free_space_floor);
     return UNITY_END();
 }

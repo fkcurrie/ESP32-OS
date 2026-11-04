@@ -25,6 +25,7 @@
 
 #include "board_pins.h"
 #include "c6os_shell.h"
+#include "c6os_syslog.h"
 #include "c6os_types.h"
 #include "c6os_vfs.h"
 #include "screen_manager.h"
@@ -42,6 +43,7 @@ constexpr const char* SOFTAP_PASS = "esp32linux";
 
 c6os::SystemState g_state;
 c6os::VirtualFs g_vfs;
+c6os::SyslogRotator g_syslog;
 c6os::ScreenManager g_screen;
 c6os::SshServer g_sshd(22);
 c6os::ShellSession g_bg_shell;
@@ -609,6 +611,12 @@ uint32_t hwFreeHeap() {
     return ESP.getFreeHeap();
 }
 
+int hwSdUsage(uint64_t* out_total_bytes, uint64_t* out_free_bytes) {
+    if (!g_sd_card || !out_total_bytes || !out_free_bytes) return -1;
+    // FATFS f_getfree(): full FAT scan on first call per mount, cached afterwards
+    return (esp_vfs_fat_info("/sd", out_total_bytes, out_free_bytes) == ESP_OK) ? 0 : -1;
+}
+
 const c6os::HardwareOps HW_OPS = {
     hwGpioMode,
     hwGpioWrite,
@@ -627,6 +635,7 @@ const c6os::HardwareOps HW_OPS = {
     hwRotateApiToken,
     hwUptimeMs,
     hwFreeHeap,
+    hwSdUsage,
 };
 
 // ============================================================================
@@ -661,6 +670,9 @@ void loadPersistentConfig() {
     }
     g_state.screen_dim_sec   = prefs.getUShort("scr_dim", 120);
     g_state.screen_sleep_sec = prefs.getUShort("scr_slp", 600);
+    g_state.log_persist_enabled = prefs.getBool("log_on", true);
+    g_state.log_file_cap_kb  = prefs.getUShort("log_cap", 256);
+    g_state.log_file_count   = prefs.getUChar("log_cnt", 4);
 
     // Salted SHA-256 root password (migrating any legacy plaintext NVS entry once)
     if (prefs.getBytesLength("pass_salt") == 16 && prefs.getBytesLength("pass_hash") == 32) {
@@ -704,6 +716,9 @@ void savePersistentConfig() {
     prefs.putBool("ap_pinned", g_state.wifi_ap_pinned);
     prefs.putUShort("scr_dim", g_state.screen_dim_sec);
     prefs.putUShort("scr_slp", g_state.screen_sleep_sec);
+    prefs.putBool("log_on", g_state.log_persist_enabled);
+    prefs.putUShort("log_cap", g_state.log_file_cap_kb);
+    prefs.putUChar("log_cnt", g_state.log_file_count);
     prefs.end();
 }
 
@@ -737,9 +752,17 @@ void initStorage() {
         uint64_t cap_bytes = static_cast<uint64_t>(g_sd_card->csd.capacity) *
                              static_cast<uint64_t>(g_sd_card->csd.sector_size);
         g_state.sd_total_mb = static_cast<uint32_t>(cap_bytes / (1024ULL * 1024ULL));
-        char msg[64];
-        snprintf(msg, sizeof(msg), "mmcblk0: MicroSD mounted on /sd (%lu MB)",
-                 static_cast<unsigned long>(g_state.sd_total_mb));
+        uint64_t sd_total = 0;
+        uint64_t sd_free = 0;
+        if (hwSdUsage(&sd_total, &sd_free) == 0 && sd_total > 0) {
+            g_state.sd_total_mb = static_cast<uint32_t>(sd_total / (1024ULL * 1024ULL));
+            g_state.sd_free_mb  = static_cast<uint32_t>(sd_free / (1024ULL * 1024ULL));
+            g_state.sd_used_mb  = static_cast<uint32_t>((sd_total - sd_free) / (1024ULL * 1024ULL));
+        }
+        char msg[80];
+        snprintf(msg, sizeof(msg), "mmcblk0: MicroSD mounted on /sd (%lu MB, %lu MB free)",
+                 static_cast<unsigned long>(g_state.sd_total_mb),
+                 static_cast<unsigned long>(g_state.sd_free_mb));
         g_state.appendDmesg(millis(), msg);
     }
 
@@ -1214,6 +1237,13 @@ void networkTask(void* param) {
             xSemaphoreGive(g_mutex);
         }
 
+        if (do_sync || do_reboot) {
+            // Flush staged syslog lines before NVS commit / restart so no boot history is lost
+            if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+                g_syslog.service(g_state, g_vfs, /*force=*/true);
+                xSemaphoreGive(g_mutex);
+            }
+        }
         if (do_sync) {
             savePersistentConfig();
         }
@@ -1729,6 +1759,9 @@ void loop() {
                 }
             }
             prev_eff_bl = eff_bl;
+
+            // syslogd: tail dmesg into the persistent rotated log (<= 512 B burst per 10 s)
+            g_syslog.service(g_state, g_vfs, /*force=*/false);
             xSemaphoreGive(g_mutex);
         }
     }

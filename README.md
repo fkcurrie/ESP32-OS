@@ -2,7 +2,7 @@
 
 **Status:** Active (`c6os 6.12`) • November 2026.
 
-**TL;DR:** Standard ESP32 firmware requires a full recompile and USB reflash for every small script or tool change. We built `C6-MicroLinux` (`c6os`) for the Waveshare `ESP32-C6-LCD-1.47` (`ESP32-C6FH4`, `160 MHz` RISC-V, `320 KB` SRAM, `8 MB` QIO Flash). Engineers log in over SSHv2, push files via SFTP v3, and install signed `EPK2` packages carrying Lua 5.4, RISC-V `.elf`, or shell apps. The QIO image uses `54,812 B` of static SRAM and `1,847,552 B` of flash. It dims and sleeps idle ST7789 panels, streams `epkg` checks in `2 KB` chunks, and fences `.elf` apps inside `16–48 KB` `W^X` sandboxes, leaving signed OTA kernel images as our main open question.
+**TL;DR:** Standard ESP32 firmware requires a full recompile and USB reflash for every small script or tool change. We built `C6-MicroLinux` (`c6os`) for the Waveshare `ESP32-C6-LCD-1.47` (`ESP32-C6FH4`, `160 MHz` RISC-V, `320 KB` SRAM, `8 MB` QIO Flash). Engineers log in over SSHv2, push files via SFTP v3, and install signed `EPK2` packages carrying Lua 5.4, RISC-V `.elf`, or shell apps. The QIO image uses `55,372 B` of static SRAM and `1,852,096 B` of flash. It dims and sleeps idle ST7789 panels, streams `epkg` checks in `2 KB` chunks, and fences `.elf` apps inside `16–48 KB` `W^X` sandboxes, leaving signed OTA kernel images as our main open question.
 
 ---
 
@@ -10,17 +10,18 @@
 
 `C6-MicroLinux` turns a single-core RISC-V microcontroller into a live, network-accessible Linux-style node. Operators connect over 2.4 GHz Wi-Fi via `ssh root@<ip>` or attach over USB-Serial on `/dev/ttyACM0`. From there, they control the `320x172` IPS display, onboard `WS2812` LED, BLE 5.0 radio, and general-purpose pins.
 
-At boot, `main.cpp` mounts `LittleFS` for `/etc`, `/root`, and `/apps`, and mounts any FAT32 microSD card on `SPI2_HOST`. Static SRAM sits at `54,812 B` (`16.7%` of `320 KB`), `8`-row DMA strip buffers hold `10,240 B`, and idle daemons block in `lwip_select()` rather than spin-polling sockets. All user runtimes (`SFTP v3`, `Lua 5.4`, `RV32IMAC` ELF VM, and `NimBLE 5.0`) use `0 B` of idle heap until called.
+At boot, `main.cpp` mounts `LittleFS` for `/etc`, `/root`, and `/apps`, and mounts any FAT32 microSD card on `SPI2_HOST`. Static SRAM sits at `55,372 B` (`16.9%` of `320 KB`), `8`-row DMA strip buffers hold `10,240 B`, and idle daemons block in `lwip_select()` rather than spin-polling sockets. All user runtimes (`SFTP v3`, `Lua 5.4`, `RV32IMAC` ELF VM, and `NimBLE 5.0`) use `0 B` of idle heap until called.
 
 | Subsystem | Implementation & Measured Bounds |
 | :--- | :--- |
 | Target Hardware | `ESP32-C6FH4` (`RV32IMAC` @ `160 MHz`, `320 KB` SRAM, `8 MB` QIO Flash @ `80 MHz`) + `1.47"` `ST7789` (`320x172` RGB565) |
-| Firmware Size | Static SRAM: `54,812 B / 327,680 B` (`16.7%`, CI gate `57,344 B`); Flash binary: `1,847,552 B / 3,342,336 B` (`55.3%`) |
+| Firmware Size | Static SRAM: `55,372 B / 327,680 B` (`16.9%`, CI gate `57,344 B`); Flash binary: `1,852,096 B / 3,342,336 B` (`55.4%`) |
 | SSHv2 & SFTP v3 (`:22`) | Non-blocking `lwip_select()` sockets, `5,824 B` session workspace, `curve25519-sha256` KEX, `aes128-ctr`, `hmac-sha2-256`, `ssh-ed25519` + `rsa-sha2-256/512`, NVS `passwd`, and binary `sftp` |
 | User App Runtime | `epkg` (`EPK1`/`EPK2` Ed25519 + `2 KB` streamed SHA-256), 32-bit `Lua 5.4` (`64 KB` heap cap), `RV32IMAC` `.elf` VM (`16–48 KB` `W^X` sandbox), and `.sh` scripts (depth `4`) |
 | Display Engine | `esp_lcd_panel_io_spi` @ `80 MHz`, `10.2 KB` DMA scanlines, two-stage idle dim (`15%` @ `120 s`) & `SLPIN` sleep (`600 s`), and `320x172` `.bmp`/`.ppm` `fbgrab` |
 | Radios & Buses | Event-driven Wi-Fi STA (`WIFI_PS_MIN_MODEM` idle, `WIFI_PS_NONE` on SSH) + SoftAP, adaptive BLE 5.0 scan (`25%` duty on active SSH/AP, `75%` idle), `gpio`, `pwm`, `adc`, `i2c`, `ping` |
 | Telemetry & HTTP (`:80`) | O(1) `ulTaskGetIdleRunTimeCounter()` 1 Hz CPU load, `uxTaskGetSystemState()` in `ps`/`top`, dirty-gated `LittleFS` usage, `/proc` & `/sys`, and lwIP `/api/status` + `/api/cmd` |
+| Persistent `syslogd` | Tails the `32 x 76 B` RAM `dmesg` ring into `/mnt/sd/var/log/messages` (`256 KB x 4` files = `1 MB` ceiling), `512 B` write bursts every `10 s`, `16 MB` SD free-space floor, and `16 KB x 2` `LittleFS` fallback |
 
 ---
 
@@ -86,7 +87,7 @@ i2c set 2 3 100000 && i2c scan
 ping -c 3 1.1.1.1
 ```
 
-Remote HTTP commands on port `80` require the 32-hex-character NVS bearer token printed by `apitoken` inside `c6-sh`. Meanwhile, `/api/status` stays read-only without a token.
+Remote HTTP commands on port `80` require the 32-hex-character NVS bearer token printed by `apitoken` inside `c6-sh`. Meanwhile, `/api/status` stays read-only without a token and now reports real microSD usage (`sd_used_mb`, `sd_free_mb`) from FATFS `f_getfree()`.
 
 ```bash
 # Read live JSON status (no token required)
@@ -96,14 +97,26 @@ curl -s http://<BOARD_IP>/api/status
 curl -s -H "Authorization: Bearer <TOKEN>" "http://<BOARD_IP>/api/cmd?c=sensors"
 ```
 
+Kernel, SSH, HTTP, and `syslogd` events land in a `2,432 B` RAM `dmesg` ring (`32` lines). The built-in `syslogd` rotator copies new ring lines to `/mnt/sd/var/log/messages` in `512 B` bursts at most every `10 s`, so log writes never contend with ST7789 DMA frames on the shared `SPI2_HOST` bus. Files rotate at `256 KB` across `4` generations (`1 MB` ceiling by default). When microSD free space drops below `16 MB`, the rotator deletes old generations and pauses writes until space recovers. Without a card, logs fall back to `/var/log/messages` on `LittleFS` capped at `16 KB x 2`.
+
+```bash
+# Inspect, resize (cap_kb files), or disable persistent logging; settings persist in NVS
+logrotate status
+logrotate 128 8
+logrotate off
+
+# Force a rotation and read the live log over SSH
+logrotate force && cat /mnt/sd/var/log/messages
+```
+
 ---
 
 ## 5. Building, Testing, and Flashing
 
-Run the 14-suite host test harness (including `ASan + LSan + UBSan`) on Linux or macOS before building the ESP32-C6 image.
+Run the 15-suite host test harness (including `ASan + LSan + UBSan`) on Linux or macOS before building the ESP32-C6 image.
 
 ```bash
-# Run host unit tests (SSH crypto, SFTP v3, EPK2 Ed25519, Lua 5.4, W^X ELF VM, idle sleep)
+# Run host unit tests (SSH crypto, SFTP v3, EPK2 Ed25519, Lua 5.4, W^X ELF VM, idle sleep, syslogd)
 pio test -e native
 pio test -e native_asan
 
