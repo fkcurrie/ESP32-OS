@@ -11,6 +11,7 @@
 #include "c6os_elf.h"
 #include "c6os_epkg.h"
 #include "c6os_lua.h"
+#include "c6os_syslog.h"
 #include "ssh_auth.h"
 
 namespace c6os {
@@ -1167,7 +1168,8 @@ void ShellSession::formatStatusJson(const SystemState& state, char* out_buf, siz
              "\"temp_c\":%d.%d,\"cron_jobs\":%u,\"boot_btn_presses\":%u,"
              "\"wifi_connected\":%s,\"wifi_ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,"
              "\"ap_enabled\":%s,\"ap_ssid\":\"%s\",\"ap_ip\":\"%s\","
-             "\"ble_enabled\":%s,\"sd_mounted\":%s,"
+             "\"ble_enabled\":%s,\"sd_mounted\":%s,\"sd_total_mb\":%u,\"sd_used_mb\":%u,\"sd_free_mb\":%u,"
+             "\"log_target\":\"%s\",\"log_enabled\":%s,\"log_lines\":%u,\"log_rotations\":%u,\"log_dropped\":%u,"
              "\"ssh_port\":%u,\"ssh_sessions\":%u,"
              "\"http_port\":%u,\"http_requests\":%u,\"syslog_port\":%u,\"syslog_packets\":%u,"
              "\"free_sram\":%u,\"total_sram\":%u,\"uptime_s\":%u}\r\n",
@@ -1202,6 +1204,14 @@ void ShellSession::formatStatusJson(const SystemState& state, char* out_buf, siz
              state.wifi_ap_ip,
              state.ble_enabled ? "true" : "false",
              state.sd_mounted ? "true" : "false",
+             static_cast<unsigned>(state.sd_total_mb),
+             static_cast<unsigned>(state.sd_used_mb),
+             static_cast<unsigned>(state.sd_free_mb),
+             SyslogRotator::targetPath(state),
+             state.log_persist_enabled ? "true" : "false",
+             static_cast<unsigned>(state.log_lines_written),
+             static_cast<unsigned>(state.log_rotations),
+             static_cast<unsigned>(state.log_lines_dropped),
              static_cast<unsigned>(state.ssh_port),
              static_cast<unsigned>(state.ssh_active_sessions),
              static_cast<unsigned>(state.http_port),
@@ -1384,6 +1394,7 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
             "  chsh [menu|sh] | passwd      Set default SSH login shell or salted password\r\n"
             "  apitoken [rotate]            Inspect or rotate HTTP :80 /api/cmd bearer token\r\n"
             "  crontab | watch | edit | sh  Cron jobs, periodic monitor, editor & scripts\r\n"
+            "  logrotate [cap_kb files]     Persistent syslogd to microSD with size-capped rotation\r\n"
             "  top, htop, ps, free, df, sensors, pinout, ping, netstat, dmesg, ls, cat, rm\r\n");
     } else if (strcmp(prog, "uname") == 0) {
         bool all = false, rel = false, mach = false, node = false;
@@ -1526,8 +1537,13 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
             total, used, avail, pct);
         if (state.sd_mounted) {
             unsigned sd_kb = static_cast<unsigned>(state.sd_total_mb * 1024U);
-            unsigned sd_avail = (sd_kb > 128U) ? (sd_kb - 128U) : sd_kb;
-            out.fmt("/dev/mmcblk0p1   %8u     128  %8u   1%% /mnt/sd\r\n", sd_kb, sd_avail);
+            unsigned sd_used_kb = static_cast<unsigned>(state.sd_used_mb * 1024U);
+            if (sd_used_kb > sd_kb) sd_used_kb = sd_kb;
+            unsigned sd_avail = (state.sd_free_mb > 0 || state.sd_used_mb > 0)
+                                    ? static_cast<unsigned>(state.sd_free_mb * 1024U)
+                                    : sd_kb;
+            unsigned sd_pct = (sd_kb > 0) ? ((static_cast<uint64_t>(sd_used_kb) * 100ULL) / sd_kb) : 0U;
+            out.fmt("/dev/mmcblk0p1   %8u %7u  %8u %3u%% /mnt/sd\r\n", sd_kb, sd_used_kb, sd_avail, sd_pct);
         }
     } else if (strcmp(prog, "ps") == 0) {
         HeapArray<TaskInfoEntry> live(16);
@@ -2390,6 +2406,53 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
             state.syslog_packets++;
             out.fmt("OK LOGGER \"%s\"\r\n", msg);
         }
+    } else if (strcmp(prog, "logrotate") == 0) {
+        if (argc < 2 || strcmp(argv[1], "status") == 0) {
+            uint32_t cap_b = SyslogRotator::effectiveCapBytes(state);
+            uint8_t cnt = SyslogRotator::effectiveFileCount(state);
+            out.fmt(
+                "syslogd persistent log: %s\r\n"
+                "  target     : %s\r\n"
+                "  per-file   : %u KB x %u files (ceiling %u KB)\r\n"
+                "  written    : %u lines, %u rotations, %u dropped\r\n"
+                "  sd         : %s (%u MB used / %u MB free of %u MB, floor %u MB)\r\n",
+                state.log_persist_enabled ? (state.log_sd_paused ? "PAUSED (sd below floor)" : "ENABLED") : "DISABLED",
+                SyslogRotator::targetPath(state),
+                static_cast<unsigned>(cap_b / 1024U), static_cast<unsigned>(cnt),
+                static_cast<unsigned>((cap_b / 1024U) * cnt),
+                static_cast<unsigned>(state.log_lines_written),
+                static_cast<unsigned>(state.log_rotations),
+                static_cast<unsigned>(state.log_lines_dropped),
+                state.sd_mounted ? "mounted" : "absent (LittleFS fallback 16 KB x 2)",
+                static_cast<unsigned>(state.sd_used_mb), static_cast<unsigned>(state.sd_free_mb),
+                static_cast<unsigned>(state.sd_total_mb),
+                static_cast<unsigned>(SyslogRotator::SD_FREE_FLOOR_MB));
+        } else if (strcmp(argv[1], "on") == 0 || strcmp(argv[1], "off") == 0) {
+            state.log_persist_enabled = (argv[1][1] == 'n');
+            state.fs_sync_requested = true;
+            out.fmt("OK LOGROTATE %s\r\n", state.log_persist_enabled ? "ENABLED" : "DISABLED");
+        } else if (strcmp(argv[1], "flush") == 0) {
+            state.log_flush_requested = true;
+            out.putStr("OK LOGROTATE FLUSH queued\r\n");
+        } else if (strcmp(argv[1], "force") == 0) {
+            state.log_rotate_requested = true;
+            out.putStr("OK LOGROTATE ROTATE queued\r\n");
+        } else {
+            long cap_kb = atol(argv[1]);
+            long cnt = (argc >= 3) ? atol(argv[2]) : static_cast<long>(state.log_file_count);
+            if (cap_kb < SyslogRotator::SD_MIN_CAP_KB || cap_kb > SyslogRotator::SD_MAX_CAP_KB ||
+                cnt < 1 || cnt > SyslogRotator::MAX_FILE_COUNT) {
+                out.fmt("ERR usage: logrotate [status | on | off | flush | force | <cap_kb %u..%u> [files 1..%u]]\r\n",
+                        static_cast<unsigned>(SyslogRotator::SD_MIN_CAP_KB),
+                        static_cast<unsigned>(SyslogRotator::SD_MAX_CAP_KB),
+                        static_cast<unsigned>(SyslogRotator::MAX_FILE_COUNT));
+            } else {
+                state.log_file_cap_kb = static_cast<uint16_t>(cap_kb);
+                state.log_file_count = static_cast<uint8_t>(cnt);
+                state.fs_sync_requested = true;
+                out.fmt("OK LOGROTATE %ld KB x %ld files (ceiling %ld KB)\r\n", cap_kb, cnt, cap_kb * cnt);
+            }
+        }
     } else if (strcmp(prog, "dmesg") == 0) {
         if (argc >= 2 && strcmp(argv[1], "-c") == 0) {
             state.dmesg_head = 0;
@@ -2489,7 +2552,7 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         }
     } else if (strcmp(prog, "screen") == 0) {
         if (argc < 2 || strcmp(argv[1], "status") == 0) {
-            HeapArray<char> json(768);
+            HeapArray<char> json(1024);
             if (json) {
                 formatStatusJson(state, json.get(), json.bytes());
                 out.putStr(json.get());

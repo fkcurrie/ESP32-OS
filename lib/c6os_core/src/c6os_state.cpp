@@ -132,7 +132,20 @@ void SystemState::initDefaults() {
     rootfs_used_kb = 24;
     sd_mounted = false;
     sd_total_mb = 0;
+    sd_used_mb = 0;
+    sd_free_mb = 0;
     uptime_sec = 0;
+
+    log_persist_enabled = true;
+    log_sd_paused = false;
+    log_flush_requested = false;
+    log_rotate_requested = false;
+    log_file_cap_kb = 256;
+    log_file_count = 4;
+    dmesg_seq = 0;
+    log_lines_written = 0;
+    log_rotations = 0;
+    log_lines_dropped = 0;
 
     cpu_temp_deci_c = 385;
     cpu_load_pct = 8;
