@@ -8,12 +8,30 @@ void ScreenManager::begin() {
     lcd_.begin();
 }
 
+void ScreenManager::applyPowerState(bool sleeping, uint8_t effective_backlight) {
+    if (sleeping) {
+        lcd_.setPanelSleep(true);
+        last_backlight_ = 0;
+        return;
+    }
+    if (lcd_.isPanelSleeping()) {
+        lcd_.setPanelSleep(false);
+    }
+    if (effective_backlight != last_backlight_) {
+        lcd_.setBacklight(effective_backlight);
+        last_backlight_ = effective_backlight;
+    }
+}
+
 void ScreenManager::renderState(const SystemState& state, bool force_full) {
     snap_.captureFrom(state, force_full ? DIRTY_FULL : state.dirty_regions);
     render(snap_, force_full);
 }
 
 void ScreenManager::render(const RenderSnapshot& snap, bool force_full) {
+    if (lcd_.isPanelSleeping()) {
+        return;
+    }
     if (snap.backlight_pct != last_backlight_) {
         lcd_.setBacklight(snap.backlight_pct);
         last_backlight_ = snap.backlight_pct;

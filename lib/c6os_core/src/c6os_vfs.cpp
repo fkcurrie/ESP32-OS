@@ -165,6 +165,7 @@ bool VirtualFs::resolveRealPath(const char* abs_path, char* out_real, size_t max
 
 void VirtualFs::initDefaultFiles(SystemState& state) {
     mkdirPath("/etc");
+    mkdirPath("/etc/epkg");
     mkdirPath("/etc/ssh");
     mkdirPath("/root");
     mkdirPath("/apps");
@@ -222,6 +223,12 @@ void VirtualFs::initDefaultFiles(SystemState& state) {
         crypto::formatDefaultAuthorizedKeys(auth_keys_buf.get(), auth_keys_buf.bytes());
         ensureFile("/etc/ssh/authorized_keys", auth_keys_buf.get());
     }
+
+    ensureFile("/etc/epkg/trusted_keys",
+               "# /etc/epkg/trusted_keys - Ed25519 package signing public keys\n"
+               "# Format: ssh-ed25519 <base64-pubkey> [comment]\n"
+               "# Trust-on-populate: unsigned EPK1 allowed while 0 keys exist;\n"
+               "# once any key is listed here, EPK2 Ed25519 signatures are required.\n");
 
     ensureFile("/root/README.txt",
                "C6-MicroLinux Quick Reference:\n"
@@ -313,6 +320,7 @@ bool VirtualFs::isDirectory(const char* abs_path) const {
         "/bin",
         "/dev",
         "/etc",
+        "/etc/epkg",
         "/etc/ssh",
         "/mnt",
         "/mnt/sd",
@@ -383,6 +391,7 @@ size_t VirtualFs::readDirEntries(const char* abs_path, VfsDirEntry* out_entries,
     if (strcmp(abs_path, "/mnt") == 0) {
         addEntry("sd", true);
     } else if (strcmp(abs_path, "/etc") == 0) {
+        addEntry("epkg", true);
         addEntry("ssh", true);
     } else if (strcmp(abs_path, "/etc/ssh") == 0) {
         addEntry("ssh_host_ed25519_key.pub", false, 96);
@@ -474,7 +483,7 @@ bool VirtualFs::listDirectory(const char* abs_path, char* out_buf, size_t max_le
         return true;
     }
     if (strcmp(abs_path, "/sys/class/graphics/fb0") == 0) {
-        w.putStr("alert  mode  name  stride  text  theme  ticker  virtual_size\n");
+        w.putStr("alert  mode  name  stride  text  theme  ticker  timeout  virtual_size\n");
         return true;
     }
     if (strcmp(abs_path, "/sys/class/leds") == 0) {
@@ -664,6 +673,12 @@ bool VirtualFs::readFile(const SystemState& state, const char* abs_path, char* o
         snprintf(out_buf, max_len, "%s\n", state.alert_active ? state.alert_text : "off");
         return true;
     }
+    if (strcmp(abs_path, "/sys/class/graphics/fb0/timeout") == 0) {
+        snprintf(out_buf, max_len, "%u %u\n",
+                 static_cast<unsigned>(state.screen_dim_sec),
+                 static_cast<unsigned>(state.screen_sleep_sec));
+        return true;
+    }
     if (strcmp(abs_path, "/sys/class/thermal/thermal_zone0/temp") == 0) {
         snprintf(out_buf, max_len, "%d\n", static_cast<int>(state.cpu_temp_deci_c) * 100);
         return true;
@@ -761,6 +776,7 @@ bool VirtualFs::writeFile(SystemState& state, const char* abs_path, const char* 
         if (val < 0) val = 0;
         if (val > 100) val = 100;
         state.backlight_pct = static_cast<uint8_t>(val);
+        state.noteActivity();
         state.markDirty(DIRTY_HEADER);
         return true;
     }
@@ -780,6 +796,7 @@ bool VirtualFs::writeFile(SystemState& state, const char* abs_path, const char* 
         } else {
             return false;
         }
+        state.noteActivity();
         state.markDirty(DIRTY_FULL);
         return true;
     }
@@ -802,8 +819,45 @@ bool VirtualFs::writeFile(SystemState& state, const char* abs_path, const char* 
             state.alert_active = true;
             strncpy(state.alert_text, clean, sizeof(state.alert_text) - 1);
             state.alert_text[sizeof(state.alert_text) - 1] = '\0';
+            state.noteActivity();
         }
         state.markDirty(DIRTY_FULL);
+        return true;
+    }
+    if (strcmp(abs_path, "/sys/class/graphics/fb0/timeout") == 0) {
+        if (strcmp(clean, "off") == 0 || strcmp(clean, "0") == 0) {
+            state.screen_dim_sec = 0;
+            state.screen_sleep_sec = 0;
+        } else if (strcmp(clean, "default") == 0) {
+            state.screen_dim_sec = 120;
+            state.screen_sleep_sec = 600;
+        } else {
+            unsigned long dim_s = 0;
+            unsigned long sleep_s = 0;
+            int parsed = sscanf(clean, "%lu %lu", &dim_s, &sleep_s);
+            if (parsed < 1) return false;
+            if (dim_s > 65535UL) dim_s = 65535UL;
+            if (parsed == 1) {
+                state.screen_dim_sec = static_cast<uint16_t>(dim_s);
+                if (dim_s == 0) {
+                    state.screen_sleep_sec = 0;
+                } else if (state.screen_sleep_sec != 0 && state.screen_sleep_sec < state.screen_dim_sec) {
+                    unsigned long scaled = dim_s * 5UL;
+                    if (scaled > 65535UL) scaled = 65535UL;
+                    state.screen_sleep_sec = static_cast<uint16_t>(scaled);
+                }
+            } else {
+                if (sleep_s > 65535UL) sleep_s = 65535UL;
+                if (sleep_s > 0 && dim_s > sleep_s) {
+                    return false;
+                }
+                state.screen_dim_sec = static_cast<uint16_t>(dim_s);
+                state.screen_sleep_sec = static_cast<uint16_t>(sleep_s);
+            }
+        }
+        state.noteActivity();
+        state.fs_sync_requested = true;
+        state.markDirty(DIRTY_HEADER | DIRTY_CARDS);
         return true;
     }
     if (strcmp(abs_path, "/sys/class/graphics/fb0/theme") == 0) {

@@ -408,6 +408,10 @@ struct SystemState {
     ThemeId theme;
     uint8_t backlight_pct;
     bool landscape_flipped;
+    bool screen_sleeping;
+    uint16_t screen_dim_sec;
+    uint16_t screen_sleep_sec;
+    uint32_t last_activity_sec;
     char headline[48];
     char subtitle[64];
     char banner_footer[64];
@@ -469,6 +473,38 @@ struct SystemState {
     void markDirty(uint8_t regions = DIRTY_FULL) {
         ui_dirty = true;
         dirty_regions |= regions;
+    }
+
+    void noteActivity() {
+        bool was_dimmed = (screen_dim_sec > 0 && idleSeconds() >= screen_dim_sec);
+        last_activity_sec = uptime_sec;
+        if (screen_sleeping) {
+            screen_sleeping = false;
+            markDirty(DIRTY_FULL);
+        } else if (was_dimmed) {
+            markDirty(DIRTY_HEADER);
+        }
+    }
+
+    uint32_t idleSeconds() const {
+        return (uptime_sec >= last_activity_sec) ? (uptime_sec - last_activity_sec) : 0U;
+    }
+
+    bool shouldPanelSleep() const {
+        if (alert_active || screen_sleep_sec == 0) return false;
+        return idleSeconds() >= screen_sleep_sec;
+    }
+
+    uint8_t effectiveBacklightPct() const {
+        if (alert_active) return backlight_pct;
+        uint32_t idle = idleSeconds();
+        if (screen_sleep_sec > 0 && idle >= screen_sleep_sec) {
+            return 0;
+        }
+        if (screen_dim_sec > 0 && idle >= screen_dim_sec) {
+            return (backlight_pct < 15U) ? backlight_pct : 15U;
+        }
+        return backlight_pct;
     }
 
     const char* fbLineAt(size_t logical_idx) const {

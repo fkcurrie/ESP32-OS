@@ -1097,6 +1097,100 @@ bool isPubkeyAuthorized(const char* authorized_keys_text,
     return false;
 }
 
+size_t parseEd25519TrustedKeys(const char* trusted_keys_text,
+                               uint8_t (*out_pks)[32], size_t max_keys) {
+    if (!trusted_keys_text || !out_pks || max_keys == 0) return 0;
+    size_t count = 0;
+    const char* p = trusted_keys_text;
+
+    auto hexNibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+
+    while (*p && count < max_keys) {
+        while (*p == '\r' || *p == '\n' || *p == ' ' || *p == '\t') ++p;
+        if (!*p) break;
+
+        const char* line_end = p;
+        while (*line_end && *line_end != '\n' && *line_end != '\r') ++line_end;
+
+        if (*p != '#') {
+            const char* cur = p;
+            bool parsed_line = false;
+            while (cur < line_end && !parsed_line) {
+                while (cur < line_end && (*cur == ' ' || *cur == '\t')) ++cur;
+                if (cur >= line_end || *cur == '#') break;
+                const char* tok_start = cur;
+                while (cur < line_end && *cur != ' ' && *cur != '\t') ++cur;
+                size_t tok_len = static_cast<size_t>(cur - tok_start);
+
+                if (tok_len == 11 && memcmp(tok_start, "ssh-ed25519", 11) == 0) {
+                    while (cur < line_end && (*cur == ' ' || *cur == '\t')) ++cur;
+                    const char* b64_start = cur;
+                    while (cur < line_end && *cur != ' ' && *cur != '\t' && *cur != '#') ++cur;
+                    size_t b64_len = static_cast<size_t>(cur - b64_start);
+                    if (b64_len > 0 && b64_len <= 128) {
+                        uint8_t blob[80];
+                        int dec_len = base64Decode(b64_start, b64_len, blob, sizeof(blob));
+                        if (dec_len == 51) {
+                            ssh::SshReader pr(blob, static_cast<size_t>(dec_len));
+                            char alg[16] = {0};
+                            const uint8_t* raw_pk = nullptr;
+                            size_t raw_len = 0;
+                            if (pr.getCString(alg, sizeof(alg)) &&
+                                strcmp(alg, "ssh-ed25519") == 0 &&
+                                pr.getString(raw_pk, raw_len) &&
+                                raw_len == 32 && pr.remaining() == 0) {
+                                memcpy(out_pks[count++], raw_pk, 32);
+                            }
+                        }
+                    }
+                    parsed_line = true;
+                } else if (tok_len == 64 && tok_start == p) {
+                    uint8_t raw_pk[32];
+                    bool hex_ok = true;
+                    for (size_t i = 0; i < 32; ++i) {
+                        int hi = hexNibble(tok_start[i * 2]);
+                        int lo = hexNibble(tok_start[i * 2 + 1]);
+                        if (hi < 0 || lo < 0) {
+                            hex_ok = false;
+                            break;
+                        }
+                        raw_pk[i] = static_cast<uint8_t>((hi << 4) | lo);
+                    }
+                    if (hex_ok) {
+                        memcpy(out_pks[count++], raw_pk, 32);
+                        parsed_line = true;
+                    }
+                }
+            }
+        }
+        p = line_end;
+    }
+    return count;
+}
+
+size_t formatOpenSshEd25519Pubkey(const uint8_t pk[32], const char* comment,
+                                  char* out_line, size_t out_cap) {
+    if (!pk || !out_line || out_cap == 0) return 0;
+    uint8_t blob[64];
+    ssh::SshWriter pw(blob, sizeof(blob));
+    pw.putCString("ssh-ed25519");
+    pw.putString(pk, 32);
+    char b64[96];
+    base64Encode(blob, pw.length(), b64, sizeof(b64), /*strip_pad=*/false);
+    BufWriter w(out_line, out_cap);
+    if (comment && comment[0] != '\0') {
+        w.fmt("ssh-ed25519 %s %s\n", b64, comment);
+    } else {
+        w.fmt("ssh-ed25519 %s\n", b64);
+    }
+    return w.length();
+}
+
 size_t buildUserauthSignedData(const uint8_t session_id[32],
                                const char* username,
                                const char* service,

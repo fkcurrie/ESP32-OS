@@ -803,6 +803,7 @@ bool ShellSession::consumeBytes(SystemState& state, VirtualFs& vfs,
                                 char* out_buf, size_t max_len) {
     BufWriter out(out_buf, max_len, false);
     if (!data || len == 0) return true;
+    state.noteActivity();
 
     for (size_t i = 0; i < len; ++i) {
         char ch = data[i];
@@ -1157,7 +1158,8 @@ void ShellSession::formatStatusJson(const SystemState& state, char* out_buf, siz
              "{\"os\":\"C6-MicroLinux\",\"kernel\":\"6.12.0-c6os-riscv32\","
              "\"hostname\":\"%s\",\"board\":\"Waveshare-ESP32-C6-LCD-1.47\","
              "\"tz\":\"%s\",\"login_shell\":\"%s\","
-             "\"mode\":\"%s\",\"theme\":\"%s\",\"bl\":%u,\"flipped\":%s,"
+             "\"mode\":\"%s\",\"theme\":\"%s\",\"bl\":%u,\"effective_bl\":%u,\"flipped\":%s,"
+             "\"dim_s\":%u,\"sleep_s\":%u,\"sleeping\":%s,"
              "\"headline\":\"%s\",\"subtitle\":\"%s\","
              "\"ticker_enabled\":%s,\"ticker\":\"%s\","
              "\"alert_active\":%s,\"alert\":\"%s\","
@@ -1175,7 +1177,11 @@ void ShellSession::formatStatusJson(const SystemState& state, char* out_buf, siz
              screenModeName(state.screen_mode),
              themeName(state.theme),
              state.backlight_pct,
+             state.effectiveBacklightPct(),
              state.landscape_flipped ? "true" : "false",
+             static_cast<unsigned>(state.screen_dim_sec),
+             static_cast<unsigned>(state.screen_sleep_sec),
+             state.screen_sleeping ? "true" : "false",
              state.headline,
              state.subtitle,
              state.ticker_enabled ? "true" : "false",
@@ -2147,8 +2153,21 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         }
     } else if (strcmp(prog, "epkg") == 0 || strcmp(prog, "/bin/epkg") == 0) {
         if (argc >= 3 && strcmp(argv[1], "install") == 0) {
-            VirtualFs::normalizePath(cwd_, argv[2], norm, sizeof(norm));
-            epkg::installPackage(state, vfs, norm, out);
+            bool allow_unsigned = false;
+            const char* pkg_arg = nullptr;
+            for (size_t i = 2; i < argc; ++i) {
+                if (strcmp(argv[i], "--allow-unsigned") == 0) {
+                    allow_unsigned = true;
+                } else if (!pkg_arg) {
+                    pkg_arg = argv[i];
+                }
+            }
+            if (!pkg_arg) {
+                out.putStr("Usage: epkg install [--allow-unsigned] <file.epkg>\r\n");
+            } else {
+                VirtualFs::normalizePath(cwd_, pkg_arg, norm, sizeof(norm));
+                epkg::installPackage(state, vfs, norm, out, allow_unsigned);
+            }
         } else if (argc >= 3 && (strcmp(argv[1], "remove") == 0 || strcmp(argv[1], "rm") == 0)) {
             epkg::removePackage(state, vfs, argv[2], out);
         } else if (argc >= 2 && strcmp(argv[1], "list") == 0) {
@@ -2156,7 +2175,7 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         } else if (argc >= 3 && strcmp(argv[1], "info") == 0) {
             epkg::packageInfo(state, vfs, argv[2], out);
         } else {
-            out.putStr("Usage: epkg <install <file.epkg> | remove <pkg> | list | info <pkg>>\r\n");
+            out.putStr("Usage: epkg <install [--allow-unsigned] <file.epkg> | remove <pkg> | list | info <pkg>>\r\n");
         }
     } else if (strcmp(prog, "lua") == 0 || strcmp(prog, "/bin/lua") == 0) {
         if (argc >= 3 && strcmp(argv[1], "-e") == 0) {
@@ -2546,6 +2565,33 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
         } else if (strcmp(argv[1], "bl") == 0 && argc >= 3) {
             vfs.writeFile(state, "/sys/class/backlight/st7789/brightness", argv[2], false);
             out.fmt("OK BL %u\r\n", state.backlight_pct);
+        } else if (strcmp(argv[1], "timeout") == 0) {
+            if (argc == 2) {
+                const char* pwr_state = state.shouldPanelSleep() ? "SLEEP" :
+                                        ((state.screen_dim_sec > 0 &&
+                                          state.idleSeconds() >= state.screen_dim_sec &&
+                                          !state.alert_active) ? "DIMMED" : "ACTIVE");
+                out.fmt("TIMEOUT dim=%us sleep=%us idle=%us effective_bl=%u%% state=%s\r\n",
+                        static_cast<unsigned>(state.screen_dim_sec),
+                        static_cast<unsigned>(state.screen_sleep_sec),
+                        static_cast<unsigned>(state.idleSeconds()),
+                        static_cast<unsigned>(state.effectiveBacklightPct()),
+                        pwr_state);
+            } else {
+                char tcfg[48];
+                if (argc >= 4) {
+                    snprintf(tcfg, sizeof(tcfg), "%s %s", argv[2], argv[3]);
+                } else {
+                    snprintf(tcfg, sizeof(tcfg), "%s", argv[2]);
+                }
+                if (vfs.writeFile(state, "/sys/class/graphics/fb0/timeout", tcfg, false)) {
+                    out.fmt("OK TIMEOUT dim=%us sleep=%us\r\n",
+                            static_cast<unsigned>(state.screen_dim_sec),
+                            static_cast<unsigned>(state.screen_sleep_sec));
+                } else {
+                    out.putStr("ERR invalid timeout (use: screen timeout <off | default | <dim_s> [sleep_s]>)\r\n");
+                }
+            }
         } else if (strcmp(argv[1], "flip") == 0 && argc >= 3) {
             if (strcmp(argv[2], "toggle") == 0) {
                 state.landscape_flipped = !state.landscape_flipped;
@@ -2602,7 +2648,7 @@ bool ShellSession::executeSingleCommand(SystemState& state, VirtualFs& vfs,
                 out.putStr("ERR invalid led command\r\n");
             }
         } else {
-            out.putStr("Usage: screen <status | mode <m> | text <h> [s] | ticker <msg|off> | alert <msg|off> | theme <t> | bl <0..100> | flip <on|off> | bar <pct> [lbl] | console <str> | clear | led <mode> [r g b]>\r\n");
+            out.putStr("Usage: screen <status | mode <m> | text <h> [s] | ticker <msg|off> | alert <msg|off> | theme <t> | bl <0..100> | timeout [off|default|<dim_s> [sleep_s]] | flip <on|off> | bar <pct> [lbl] | console <str> | clear | led <mode> [r g b]>\r\n");
         }
     } else {
         // Direct executable resolution: check explicit path or /apps/<prog>

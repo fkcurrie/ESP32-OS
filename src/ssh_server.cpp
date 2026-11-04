@@ -962,6 +962,7 @@ void SshServer::handleClient(int client_fd, SystemState& state,
                             sendSshPacket(client_fd, ts, ws, &succ, 1);
                             if (xSemaphoreTake(mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                                 state.ssh_total_logins++;
+                                state.noteActivity();
                                 state.appendDmesg(millis(), "sshd: Accepted verified publickey for root");
                                 state.markDirty(DIRTY_HEADER | DIRTY_CARDS);
                                 xSemaphoreGive(mutex);
@@ -995,6 +996,7 @@ void SshServer::handleClient(int client_fd, SystemState& state,
                         sendSshPacket(client_fd, ts, ws, &succ, 1);
                         if (xSemaphoreTake(mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                             state.ssh_total_logins++;
+                            state.noteActivity();
                             state.appendDmesg(millis(), "sshd: Accepted password for root");
                             state.markDirty(DIRTY_HEADER | DIRTY_CARDS);
                             xSemaphoreGive(mutex);
@@ -1096,6 +1098,7 @@ void SshServer::handleClient(int client_fd, SystemState& state,
                     }
                     io_buf[0] = '\0';
                     if (xSemaphoreTake(mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                        state.noteActivity();
                         shell.executeCommandLine(state, vfs, cmd_str, io_buf, SHELL_IO_BUF_BYTES);
                         xSemaphoreGive(mutex);
                     }
@@ -1186,6 +1189,7 @@ void SshServer::handleClient(int client_fd, SystemState& state,
                     sftp_ctx.tx_bytes = 0;
                     bool ok = false;
                     if (xSemaphoreTake(mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                        state.noteActivity();
                         ok = sftp->feed(data_ptr, data_len);
                         state.net_tx_bytes += sftp_ctx.tx_bytes;
                         xSemaphoreGive(mutex);
@@ -1202,6 +1206,7 @@ void SshServer::handleClient(int client_fd, SystemState& state,
                 io_buf[0] = '\0';
                 bool keep_alive = true;
                 if (xSemaphoreTake(mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                    state.noteActivity();
                     keep_alive = shell.consumeBytes(state, vfs,
                                                     reinterpret_cast<const char*>(data_ptr),
                                                     data_len, io_buf, SHELL_IO_BUF_BYTES);

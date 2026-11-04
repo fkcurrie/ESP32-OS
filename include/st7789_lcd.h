@@ -28,6 +28,8 @@ public:
 
     void setBacklight(uint8_t pct);
     void setLandscapeFlip(bool flipped);
+    void setPanelSleep(bool sleep);
+    bool isPanelSleeping() const { return panel_asleep_; }
 
     // Opens a contiguous vertical scanline window [y0 .. y1] across full width (0..319).
     void beginVerticalWindow(uint16_t y0, uint16_t y1);
@@ -59,6 +61,7 @@ private:
     volatile uint8_t fifo_tail_;
     uint8_t next_slot_;
     bool bus_ready_;
+    bool panel_asleep_;
 };
 
 }  // namespace lcd
